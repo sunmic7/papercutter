@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -B -m pytest tests/test_smart_cutter.py -q)",
+      "Bash(python -B -m unittest tests.test_smart_cutter -q)",
+      "Bash(python -B -c ' *)",
+      "Bash(python -B -c \"import ast; ast.parse\\(open\\('cut_questions_gui.py', encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('cut_questions_v4.py', encoding='utf-8'\\).read\\(\\)\\); print\\('语法 OK'\\)\")",
+      "Bash(tasklist /FI \"IMAGENAME eq python.exe\")",
+      "Bash(tasklist)",
+      "Read(//h/切题-已完成/2018.1//**)",
+      "Bash(xxd)",
+      "Bash(grep -vE \"Creating model|no ccache|warnings.warn|paddle\\\\\\\\utils\")",
+      "Bash(tasklist /FI \"IMAGENAME eq pythonw.exe\")",
+      "Bash(ls -la \"H:\\\\命中ISBN教材\\\\2018第一部分\\\\从课本到奥数难题点拨五年级2018__ISBN_9787544542524\" 2>/dev/null | head -15)",
+      "Read(//h/命中ISBN教材/2018第一部分/从课本到奥数难题点拨五年级2018__ISBN_9787544542524/**)",
+      "Bash(awk '/教材 \\\\[39\\\\/39\\\\]/{found=1} found' \"logs/cut_questions_20260801_111551.log\")",
+      "Bash(rm -f runtime/_pipe_progress_runner.py)",
+      "Bash(python -B -c \"import ast; ast.parse\\(open\\('cut_questions_v4.py', encoding='utf-8'\\).read\\(\\)\\); print\\('语法 OK'\\)\")",
+      "Bash(python -B -c \"import ast; ast.parse\\(open\\('cut_questions_v4.py',encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('cut_questions_gui.py',encoding='utf-8'\\).read\\(\\)\\); print\\('语法 OK'\\)\")"
+    ]
+  }
+}

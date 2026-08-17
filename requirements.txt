@@ -1,0 +1,52 @@
+# 教材切题工具：新电脑部署说明（Windows，完全本地运行）
+#
+# 一、先安装 Python
+#    1. 安装【64 位 Python 3.13】（本工具当前已在 Python 3.13.14 验证）。
+#    2. 安装界面务必勾选 “Add python.exe to PATH”。
+#    3. 打开 PowerShell，进入本文件所在的 papercutter 文件夹，执行：
+#         python --version
+#       能显示 Python 3.13.x 再继续。
+#
+# 二、安装本文件列出的程序库（新电脑只需执行一次）
+#         python -m pip install --upgrade pip
+#         python -m pip install -r requirements.txt
+#
+# 三、离线运行还必须复制 OCR 模型（这是最容易遗漏的一步）
+#    1. 复制整个 papercutter 文件夹时，务必保留下面两个项目内目录：
+#         runtime\models\paddleocr\PP-OCRv5_mobile_det
+#         runtime\models\paddleocr\PP-OCRv5_mobile_rec
+#       它们是“快速页面结构识别”模型。
+#    2. 从旧电脑复制下面两个高精度模型目录到新电脑同一位置：
+#         旧电脑：C:\Users\旧用户名\.paddlex\official_models\PP-OCRv6_medium_det
+#         旧电脑：C:\Users\旧用户名\.paddlex\official_models\PP-OCRv6_medium_rec
+#         新电脑：C:\Users\新用户名\.paddlex\official_models\
+#       即新电脑最终应有：
+#         C:\Users\新用户名\.paddlex\official_models\PP-OCRv6_medium_det
+#         C:\Users\新用户名\.paddlex\official_models\PP-OCRv6_medium_rec
+#       不复制这两项时，离线状态无法做高精度题目/答案识别。
+#
+# 四、可有可无、无需搬运的内容
+#    logs\、runtime\ocr_cache\、runtime\repair_backups\ 可以不复制；
+#    不复制只会失去旧日志和 OCR 缓存，不影响功能或精度。
+#
+# 五（补充）、硬件与并行切题
+#    批量模式会按 CPU 线程数和可用内存自动决定并行切几本教材（默认最多 2 本）。
+#    配置较低的电脑（如 4 核/8 线程、内存 8GB 以下）会自动回到顺序处理；
+#    也可在界面"并行切题"下拉框手动选"1 本"。每并行一本约需 2~4GB 内存。
+#
+# 五、启动
+#    依赖和模型都准备好后，双击“启动切题工具.vbs”。
+#    若双击无反应，请在 PowerShell 中执行：
+#         python cut_questions_gui.py
+#    这样可看到报错信息。正式界面使用 PySide6；缺少时会自动回退到 tkinter 基础界面。
+#
+# 下面是当前电脑已经验证可用的版本。请不要同时安装 opencv-python，
+# 因为 opencv-contrib-python 已经包含 OpenCV 主程序。
+# PySide6 用于企业化任务界面、实时题框审核和目录选择；缺少时将自动使用旧版 tkinter 界面。
+
+numpy==2.3.5
+opencv-contrib-python==4.10.0.84
+paddlepaddle==3.3.1
+paddleocr==3.7.0
+paddlex==3.7.2
+PySide6==6.11.1

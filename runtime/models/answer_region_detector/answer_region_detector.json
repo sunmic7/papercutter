@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "name": "hilex_answer_region_detector",
+  "format": "onnx",
+  "task": "single-class question-page internal answer/option-region detection",
+  "classes": [
+    "answer_region"
+  ],
+  "input_size": 640,
+  "nms_embedded": true,
+  "source_weights": "F:\\papercutter\\runtime\\training_runs\\hilex_answer_cpu_formal_20260806\\weights\\best.pt",
+  "exported_at": "2026-08-07T00:34:03.742562+00:00"
+}

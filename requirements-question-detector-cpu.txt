@@ -1,0 +1,5 @@
+# Optional dependencies for the trainable question-detector subsystem.
+# The main cutter continues to work if these packages are absent.
+ultralytics==8.4.115
+onnxruntime>=1.20.0
+

@@ -1,0 +1,70 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Secrets — never upload API keys
+.env
+**/.env
+
+# Large Electron exe with its own .git
+desktop_annotation/PaperFlow-Annotation/
+
+# OCR cache (can be regenerated)
+runtime/ocr_cache/
+
+# Training outputs
+runtime/training_runs/
+
+# Evaluation results
+runtime/eval_output/
+
+# Delivery packages
+runtime/delivery_packages/
+
+# Corpus outputs
+runtime/corpus_output/
+
+# Logs
+logs/
+*.log
+
+# Symlinks pointing to external drives
+vlm_source
+result16
+
+# Rendering output
+rendered_brief/
+
+# Run outputs (detection results)
+runs/
+
+# Runtime data
+runtime/repair_backups/
+runtime/legacy_root_cache/
+runtime/gui_settings*.json
+runtime/e2e_v31/
+
+# Annotation project data
+runtime/manual_annotation_projects/
+runtime/manual_annotation_exports/
+runtime/ocr_delivery_exports/
+runtime/report_review/
+runtime/sidebar_previews/
+runtime/workspace_db/
+runtime/regression_samples/
