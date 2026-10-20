@@ -1,0 +1,93 @@
+%% 切分算法改造：B → V 判定时序（2026-10-20 设计稿）
+%% 对应文档：reports/切分算法改造设计_20261020.md
+%% 关键：判定顺序固定 —— 先定编号归属（B 系列）→ 再判能否竖切（V 系列）
+
+sequenceDiagram
+    autonumber
+    participant P as process_book
+    participant SM as split_page_into_majors
+    participant SC as _split_single_col_majors
+    participant SL as split_major_into_minors（薄壳）
+    participant GE as cut_geometry
+    participant AR as layout_arbiter（冻结）
+    participant NM as cut_numbering
+    participant TR as build_number_territories
+    participant PV as plan_vertical_cuts
+    participant RC as _recover_missed_minor_boundaries
+
+    Note over P,SL: ── 阶段 0：页面级分栏（行为不变）──
+    P->>SM: split_page_into_majors(img, ocr_items)
+    SM->>AR: detect(img) / resolve_regions(...)
+    AR-->>SM: {columns, gutters} 或 None
+    SM->>SC: _split_single_col_majors(col_img, local_items)
+    SC-->>SM: blocks[{crop_img, _column_bounds, _col}]
+    SM-->>P: major_blocks
+
+    Note over P,GE: ── 阶段 1：页面级视觉证据采集（V-A 的唯一合法来源）──
+    P->>GE: _collect_column_evidence(img, profile)
+    GE->>AR: detect(img)（整页图，不是块图！）
+    alt 裁判可用且 ≥2 栏
+        AR-->>GE: columns / gutters
+        GE-->>P: {source:'arbiter', columns, gutters}
+    else 裁判不可用
+        GE->>GE: _visual_column_split / _visual_vertical_divider
+        GE-->>P: {source:'visual'|'none', columns, gutters}
+    end
+    Note right of GE: source='none' 时 V-A 无法满足<br/>走 §3.2 第三态降级
+
+    Note over P,TR: ── 阶段 2：B 系列 —— 先定编号归属（权威）──
+    P->>SL: split_major_into_minors(crop, items, profile,<br/>column_evidence=ev, scope=scope)
+    SL->>NM: find_minor_boundaries_strict(items, w, h)
+    Note right of NM: D7 拦截：数字+「.」+数字开头 ⇒ 丢弃<br/>（2.7+0.2= / 3.08+6.32= / 10.67-4.07=）<br/>这一处修掉 F-1（本案 minor_extra 根因）
+    NM-->>SL: strict_boundaries[]
+
+    SL->>TR: build_number_territories(crop, items, boundaries, scope)
+    TR->>TR: B0 按 L1/练习/例N 划分 scope
+    TR->>TR: B2 D6 圈号：行首 + 题干≥4汉字
+    TR->>TR: B3 D5 例题独立成样本，其后练习另起 scope
+    TR->>TR: B4 D2 P 区判据（指令 vs 材料）
+    TR->>TR: B5 L3 归属 (1)(2)/①②③ → number_path 加深
+    TR->>TR: B6 锚点 B1~B6（括号/横线/图不得跨切）
+    TR->>GE: _median_line_height(items)
+    GE-->>TR: line_h
+    TR-->>SL: territories[{y0,y1,num,number_path,level,slots,...}]
+
+    SL->>RC: _recover_missed_minor_boundaries(crop, territories)
+    RC-->>SL: territories（补跳号，仍在 territory 序列内）
+
+    Note over SL,PV: ── 阶段 3：V 系列 —— 再判能否竖切（默认不竖切）──
+    SL->>PV: plan_vertical_cuts(territories, items, ev, crop,<br/>line_h, page_width)
+    loop 每条候选竖切线（仅来自页面级证据）
+        PV->>PV: V-DENY(i) 切线任一侧无编号行？
+        PV->>PV: V-DENY(ii) 上下各 1 行高内无编号行？
+        PV->>PV: V-DENY(iii) 缝宽<max(行高,页宽3%) ∧ 两侧都窄？
+        PV->>PV: V-DENY(iv) 与闭合矩形框相交？
+        PV->>PV: V-DENY(v) 缺口两侧同 number_path 辖区？
+        PV->>PV: V-A 页面级视觉证据成立？
+        PV->>PV: V-B 列顶25%内有编号且左缘≤列宽28%？
+        PV->>PV: V-C 各列编号不同且连续？
+        PV->>PV: V-D 切线与框竖边交点数=0？
+        PV->>PV: V-E 无横跨切线文本行？
+    end
+    PV-->>SL: [{x, allowed, deny_reason, needs_review, reason_detail}]
+
+    Note over SL: ── 阶段 4：三态出样本 ──
+    alt V 全通过（横排并排小题）
+        SL->>SL: territory 一分为二，各重算 y 边界
+    elif 任一 V-DENY 命中（本案：两列口算 / 竖式三框）
+        SL->>SL: 整块 1 条，不竖切，不标记
+    else V-A 部分满足（第三态降级）
+        SL->>SL: 水平带出样本
+        SL->>SL: needs_review=True / vertical_reason='no_page_evidence'
+        Note right of SL: review_level='L2'（规则 §8 L2-9）<br/>裁图画竖直虚线<br/>vertical_candidates 完整落盘供回放
+    end
+
+    SL->>GE: _closed_rect_boxes(crop)（短路：仅含算式/括号时）
+    GE-->>SL: [[x0,y0,x1,y1], ...]
+    SL->>SL: 槽位排序（栏优先：x 聚类 → 列内 y 升序）
+    SL-->>P: minor_cuts[{num, crop_img, _y_start, _y_end,<br/>_x_start, _x_end, _answer_slots, _bbox_parts, _context_ref}]
+
+    Note over P,RC: ── 阶段 5：落盘（既有链路，仅扩字段）──
+    P->>P: attach_question_source_metadata(minors, block, ...)
+    P->>P: build_question_metadata() → schema_version=3
+    P->>P: write_paperflow_project() → record + 4 个新字段

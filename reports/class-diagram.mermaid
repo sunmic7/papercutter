@@ -1,0 +1,230 @@
+%% 切分算法改造：数据结构与接口（2026-10-20 设计稿）
+%% 对应文档：reports/切分算法改造设计_20261020.md
+%% 灰色注释标注「现有 / 新增 / 签名变更」
+
+classDiagram
+    direction TB
+
+    %% ══════════ 数据模型（B 系列产出）══════════
+    class NumberTerritory {
+        +int y0
+        +int y1
+        +str level
+        +int num
+        +list~str~ number_path
+        +str minor_number
+        +bool minor_number_inferred
+        +str boundary_source
+        +str instruction
+        +list material_box
+        +list slots
+        +bool needs_review
+        +str vertical_reason
+        +list vertical_candidates
+    }
+    note for NumberTerritory "【新增】编号辖域。\nB 系列的唯一权威产物：\n「谁拥有哪块像素」。\nV 判定的纵坐标来源。"
+
+    class AnswerSlot {
+        +int slot
+        +str expr
+        +list xy
+        +str answer
+        +bool verified
+    }
+    note for AnswerSlot "【新增】有序槽位。\n栏优先排序（A1）。\nlen 必须与答案槽数相等（A6）。"
+
+    class VerticalCandidate {
+        +int x
+        +int gutter_w
+        +int left_w
+        +int right_w
+        +bool allowed
+        +str deny_reason
+        +bool needs_review
+        +dict reason_detail
+    }
+    note for VerticalCandidate "【新增】一条候选竖切线的判定结果。\n纯判定，不做任何裁切。"
+
+    %% ══════════ 页面级证据 ══════════
+    class ColumnEvidence {
+        +list~tuple~ columns
+        +list gutters
+        +str source
+        +bool usable
+    }
+    note for ColumnEvidence "【新增】V-A 的唯一合法来源。\nsource ∈ {arbiter, visual, none}\n'side_by_side_columns 的聚类结果\n不得作为 source。"
+
+    %% ══════════ 服务类 ══════════
+    class cut_geometry {
+        <<module 新增>>
+        +_median_line_height(ocr_items) int
+        +_column_content_width(ocr_items, x0, x1) int
+        +_closed_rect_boxes(crop) list
+        +_collect_column_evidence(img, profile) ColumnEvidence
+    }
+    note for cut_geometry "【新增模块】几何算子。\n全部纯函数、无 IO、可单测。\n_closed_rect_boxes 是唯一必须\n新写的图像算子（findContours）。"
+
+    class cut_numbering {
+        <<module 新增>>
+        +build_number_territories(major_crop, ocr_items, scope, profile, padding, strict) list~NumberTerritory~
+        +plan_vertical_cuts(territories, ocr_items, column_evidence, major_crop, line_h, page_width) list~VerticalCandidate~
+        -_d7_filter(text) bool
+        -_scope_split(items, boundaries) dict
+        -_d2_p_zone(territory, items, line_h) str
+        -_d6_circled(text) int
+        -_territory_anchor(territory, img, next_y) int
+    }
+    note for cut_numbering "【新增模块】B→V 判定引擎。\nbuild_… = 编排；下划线函数 = 可单测的判定单元。\nplan_vertical_cuts 做成纯函数 →\n单测成本从分钟级降到毫秒级。"
+
+    class cut_questions_v4 {
+        <<module 现有>>
+        +find_minor_boundaries(ocr_items, crop_width, crop_height, strict) list
+        +split_major_into_minors(major_crop, ocr_items, padding, profile, _depth, column_evidence, scope) list
+        -_split_side_by_side_minors(major_crop, ocr_items, boundaries, padding, profile) list
+        -_side_by_side_columns(ocr_items, crop_width, crop_height) list
+        -_find_clean_horizontal_cut(img, current_y, next_y, fallback_padding) int
+        +attach_question_source_metadata(minor_cuts, block, source_path, source_size, deskew_angle) list
+        +build_question_metadata(minor, major_idx, major_title, sequence, crop_info, quality_issues, pairing, answer_source) dict
+        +write_paperflow_project(src_dir, units_pf_data, book_profile) None
+    }
+    note for cut_questions_v4 "签名变更：\n· find_minor_boundaries +strict\n· split_major_into_minors +column_evidence/+scope\n· _split_side_by_side_minors 【删除】\n· _side_by_side_columns 【保留但降级】\n  仅作几何工具，不再是切分依据"
+
+    class layout_strategy {
+        <<module 现有>>
+        +LayoutStrategy strategy_for(profile)
+        +dict to_dict()
+        +LayoutStrategy with_overrides(**overrides)
+        --strict_minor_boundary : bool = True
+        --vertical_cut_default_deny : bool = True
+        --slot_order : str = "column_first"
+    }
+    note for layout_strategy "【新增 3 个开关，不改任何现有字段】\n新增开关必须同时在 DESCRIPTIONS\n给中文说明（该文件既有约定）。\n三个开关均可关 → 关掉即回到旧行为。"
+
+    class layout_arbiter {
+        <<module 冻结>>
+        +available() bool
+        +detect(img, with_regions) dict
+        +resolve_regions(img, regions, ocr_items, log) list
+        +image_regions(img) list
+    }
+    note for layout_arbiter "【冻结 · 不改一行】\n只作为 ColumnEvidence 的供给方\n被读取 columns / gutters\n（两者都是既有键）。"
+
+    %% ══════════ 字段层 ══════════
+    class MinorCut {
+        +int num
+        +ndarray crop_img
+        +bool number_detected
+        +int _y_start
+        +int _y_end
+        +int _x_start
+        +int _x_end
+        +int _anchor_y
+        +str _boundary_source
+        +list _answer_slots
+        +list _bbox_parts
+        +str _context_ref
+        +list _source_box
+        +list _source_segments
+    }
+    note for MinorCut "切分层的中间产物。\n_下划线前缀 = 内部字段，\n落盘时映射为公开字段。"
+
+    class Record {
+        +str id
+        +list bbox
+        +list number_path
+        +str display_number
+        +str major_number
+        +str major_title
+        +str minor_number
+        +str subsection_number
+        +str subsection_title
+        +str region_role
+        +str continuation_of
+        +bool minor_number_inferred
+        +str match_scope_id
+        +str answer_granularity
+        +list answer_slots
+        +list bbox_parts
+        +str context_ref
+        +str review_level
+        +list review_reasons
+        +bool needs_review
+        +str vertical_cut_status
+        +str vertical_reason
+        +list vertical_candidates
+    }
+    note for Record "PaperFlow 工程里的交付记录。\n4 个新字段（answer_granularity /\nanswer_slots / bbox_parts / context_ref）\n必须无条件存在（不挂 PAPERFLOW_ENRICH）。\n注意：规则里的 section_role 就是\n现有的 region_role，不新增枚举值。"
+
+    class ManualAnnotationData {
+        <<module 未冻结>>
+        +normalize_record(record) dict
+        +apply_enrich_defaults(record) dict
+        +load_project(path) dict
+        +number_path(record) list
+        +canonical_number_path(record) tuple
+        --CUT_V4_NORMALIZE_DEFAULTS : dict
+        --CUT_PERSISTENT_KEYS : tuple
+    }
+    note for ManualAnnotationData "向后兼容的唯一落点。\nCUT_V4_NORMALIZE_DEFAULTS 无条件补 4 字段；\nCUT_PERSISTENT_KEYS 供标注 API\n保存时回接（唯一解冻点）。"
+
+    %% ══════════ 关系 ══════════
+    cut_geometry ..> ColumnEvidence : 产出
+    cut_geometry ..> NumberTerritory : 提供 line_h
+    layout_arbiter ..> ColumnEvidence : columns/gutters
+
+    cut_numbering ..> NumberTerritory : 产出
+    cut_numbering ..> VerticalCandidate : 产出
+    cut_numbering ..> cut_geometry : 依赖
+
+    cut_questions_v4 ..> cut_numbering : 编排
+    cut_questions_v4 ..> cut_geometry : 依赖
+    cut_questions_v4 ..> layout_strategy : 读开关
+    cut_questions_v4 ..> layout_arbiter : 读证据（经 _collect_column_evidence）
+
+    NumberTerritory "1" *-- "0..*" AnswerSlot : slots
+    NumberTerritory "0..*" --> "0..*" VerticalCandidate : vertical_candidates
+
+    NumberTerritory ..> MinorCut : 映射为
+    MinorCut ..> Record : attach + build_question_metadata
+    MinorCut "1" --> "1" AnswerSlot : _answer_slots
+
+    Record ..> ManualAnnotationData : load/normalize/持久化
+
+    class LayoutStrategy {
+        <<dataclass>>
+        +str profile
+        +bool strict_minor_boundary
+        +bool vertical_cut_default_deny
+        +str slot_order
+        +list describe()
+    }
+    cut_questions_v4 --> LayoutStrategy : strategy_for(profile)
+
+    class CutQualityAudit {
+        <<module 扩展>>
+        +audit_page(image_path, profile) dict
+        +summarize(records) dict
+        --vertical_cut_false : int = 0
+        --frame_intersected_cuts : int = 0
+        --text_truncated : int = 0
+        --text_contained_rate : float >= 0.995
+    }
+    note for CutQualityAudit "【新增 3 项红线指标】\n+text_contained_rate（只上报）。\nvertical_cut_false 可由既有\ncut_numbers 与 _side_by_side 标记\n直接算，无需新 OCR。"
+
+    class CutGranularityGate {
+        <<module 新增>>
+        +main(baseline, after, case) int
+        --R1 : minor_extra(case) == 0
+        --R2 : minor_extra(all) <= 16
+        --R3 : vertical_cut_false == 0
+        --R4 : frame_intersected_cuts == 0
+        --R5 : text_truncated == 0
+        --R6 : major_recall >= 0.976
+        --R7 : minor_recall >= 0.906
+        --R8 : 10 项软指标 <= 基线
+        --R9 : error_pages <= 17/48
+    }
+    note for CutGranularityGate "R1~R9 门禁脚本。\n退出码 0 = 全过；非 0 = 触发回退判据。\n注意 R2 用工具口径 ≤16；\n规则口径 51 只上报不设门。"
+
+    CutQualityAudit ..> CutGranularityGate : 供数
+    CutQualityAudit ..> cut_questions_v4 : 调 split_major_into_minors
