@@ -349,7 +349,10 @@ class EmployeeWorkbenchInteractionTests(unittest.TestCase):
         main = (APP_JS / "main.js").read_text(encoding="utf-8")
         self.assertIn("label: '打开教材…'", electron)
         self.assertIn("label: '生成交付文件'", electron)
-        self.assertIn("label: '页面'", electron)
+        # 「页面」菜单已删除，旋转并入「视图」；「模式」与文件/视图并列。
+        self.assertNotIn("label: '页面'", electron)
+        self.assertIn("label: '模式'", electron)
+        self.assertIn("顺时针旋转当前页面 90°", electron)
         self.assertIn("还原当前页大小和位置", electron)
         self.assertNotIn("label: '编辑'", electron)
         self.assertNotIn("label: '工具'", electron)
@@ -1071,12 +1074,25 @@ if (run(legacyBreak) !== '第一行\n第二行') throw new Error('literal legacy
         self.assertIn("selectAnnotation(first.answerId)", main_source)
 
     def test_pair_draw_mode_wiring(self):
-        """配对画框：画题框记配对源，答案页画答案框自动配对，页面确认后补配。"""
+        """配对画框：入口在顶部「模式」菜单，画题框记配对源，答案页画答案框自动配对。"""
         html = (APP_JS.parent / "index.html").read_text(encoding="utf-8")
-        self.assertIn('id="employeePairDraw"', html)
+        # 主界面不再放按钮，只保留状态条。
+        self.assertNotIn('id="employeePairDraw"', html)
         self.assertIn('id="pairDrawStatus"', html)
+        # Electron：顶层「模式」菜单与文件/视图并列，页面菜单已删、旋转并入视图。
+        electron = (APP_JS.parent / "electron" / "main.js").read_text(encoding="utf-8")
+        self.assertNotIn("label: '页面'", electron)
+        self.assertIn("label: '模式'", electron)
+        view_pos = electron.index("label: '视图'")
+        mode_pos = electron.index("label: '模式'")
+        self.assertLess(view_pos, mode_pos)
+        rotate_pos = electron.index("menu-rotate-current-page")
+        self.assertGreater(rotate_pos, view_pos, "旋转应并入视图菜单之后发出")
+        self.assertIn("menu-toggle-pair-draw", electron)
+        preload = (APP_JS.parent / "electron" / "preload.js").read_text(encoding="utf-8")
+        self.assertIn("onMenuTogglePairDraw", preload)
         main_source = (APP_JS / "main.js").read_text(encoding="utf-8")
-        self.assertIn("togglePaperFlowPairMode(", main_source)
+        self.assertIn("onMenuTogglePairDraw?.(() => this.togglePaperFlowPairMode())", main_source)
         self.assertIn("async onPaperFlowPairFrameDrawn(", main_source)
         self.assertIn("async flushPaperFlowPairAnswers(", main_source)
         # 绘制与选中两个钩子都要接上。
