@@ -63,7 +63,7 @@ PRELABEL_INFERENCE_LOCK = threading.Lock()
 PRELABEL_INFLIGHT_LOCK = threading.Lock()
 PRELABEL_INFLIGHT: dict[tuple, "_PrelabelFlight"] = {}
 ANSWER_PRELABEL_REVIEW_THRESHOLD = 120
-PAPERFLOW_BRIDGE_REVISION = "scope-number-match-relaxed-20261020"
+PAPERFLOW_BRIDGE_REVISION = "confident-auto-match-20261020"
 # 总开关：置 0/false/no/off 时 _save_page 不冻结不分级、三条 enrich 路由直接返回
 # {"ok": false, "disabled": true}，主流程行为与接入前完全一致。
 ENRICH_DISABLED_VALUES = {"0", "false", "no", "off"}
@@ -1246,9 +1246,12 @@ def _set_pair(payload: dict) -> dict:
     }
 
 
-def _accept_confident_matches(payload: dict) -> dict:
-    """Conservatively accept only unambiguous, confirmed-answer suggestions."""
-    project_path, project = _load_project(payload)
+def _confident_match_proposals(project: dict) -> list[tuple[str, str, float]]:
+    """唯一推荐自动配对的候选：题号层级完全一致、得分与分差足够、答案未被占用。
+
+    供两处复用：`_accept_confident_matches`（人工触发批量确认）与
+    `_auto_match_scopes`（自动匹配末尾对剩余题目直接应用唯一推荐）。
+    """
     existing = {str(pair.get("question_id", "")): pair for pair in project.get("pairs", [])}
     used_answers = {
         str(answer_id)
@@ -1280,6 +1283,13 @@ def _accept_confident_matches(payload: dict) -> dict:
             continue
         proposals.append((question_id, answer_id, float(best_score)))
         reserved_answers.add(answer_id)
+    return proposals
+
+
+def _accept_confident_matches(payload: dict) -> dict:
+    """Conservatively accept only unambiguous, confirmed-answer suggestions."""
+    project_path, project = _load_project(payload)
+    proposals = _confident_match_proposals(project)
     saved_pairs: dict[str, dict] = {}
     saved_metrics: dict[str, dict] = {}
     for question_id, answer_id, _score in proposals:
@@ -1480,8 +1490,9 @@ def _auto_match_scopes(payload: dict) -> dict:
     """Match confirmed Q/A records sharing scope and canonical number.
 
     按用户规则放宽：同分组且完整题号相同即自动配对，不再要求两侧唯一。
-    同号的多道题（常见于跨页续题被切成多个框）会共用同一批答案；没有
-    对应答案的题号保持待处理，交人工核对。
+    同号的多道题（常见于跨页续题被切成多个框）会共用同一批答案；随后对
+    剩余未匹配的题应用「唯一推荐」自动配对（题号层级完全一致、分差足够），
+    有误由人工后续修改。没有对应答案的题号保持待处理，交人工核对。
     """
     project_path, project = _load_project(payload)
     existing_questions = {
@@ -1539,17 +1550,32 @@ def _auto_match_scopes(payload: dict) -> dict:
             pair for pair in project.get("pairs", [])
             if str(pair.get("question_id", "")) == question_id
         ))
-    if proposals and _enrich_enabled():
-        enrich_snapshot.refresh_answer_segment(
-            project,
-            sorted({answer_id for _question_id, answer_ids, _scope_id in proposals for answer_id in answer_ids}),
+    # 唯一推荐直接自动匹配（用户规则 2026-10-20）：同号配对后仍未匹配的题，
+    # 若推荐答案唯一且与第二候选分差足够，先匹配上，有误由人工后续修改。
+    confident_proposals = _confident_match_proposals(project)
+    for question_id, answer_id, _score in confident_proposals:
+        annotation_data.set_pair(
+            project, question_id, [answer_id], "accepted", source="confident_auto"
         )
-    if proposals:
+        _write_pair_metrics(project, question_id, [answer_id])
+        saved_pairs.append(next(
+            pair for pair in project.get("pairs", [])
+            if str(pair.get("question_id", "")) == question_id
+        ))
+    touched_answer_ids = sorted({
+        answer_id
+        for _question_id, answer_ids, _scope_id in proposals
+        for answer_id in answer_ids
+    } | {answer_id for _question_id, answer_id, _score in confident_proposals})
+    if touched_answer_ids and _enrich_enabled():
+        enrich_snapshot.refresh_answer_segment(project, touched_answer_ids)
+    if touched_answer_ids:
         annotation_data.save_project(project, project_path)
         sync_project(project_path, project, ROOT / "runtime")
     return {
         "ok": True,
         "accepted_count": len(proposals),
+        "confident_count": len(confident_proposals),
         "conflict_count": len(conflicts),
         "conflicts": conflicts[:100],
         "pairs": saved_pairs,

@@ -800,6 +800,48 @@ class AnnotationApiTests(unittest.TestCase):
         paired_answers = {tuple(pair["answer_ids"]) for pair in result["pairs"]}
         self.assertEqual(paired_answers, {(answer_id,)})
 
+    def test_scope_auto_match_accepts_a_unique_recommendation(self) -> None:
+        """唯一推荐自动匹配：同号配对没命中的题，若推荐答案唯一且分差足够，直接配对。
+
+        题目没有归入分组，同号配对不会命中；但题号层级与答案完全一致且
+        第二候选分差很大，属于唯一推荐，应自动匹配，无需人工确认。
+        """
+        project = api.annotation_data.load_project(self.project_path)
+        project["pages"][0].update(status="accepted", questions=[
+            api.annotation_data.new_record([1, 1, 20, 20], number_path=["九", "3"]),
+        ])
+        project["answer_pages"][0].update(status="accepted", answers=[
+            api.annotation_data.new_record([1, 1, 20, 20], answer=True, number_path=["九", "3"]),
+            api.annotation_data.new_record([30, 1, 50, 20], answer=True, number_path=["九", "4"]),
+        ])
+        api.annotation_data.save_project(project, self.project_path)
+        result = api._auto_match_scopes({"project_path": str(self.project_path)})
+        self.assertEqual(result["accepted_count"], 0)
+        self.assertEqual(result["confident_count"], 1)
+        self.assertEqual(result["conflict_count"], 0)
+        question_id = project["pages"][0]["questions"][0]["id"]
+        pair = next(item for item in result["pairs"] if item["question_id"] == question_id)
+        self.assertEqual(pair["source"], "confident_auto")
+        self.assertEqual(
+            pair["answer_ids"], [project["answer_pages"][0]["answers"][0]["id"]]
+        )
+
+    def test_scope_auto_match_keeps_ambiguous_recommendations_for_manual_review(self) -> None:
+        """两个候选都能对上题号时不算唯一推荐，保持待处理交人工核对。"""
+        project = api.annotation_data.load_project(self.project_path)
+        project["pages"][0].update(status="accepted", questions=[
+            api.annotation_data.new_record([1, 1, 20, 20], number_path=["九", "3"]),
+        ])
+        project["answer_pages"][0].update(status="accepted", answers=[
+            api.annotation_data.new_record([1, 1, 20, 20], answer=True, number_path=["九", "3"]),
+            api.annotation_data.new_record([30, 1, 50, 20], answer=True, number_path=["九", "3"]),
+        ])
+        api.annotation_data.save_project(project, self.project_path)
+        result = api._auto_match_scopes({"project_path": str(self.project_path)})
+        self.assertEqual(result["accepted_count"], 0)
+        self.assertEqual(result["confident_count"], 0)
+        self.assertEqual(result["pairs"], [])
+
     def test_selected_question_and_answer_pages_can_be_removed_from_a_scope(self) -> None:
         scope = api._upsert_match_scope({
             "project_path": str(self.project_path), "name": "可移除分组",
