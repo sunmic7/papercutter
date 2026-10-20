@@ -1070,6 +1070,27 @@ if (run(legacyBreak) !== '第一行\n第二行') throw new Error('literal legacy
         self.assertIn("loadPaperFlowKind('answer', page.image)", main_source)
         self.assertIn("selectAnnotation(first.answerId)", main_source)
 
+    def test_pair_draw_mode_wiring(self):
+        """配对画框：画题框记配对源，答案页画答案框自动配对，页面确认后补配。"""
+        html = (APP_JS.parent / "index.html").read_text(encoding="utf-8")
+        self.assertIn('id="employeePairDraw"', html)
+        self.assertIn('id="pairDrawStatus"', html)
+        main_source = (APP_JS / "main.js").read_text(encoding="utf-8")
+        self.assertIn("togglePaperFlowPairMode(", main_source)
+        self.assertIn("async onPaperFlowPairFrameDrawn(", main_source)
+        self.assertIn("async flushPaperFlowPairAnswers(", main_source)
+        # 绘制与选中两个钩子都要接上。
+        self.assertIn("void this.onPaperFlowPairFrameDrawn(annotation)", main_source)
+        self.assertIn("setPaperFlowPairQuestion(cardAnnotation.id)", main_source)
+        # 确认本页后自动补配挂起的答案框。
+        self.assertIn("await this.flushPaperFlowPairAnswers()", main_source)
+        # 配对复用既有 set-pair 端点，后端零改动。
+        flush_start = main_source.index("async flushPaperFlowPairAnswers(")
+        self.assertIn(
+            "'/api/project/set-pair'",
+            main_source[flush_start:flush_start + 3000],
+        )
+
     def test_confirmed_match_keeps_the_stable_pair_identity_from_backend(self):
         source = (APP_JS / "main.js").read_text(encoding="utf-8")
         start = source.index("async confirmPaperFlowMatch(noAnswer)")
