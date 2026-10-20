@@ -76,3 +76,9 @@ desktop_annotation/_ui_baseline/**
 
 # 19MB 训练权重，不入库
 *.pt
+
+# 部署密钥与本地工具配置，绝不入库
+.paperflow-deploy-key-temp
+*.deploy-key
+.claude/
+.workbuddy/
