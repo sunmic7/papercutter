@@ -1099,13 +1099,14 @@ if (run(legacyBreak) !== '第一行\n第二行') throw new Error('literal legacy
         # 绘制与选中两个钩子都要接上。
         self.assertIn("void this.onPaperFlowPairFrameDrawn(annotation)", main_source)
         self.assertIn("setPaperFlowPairQuestion(cardAnnotation.id)", main_source)
-        # 答案页点选已有答案框也要配对（刚画的框由创建钩子处理）。
+        # 答案页点选答案框也要配对（画/点选统一走 pairPaperFlowAnswerFrame）。
         select_pos = main_source.index("onAnnotationSelect(annotation)")
         self.assertIn(
-            "pairPaperFlowAnswerFrame(cardAnnotation, false)",
+            "pairPaperFlowAnswerFrame(cardAnnotation)",
             main_source[select_pos:],
         )
-        # 配对时把配对源题框的题号同步到答案框上。
+        # 配对时把配对源题框的题号同步到答案框上；配对源跨页后从项目内存取题号。
+        self.assertIn("paperFlowPairQuestionNumberPath", main_source)
         self.assertIn("attrs.paperflowNumberPath = questionPath.slice()", main_source)
         self.assertIn("attrs.paperflowNumberInferred = false", main_source)
         # 确认本页后自动补配挂起的答案框。
