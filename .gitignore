@@ -73,3 +73,6 @@ desktop_annotation/_ui_baseline/**
 !desktop_annotation/_ui_baseline/
 !desktop_annotation/_ui_baseline/**/
 !desktop_annotation/_ui_baseline/**/_manifest.json
+
+# 19MB 训练权重，不入库
+*.pt
