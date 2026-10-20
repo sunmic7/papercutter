@@ -1,0 +1,66 @@
+{
+  "version": "candidate-rules-2026.10.1",
+  "updated_at": "2026-10-19",
+  "note": "题图候选的版面筛选、归属判定与机器硬拒阈值。全部外置，因为不同版式（对开扫描 vs 手机拍照）的最优阈值明显不同，写死在代码里必然要在现场改代码。读取方：layout_arbiter.image_rules() 与 review_tools.illustration_candidates.RULES。",
+  "image_regions": {
+    "labels": [
+      "image",
+      "figure",
+      "chart",
+      "formula",
+      "table"
+    ],
+    "score_min": 0.5,
+    "area_ratio_min": 0.0002,
+    "side_min": 64
+  },
+  "owner": {
+    "contain_area_ratio": 0.85,
+    "confidences": {
+      "contain": 0.95,
+      "center": 0.8,
+      "nearest": 0.5,
+      "cross_column": 0.0,
+      "orphan": 0.0
+    },
+    "nearest_gap_ratio": 1.2,
+    "nearest_overlap_tolerance_ratio": 0.15,
+    "gutter_cross_ratio": 0.2,
+    "column_epsilon": 1.0
+  },
+  "hard_reject": {
+    "page_like": {
+      "hamming_max": 64,
+      "hash_size": 32,
+      "page_area_ratio_min": 0.9,
+      "page_similarity_min": 0.9,
+      "page_margin_ratio_max": 0.05,
+      "note": "三条判据取或，任意一条命中即 page_like：① 32×32 感知哈希汉明距离 ≤64 —— 抓\"整页缩略图被贴成一个小区域\"这类内容级克隆；② 面积 ≥ 页面积 90% 且与整页相似度 ≥0.9 —— 防止哈希被大面积留白拉偏；③ 候选框四边到页边的距离都 ≤ 该方向页宽/页高的 5% —— 抓\"框就是整页\"，纯几何、与内容无关。阈值依据（QA 实测真实扫描页 4929×3382）：整页框内缩 0/1/2/3/5/8/12/20/40px 时汉明距离为 0/2/4/5/8/14/20/38/80，即单靠位级阈值必须放宽到 64 才覆盖常态抖动；真实题图与整页的汉明距离是 384~572（相似度 0.44~0.63），64 / 0.9 / 5% 都有数倍余量。③ 的边界由**短边**决定，不按像素数：同一 40px 内缩在 1000×1400（高 margin 2.86%）被拦、在 1000×686（高 margin 5.83%）被放行；对开真实页 4929×3382 上 40px(1.18%) 拦、175px(5.17%) 放行。换算成面积，有效护栏约在\"面积 ≥ 0.83~0.87（随纵横比浮动）\"。"
+    },
+    "table_region": {
+      "enabled": false,
+      "reason": "table_region",
+      "note": "默认降级为待复核：需求允许图表/统计图作题图（如「班级/人数」统计表本身就是统计题的题图），但表格数据也要求可转写，故交人判断；严格模式可置 true 一律硬拒"
+    },
+    "formula_only": {
+      "vertical_ratio_max": 3,
+      "horizontal_ratio_max": 6,
+      "thin_area_ratio_max": 0.02,
+      "thin_height_ratio_max": 0.05,
+      "reason": "formula_only",
+      "note": "formula 区域满足任一即硬拒：a) 高/宽 >3 或 宽/高 >6（长条公式）；b) 面积 <2% 页面积；c) 高度 <5% 页高（细条算式行，如 `78×199≈16000( )`）。其余 formula 保留但标 needs_review=True，因为\"公式与题干混排的长框\"可能是有效题图，需要人看。"
+    },
+    "number_label": {
+      "area_min": 0.0015,
+      "side_min": 48
+    },
+    "too_small": {
+      "side_min": 128
+    }
+  },
+  "quality_gate": {
+    "min_side_px": 128,
+    "min_area_ratio": 0.0002,
+    "note": "min_side_px 与 delivery_workspace._k12_validation 的 128 门槛对齐，前置到候选阶段"
+  }
+}

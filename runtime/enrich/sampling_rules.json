@@ -1,0 +1,43 @@
+{
+  "type": "zero_defect_acceptance",
+  "version": "sampling-rules-2026.10",
+  "updated_at": "2026-10-19",
+  "confidence": 0.95,
+  "defects_allowed": 0,
+  "tiers": [
+    {
+      "target_error_rate": 0.05,
+      "n": 59,
+      "upper_bound": 0.0495
+    },
+    {
+      "target_error_rate": 0.1,
+      "n": 29,
+      "upper_bound": 0.0981
+    },
+    {
+      "target_error_rate": 0.15,
+      "n": 19,
+      "upper_bound": 0.1459
+    }
+  ],
+  "statement_template": "0/{n} -> 95% one-sided upper bound {upper_bound_pct}%",
+  "forbidden_statements": [
+    "该批错率 ≤5%",
+    "95% 概率检出 5% 错误",
+    "错率是 0"
+  ],
+  "statement_note": "对外表述只能来自 statement_template。禁止说「该批错率≤5%」（点估计，无置信度），禁止说「95% 概率检出 5% 错误」（那是检出功效）。",
+  "formula": "n = ceil(ln(1-confidence) / ln(1-target_error_rate))",
+  "sampling_pool_level": "L0",
+  "strata_keys": ["page_index", "question_type", "region_role"],
+  "scopes": ["batch", "stratum"],
+  "stratum_note": "单本 L0 池 < n 时必须累积到 stratum；stratum_id 未指定时报错，不默认放行到批级（D3）。",
+  "degrade": {
+    "batch_trigger_defects": 1,
+    "stratum_recall_min_same_defects": 3,
+    "note": "批级：抽检 ≥1 缺陷即全 L0 降 L2；层级：全检发现 ≥3 条同类错才回溯（D5）。两者作用域不同，不能混用阈值。"
+  },
+  "verification_nat": 384,
+  "verification_nat_note": "384 只适用于一次性资质审计/客户复核，不实现为默认值（按 384/批等于全检，制度必被绕过）。"
+}
