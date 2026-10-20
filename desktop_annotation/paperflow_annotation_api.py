@@ -63,7 +63,7 @@ PRELABEL_INFERENCE_LOCK = threading.Lock()
 PRELABEL_INFLIGHT_LOCK = threading.Lock()
 PRELABEL_INFLIGHT: dict[tuple, "_PrelabelFlight"] = {}
 ANSWER_PRELABEL_REVIEW_THRESHOLD = 120
-PAPERFLOW_BRIDGE_REVISION = "enrich-snapshot-20261020"
+PAPERFLOW_BRIDGE_REVISION = "moved-book-root-heal-20261020"
 # 总开关：置 0/false/no/off 时 _save_page 不冻结不分级、三条 enrich 路由直接返回
 # {"ok": false, "disabled": true}，主流程行为与接入前完全一致。
 ENRICH_DISABLED_VALUES = {"0", "false", "no", "off"}
@@ -536,6 +536,15 @@ def _open_book(payload: dict) -> dict:
         if annotation_data.is_company_public_delivery_root(project.get("delivery_output_root")):
             project.pop("delivery_output_root", None)
             changed = True
+        # 教材文件夹被整体复制/搬移时，随行的项目文件里 book_root / image_root
+        # 仍指向旧位置；后续所有走 _load_project 的接口都会报"标注项目路径与
+        # 教材目录不匹配"。项目文件就放在本次打开的教材目录旁，它属于这本教材，
+        # 因此以实际打开目录为准把根字段改回来（自愈），而不是让用户手工改 JSON。
+        for stale_root_key in ("book_root", "image_root", "answer_image_root"):
+            stale_root = project.get(stale_root_key)
+            if stale_root and Path(str(stale_root)).resolve() != book_root:
+                project[stale_root_key] = str(book_root)
+                changed = True
         changed = bool(annotation_data.remove_cached_delivery_pages(project, book_root)) or changed
         changed = _remove_parent_question_boxes(project) or changed
         # 版式画像落盘：以前每次 /api/prelabel 都按目录名现猜，结果不落盘、

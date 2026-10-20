@@ -63,6 +63,39 @@ class AnnotationApiTests(unittest.TestCase):
         saved = api.annotation_data.load_project(self.project_path)
         self.assertFalse(saved["ocr_settings"]["auto_page_ocr_on_confirm"])
 
+    def test_open_book_repairs_stale_roots_of_a_moved_book_project(self) -> None:
+        """教材文件夹整体复制/搬移后，随行项目文件的根字段仍指向旧目录。
+
+        打开教材时应以实际打开目录为准自愈，否则后续所有走 _load_project
+        的接口（保存缓存、页面分类等）都会报"标注项目路径与教材目录不匹配"。
+        """
+        moved = Path(self.temp.name) / "教材副本"
+        (moved / "answers").mkdir(parents=True)
+        image = np.full((200, 300, 3), 255, dtype=np.uint8)
+        cv2.imwrite(str(moved / "question.png"), image)
+        cv2.imwrite(str(moved / "answers" / "answer.png"), image)
+        project = {
+            "book_root": str(self.book),
+            "image_root": str(self.book),
+            "answer_image_root": str(self.book),
+            "pages": [{"image": "question.png"}],
+            "answer_pages": [{"image": "answers/answer.png"}],
+        }
+        moved_project_path = moved / "PaperFlow标注项目.json"
+        api.annotation_data.save_project(project, moved_project_path)
+
+        opened = api._open_book({"book_root": str(moved)})
+        self.assertEqual(Path(opened["project"]["book_root"]), moved.resolve())
+        self.assertEqual(Path(opened["project"]["image_root"]), moved.resolve())
+        self.assertEqual(Path(opened["project"]["answer_image_root"]), moved.resolve())
+
+        # 自愈后 _load_project 校验通过，页面分类等接口可以正常工作。
+        result = api._reclassify_pages({
+            "project_path": str(moved_project_path), "source_kind": "answer",
+            "page_indices": [0], "target_kind": "question",
+        })
+        self.assertEqual(result["moved"], 1)
+
     def test_prelabel_rejects_an_image_that_is_not_the_requested_project_page(self) -> None:
         outside = self.book / "outside.png"
         cv2.imwrite(str(outside), np.full((20, 20, 3), 255, dtype=np.uint8))
