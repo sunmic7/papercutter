@@ -10,7 +10,12 @@ from pathlib import Path
 from typing import Any
 
 
-EXPECTED_INPUT_SHAPE = [1, 3, 640, 640]
+SUPPORTED_INPUT_SHAPES = {
+    (1, 3, 640, 640),
+    (1, 3, 960, 960),
+    (1, 3, 1280, 1280),
+    (1, 3, 1600, 1600),
+}
 EXPECTED_CLASS = "question"
 
 
@@ -21,8 +26,10 @@ def _normalise_shape(shape: Any) -> list[Any]:
 def validate_contract_metadata(manifest: dict[str, Any], input_shape: list[Any], input_type: str, output_shape: list[Any], output_type: str) -> list[str]:
     """Return human-readable violations; kept separate for unit testing."""
     errors: list[str] = []
-    if input_shape != EXPECTED_INPUT_SHAPE:
-        errors.append(f"输入形状必须是 {EXPECTED_INPUT_SHAPE}，实际为 {input_shape}")
+    if tuple(input_shape) not in SUPPORTED_INPUT_SHAPES:
+        errors.append(
+            f"输入形状必须是受支持的方形尺寸之一，实际为 {input_shape}"
+        )
     if input_type != "tensor(float)":
         errors.append(f"输入类型必须是 tensor(float)，实际为 {input_type}")
     if output_type != "tensor(float)":
@@ -35,8 +42,8 @@ def validate_contract_metadata(manifest: dict[str, Any], input_shape: list[Any],
         errors.append("清单 model_name 必须为 question_detector")
     if manifest.get("classes") != {"0": EXPECTED_CLASS}:
         errors.append("清单 classes 必须严格为 {\"0\": \"question\"}")
-    if manifest.get("input", {}).get("shape") != EXPECTED_INPUT_SHAPE:
-        errors.append("清单 input.shape 必须为 [1, 3, 640, 640]")
+    if manifest.get("input", {}).get("shape") != input_shape:
+        errors.append("清单 input.shape 必须与 ONNX 实际输入形状一致")
     output = manifest.get("output", {})
     if output.get("nms_in_model") is not True or output.get("format") != "ultralytics_nms":
         errors.append("清单 output 必须声明 ultralytics_nms 与 nms_in_model=true")

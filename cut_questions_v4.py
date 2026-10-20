@@ -48,9 +48,9 @@ import numpy as np
 import review_queue
 import question_detector
 import answer_detector
+import layout_strategy
 import answer_region_detector
 import vlm_hybrid
-import live_review_protocol
 
 # ═══════════════════════════════════════════════════════════════
 # 配置
@@ -94,8 +94,13 @@ OCR_ANCHOR_MAX_SIDE = 1200
 ANSWER_OCR_MAX_SIDE = 1600
 DESKEW_ANALYSIS_MAX_SIDE = 1100
 MIN_OCR_CONFIDENCE = 0.35
+# 同一大题标题被 OCR 拆成两个文字框时，两框的 y 差上限与 x 差上限（像素）。
+# 前者用来识别“同一行拆成两块”，后者用来排除对开页左右两页印着同一个大题号。
+SPLIT_MAJOR_MERGE_GAP = 90
+SPLIT_MAJOR_MERGE_DX = 1200
 # 环境变量只供性能基准隔离缓存使用；正常运行保持固定版本并持续复用缓存。
 OCR_CACHE_VERSION = os.environ.get('PAPERCUTTER_OCR_CACHE_VERSION', 'ocr-v3-1800-20260729')
+# 输出模式：默认 PaperFlow 预标注 JSON；通过 --export-crops 可恢复旧裁图输出。
 
 # 批量任务的故障定位上下文。process_year 会在某本教材意外异常后读取它，
 # 只重试/跳过出错单元，而不是让整批任务直接结束。
@@ -443,6 +448,10 @@ OLYMPIAD_LESSON_RE = re.compile(
     r'^第(?:[一二三四五六七八九十百千万]+|\d{1,3})(?:讲|课|节)'
 )
 OLYMPIAD_CIRCLED_NUMBERS = '①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳'
+# “①把动物分类……”这种行 = 圈号 + 题干；只有一个圈号的行是图注，不匹配。
+RE_CIRCLED_STEM = re.compile(
+    r'^([' + OLYMPIAD_CIRCLED_NUMBERS + r'])\s*(.+)$', re.S
+)
 COVER_KEYWORDS = ('ISBN', '定价', '责任编辑', '封面设计', '出版发行', '版权所有')
 NON_CONTENT_PAGE_KEYWORDS = ('目录', '图书在版编目', 'CIP数据', '版权页')
 PAPER_START_RE = re.compile(
@@ -478,112 +487,6 @@ def emit_progress(phase, current, total, message='', **extra):
     # the local desktop client reads the original page directly from disk.
     payload.update(extra)
     print(PROGRESS_PREFIX + json.dumps(payload, ensure_ascii=False), flush=True)
-
-
-def _live_review_candidates(minor_cuts):
-    """Convert in-memory cuts into a small, JSON-safe page-review proposal."""
-    candidates = []
-    for index, minor in enumerate(minor_cuts):
-        box = minor.get('_source_box', [])
-        if not isinstance(box, (list, tuple)) or len(box) != 4:
-            continue
-        candidates.append({
-            'id': f'cut-{index + 1}',
-            'source_id': f'cut-{index + 1}',
-            'box': [int(value) for value in box],
-            'number': minor.get('num'),
-            'number_detected': bool(minor.get('number_detected', False)),
-            'risk_flags': ([
-                '题号未可靠识别',
-            ] if not minor.get('number_detected', True) else []) + ([
-                '模型按序列补全题号',
-            ] if minor.get('_inferred_number') else []),
-        })
-    return candidates
-
-
-def _apply_live_review_decision(page_img, page_path, minor_cuts, decision):
-    """Make accepted page edits authoritative before crops are written.
-
-    Existing cuts keep their OCR evidence when merely resized.  Newly drawn
-    boxes deliberately have no trusted question number and therefore remain
-    traceable as manual additions in later review and training data.
-    """
-    original = {f'cut-{index + 1}': minor for index, minor in enumerate(minor_cuts)}
-    height, width = page_img.shape[:2]
-    reviewed = []
-    for item in decision.get('candidates', []):
-        box = item.get('box', [])
-        if not isinstance(box, list) or len(box) != 4:
-            continue
-        x0, y0, x1, y1 = (max(0, int(value)) for value in box)
-        x1, y1 = min(width, x1), min(height, y1)
-        if x1 <= x0 or y1 <= y0:
-            continue
-        source_id = str(item.get('source_id') or '')
-        source = original.get(source_id)
-        if source is None:
-            cut = {
-                'num': int(item.get('number') or 0),
-                'number_detected': False,
-                '_number_confidence': 0.0,
-                '_boundary_source': 'manual_live_review',
-                '_review_added': True,
-                '_source_path': os.path.abspath(page_path),
-                '_source_size': [width, height],
-                '_major_box': [0, 0, width, height],
-                '_page_deskew_angle': 0.0,
-            }
-        else:
-            cut = dict(source)
-            if item.get('number') not in (None, ''):
-                try:
-                    cut['num'] = int(item['number'])
-                except (TypeError, ValueError):
-                    pass
-        cut['_source_box'] = [x0, y0, x1, y1]
-        cut['crop_img'] = page_img[y0:y1, x0:x1].copy()
-        cut['_live_reviewed'] = True
-        cut['_live_review_original_box'] = list(source.get('_source_box', [])) if source else []
-        # A human replacement describes one page.  Preserve cross-page source
-        # segments only for unchanged cuts; otherwise record the exact new box.
-        if source is None or cut['_source_box'] != cut['_live_review_original_box']:
-            cut['_source_segments'] = [{
-                'image': cut.get('_source_path', ''),
-                'size': list(cut.get('_source_size', [width, height])),
-                'question_box': [x0, y0, x1, y1],
-                'page_deskew_angle': float(cut.get('_page_deskew_angle', 0.0)),
-            }]
-        reviewed.append(cut)
-    reviewed.sort(key=lambda value: (value.get('_source_box', [0, 0, 0, 0])[1], value.get('_source_box', [0, 0, 0, 0])[0]))
-    return reviewed
-
-
-def review_page_cuts(page_img, page_path, minor_cuts, *, unit_name='', major_title='', page_label=''):
-    """Publish a local preview, optionally waiting for human page approval."""
-    if not live_review_protocol.enabled() or page_img is None or page_img.size == 0:
-        return minor_cuts
-    height, width = page_img.shape[:2]
-    request_path, request = live_review_protocol.create_request(
-        image_path=page_path,
-        image_size=(width, height),
-        candidates=_live_review_candidates(minor_cuts),
-        book_name=CURRENT_RUN_CONTEXT.get('book_name') or '',
-        unit_name=unit_name,
-        major_title=major_title,
-        page_label=page_label,
-    )
-    emit_progress(
-        'page_preview', 0, 0, f'等待页面审核：{page_label}',
-        review_request=str(request_path), review_mode=live_review_protocol.mode(),
-    )
-    if live_review_protocol.mode() != 'gate':
-        return minor_cuts
-    print(f'    [人工审核] 已提交 {page_label}，等待确认…')
-    decision = live_review_protocol.wait_for_decision(request)
-    result = _apply_live_review_decision(page_img, page_path, minor_cuts, decision)
-    print(f'    [人工审核] 已确认 {page_label}：{len(result)} 个题框')
-    return result
 
 
 def reset_run_stats():
@@ -858,9 +761,6 @@ def build_question_metadata(
             'shared_context_box': list(minor.get('_shared_context_box', [])),
             'vlm_primary_group_id': minor.get('_vlm_group_id', ''),
             'vlm_outside_returned_groups': bool(minor.get('_vlm_outside_group', False)),
-            'live_reviewed': bool(minor.get('_live_reviewed', False)),
-            'live_review_added': bool(minor.get('_review_added', False)),
-            'live_review_original_box': list(minor.get('_live_review_original_box', [])),
         },
         'normalization': _json_safe_crop_info(crop_info),
         'quality_issues': list(quality_issues or []),
@@ -926,6 +826,22 @@ def unique_paths(paths):
             seen.add(key)
             result.append(path)
     return result
+
+
+def resolve_paperflow_book_root(src_dir):
+    """返回员工在 PaperFlow 中应打开的实际图片目录。"""
+    root = os.path.abspath(src_dir)
+    if list_images(root):
+        return root
+    image_children = [
+        path for path in (
+            os.path.join(root, name) for name in os.listdir(root)
+        )
+        if os.path.isdir(path)
+        and not os.path.basename(path).startswith('_')
+        and list_images(path)
+    ]
+    return image_children[0] if len(image_children) == 1 else root
 
 
 def completion_marker_path(unit_dir):
@@ -1006,15 +922,38 @@ def source_book_fingerprint(src_dir):
     }
 
 
-def is_completed_book(src_dir, book_out_dir, fingerprint=None):
-    """在 OCR 前验证整本完成标记；输入内容一致才允许整本跳过。"""
+def is_completed_book(src_dir, book_out_dir, fingerprint=None, output_mode='crops'):
+    """在 OCR 前验证与当前输出模式匹配的整本完成结果。"""
+    actual = fingerprint or source_book_fingerprint(src_dir)
+    if output_mode == 'paperflow':
+        project_path = os.path.join(src_dir, 'PaperFlow标注项目.json')
+        if not os.path.isfile(project_path):
+            return False, None
+        try:
+            with open(project_path, 'r', encoding='utf-8') as file:
+                data = json.load(file)
+            valid = (
+                data.get('kind') == 'papercutter_manual_annotation'
+                and data.get('preannotation_mode') == 'paperflow'
+                # 旧版已发布项目没有 status；兼容它们，避免重跑覆盖人工补标。
+                # 新版的不完整任务不会发布项目，若外部显式标为 incomplete 则绝不跳过。
+                and data.get('status', 'complete') == 'complete'
+                and data.get('algorithm_version') == ALGORITHM_VERSION
+                and data.get('source_fingerprint') == actual
+                and isinstance(data.get('pages'), list)
+                and isinstance(data.get('answer_pages'), list)
+            )
+            return (True, data) if valid else (False, None)
+        except (OSError, ValueError, TypeError) as error:
+            print(f'  [警告] 无法读取 PaperFlow 预标注项目，将重新处理：{error}')
+            return False, None
+
     marker = book_completion_marker_path(book_out_dir)
     if not os.path.isfile(marker) or os.path.isdir(os.path.join(book_out_dir, '_运行中')):
         return False, None
     try:
         with open(marker, 'r', encoding='utf-8') as file:
             data = json.load(file)
-        actual = fingerprint or source_book_fingerprint(src_dir)
         valid = (
             data.get('status') == 'complete'
             and data.get('algorithm_version') == ALGORITHM_VERSION
@@ -1060,7 +999,7 @@ def adopt_legacy_completed_book(src_dir, book_out_dir, profile, fingerprint):
     # 对新版已修复的“思维拓展32练”不能沿用旧版整书合并结果。
     book_name = os.path.basename(os.path.normpath(src_dir))
     if (
-        profile == 'olympiad'
+        layout_strategy.strategy_for(profile).legacy_flat_unit_guard
         and len(children) == 1
         and os.path.basename(children[0]) == '第一课时'
         and '32练' in book_name
@@ -1182,50 +1121,103 @@ def is_non_question_section(title):
     return any(keyword in normalized for keyword in NON_QUESTION_SECTION_KEYWORDS)
 
 
-def infer_book_profile(src_dir):
-    """根据书名和目录结构推断裁剪场景，供后续策略选择。"""
+# 版式画像（profile）决定结构 OCR 的画布范围与大题边界规则。整套取值集中
+# 在这里，界面只需要展示中文名，不需要知道内部代号。
+BOOK_PROFILE_CHOICES = (
+    'general', 'exam', 'workbook', 'drill', 'holiday', 'olympiad', 'instructional',
+)
+BOOK_PROFILE_LABELS = {
+    'general': '通用（不套用专用规则）',
+    'exam': '试卷 / 单元卷',
+    'workbook': '课堂练习 / 作业本',
+    'drill': '口算 / 速算题卡',
+    'holiday': '假期作业',
+    'olympiad': '奥数与思维训练',
+    'instructional': '教材解读 / 讲解',
+}
+# 检测规则或抽样口径变化时必须改这个版本号，否则旧缓存会被继续复用。
+BOOK_PROFILE_REVISION = 'book-profile-v2-20261019'
+BOOK_PROFILE_SAMPLE_LIMIT = 3
+# 抽样页结构 OCR 的总时间上限。试卷对开扫描单页可能要几十秒，宁可少读一页
+# 也不能让后台识别无限拖下去（前台预标注会和它抢 CPU）。
+BOOK_PROFILE_OCR_BUDGET = 150.0
+
+
+def infer_book_profile_detail(src_dir):
+    """根据书名推断版式，并返回命中的词，供界面解释“为什么是这个版式”。
+
+    判定顺序即优先级，改动会直接影响老项目的识别结果，必须同步回归
+    ``tests/test_smart_cutter.py`` 里的 profile 用例。
+    """
     name = os.path.basename(os.path.normpath(src_dir))
     # 周测、单元测、达标检测等通常也是完整试卷；若先命中“训练”会被
     # 误归为 workbook，结构 OCR 只抽样两侧窄条，三栏题面会因此漏掉中栏。
-    if any(word in name for word in (
+    for word in (
         '试卷', '金卷', '卷王', '全能卷', '测试卷', '周测', '单元测',
         '达标检测', '阶段检测', '模拟卷', '月考',
-    )):
-        return 'exam'
-    if any(word in name for word in ('口算', '题卡', '速算')):
-        return 'drill'
-    if '暑假' in name or '寒假' in name:
-        return 'holiday'
-    if '奥数' in name or '思维' in name:
-        return 'olympiad'
-    if any(word in name for word in ('教材解读', '教材全解', '知识讲解')):
-        return 'instructional'
-    if any(word in name for word in ('课堂', '同步', '作业', '练习', '训练')):
-        return 'workbook'
-    return 'general'
+    ):
+        if word in name:
+            return 'exam', word
+    for word in ('口算', '题卡', '速算'):
+        if word in name:
+            return 'drill', word
+    for word in ('暑假', '寒假'):
+        if word in name:
+            return 'holiday', word
+    for word in ('奥数', '思维'):
+        if word in name:
+            return 'olympiad', word
+    for word in ('教材解读', '教材全解', '知识讲解'):
+        if word in name:
+            return 'instructional', word
+    for word in ('课堂', '同步', '作业', '练习', '训练'):
+        if word in name:
+            return 'workbook', word
+    return 'general', ''
+
+
+def infer_book_profile(src_dir):
+    """根据书名和目录结构推断裁剪场景，供后续策略选择。"""
+    return infer_book_profile_detail(src_dir)[0]
+
+
+def refine_profile_from_text_detail(profile, text):
+    """同 ``refine_profile_from_text``，额外返回判定依据。
+
+    依据会写进项目，员工在界面上能看到“自动识别为试卷，因为正文含……”，
+    判错时才知道该改成什么。
+    """
+    if profile != 'general':
+        return profile, ''
+    compact = re.sub(r'\s+', '', text or '')
+    for word in ('暑假生活', '寒假生活', '暑假作业', '寒假作业', '假期体验'):
+        if word in compact:
+            return 'holiday', f'正文含“{word}”'
+    if PAPER_START_RE.search(compact):
+        return 'exam', '正文含单元/期中/期末测试卷名'
+    if (
+        '时间' in compact and '总分' in compact
+        and any(word in compact for word in ('检测', '试卷', '考试'))
+    ):
+        return 'exam', '正文含“时间/总分”卷面抬头'
+    for word in ('奥数', '举一反三', '思维训练', '竞赛专题'):
+        if word in compact:
+            return 'olympiad', f'正文含“{word}”'
+    instructional_hits = [word for word in INSTRUCTIONAL_KEYWORDS if word in compact]
+    if len(instructional_hits) >= 2:
+        return 'instructional', '正文含' + '、'.join(f'“{word}”' for word in instructional_hits[:3])
+    for word in ('口算题卡', '口算练习', '速算', '计时口算'):
+        if word in compact:
+            return 'drill', f'正文含“{word}”'
+    exercise_hits = [word for word in EXERCISE_KEYWORDS if word in compact]
+    if len(exercise_hits) >= 2:
+        return 'workbook', '正文含' + '、'.join(f'“{word}”' for word in exercise_hits[:3])
+    return profile, ''
 
 
 def refine_profile_from_text(profile, text):
     """书名信息不足时，用页面正文把 general 场景细化为更合适的策略。"""
-    if profile != 'general':
-        return profile
-    compact = re.sub(r'\s+', '', text or '')
-    if any(word in compact for word in ('暑假生活', '寒假生活', '暑假作业', '寒假作业', '假期体验')):
-        return 'holiday'
-    if (
-        PAPER_START_RE.search(compact)
-        or ('时间' in compact and '总分' in compact and any(word in compact for word in ('检测', '试卷', '考试')))
-    ):
-        return 'exam'
-    if any(word in compact for word in ('奥数', '举一反三', '思维训练', '竞赛专题')):
-        return 'olympiad'
-    if sum(1 for word in INSTRUCTIONAL_KEYWORDS if word in compact) >= 2:
-        return 'instructional'
-    if any(word in compact for word in ('口算题卡', '口算练习', '速算', '计时口算')):
-        return 'drill'
-    if sum(1 for word in EXERCISE_KEYWORDS if word in compact) >= 2:
-        return 'workbook'
-    return profile
+    return refine_profile_from_text_detail(profile, text)[0]
 
 
 def refine_profile_from_images(profile, image_paths, ocr_max_side=OCR_FAST_MAX_SIDE):
@@ -1251,6 +1243,192 @@ def refine_profile_from_images(profile, image_paths, ocr_max_side=OCR_FAST_MAX_S
         detected = refine_profile_from_text(profile, '\n'.join(combined_text))
         if detected != 'general':
             return detected
+    return profile
+
+
+def book_profile_cache_path(book_root, runtime_root=None):
+    """版式画像按教材根目录落盘，路径不随 Python 进程重启而变化。"""
+    root = runtime_root or RUNTIME_DIR
+    key = hashlib.sha1(
+        os.path.normcase(os.path.abspath(book_root)).encode('utf-8', 'surrogateescape')
+    ).hexdigest()
+    return os.path.join(str(root), 'profile_cache', f'{key}.json')
+
+
+def _profile_sample_signature(paths):
+    """抽样页的“身份”：文件名 + 大小 + mtime，任一项变化即视为换了页面。"""
+    signature = []
+    for path in paths:
+        try:
+            stat = os.stat(path)
+        except OSError:
+            signature.append([os.path.basename(path), -1, -1])
+            continue
+        signature.append([os.path.basename(path), int(stat.st_size), int(stat.st_mtime_ns)])
+    return signature
+
+
+def _profile_sample_paths(image_paths, limit=BOOK_PROFILE_SAMPLE_LIMIT):
+    """等间隔取页，避开封面与版权页，同时保证首尾都有覆盖。"""
+    paths = [path for path in image_paths if path]
+    if not paths:
+        return []
+    if len(paths) <= limit:
+        return paths
+    fractions = (0.12, 0.5, 0.85) if limit == 3 else tuple(
+        (index + 1) / (limit + 1) for index in range(limit)
+    )
+    picked = []
+    for fraction in fractions[:limit]:
+        index = min(len(paths) - 1, max(0, int(round(fraction * (len(paths) - 1)))))
+        if paths[index] not in picked:
+            picked.append(paths[index])
+    return picked
+
+
+def read_book_profile_cache(book_root, runtime_root=None):
+    """读取已落盘的版式判定；版本号或教材路径不符时一律当作未命中。"""
+    path = book_profile_cache_path(book_root, runtime_root)
+    try:
+        with open(path, 'r', encoding='utf-8') as file:
+            payload = json.load(file)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get('revision') != BOOK_PROFILE_REVISION:
+        return None
+    if payload.get('profile') not in BOOK_PROFILE_CHOICES:
+        return None
+    return payload
+
+
+def _write_book_profile_cache(book_root, payload, runtime_root=None):
+    path = book_profile_cache_path(book_root, runtime_root)
+    temporary = f'{path}.tmp'
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(temporary, 'w', encoding='utf-8') as file:
+            json.dump(payload, file, ensure_ascii=False, indent=2)
+        os.replace(temporary, path)
+    except OSError:
+        try:
+            os.remove(temporary)
+        except OSError:
+            pass
+
+
+def _profile_title_lines(ocr_items):
+    """只保留像标题的短行，用来判定教材版式。
+
+    整页正文直接喂给 ``refine_profile_from_text`` 会被前言坑到：100 分攻略的
+    “编写说明”里写着“分课时同步练习和阶段检测卷两部分”，于是整本书被判成
+    试卷。卷名、栏目名都是短行且不含句读，按这个形状过滤能挡掉绝大多数前言
+    与讲解段落；漏判只会退回 general，比判错安全。
+    """
+    lines = []
+    for item in ocr_items:
+        text = re.sub(r'\s+', '', item.get('text', '') or '')
+        if not text or len(text) > 28:
+            continue
+        if any(mark in text for mark in '。；，、'):
+            continue
+        lines.append(text)
+    return lines
+
+
+def detect_book_profile(book_root, image_paths=None, runtime_root=None,
+                        force=False, sample_limit=BOOK_PROFILE_SAMPLE_LIMIT,
+                        ocr_budget=BOOK_PROFILE_OCR_BUDGET, ocr_guard=None):
+    """判定教材版式：书名优先，书名判不出来时抽样正文。
+
+    返回 ``profile`` / ``source``（name/text/cache/general）``reason`` /
+    ``sampled`` / ``cached``。抽样 OCR 是这里唯一的重活，结果按教材落盘，
+    同一本教材只在首次（或抽样页变化后）真正跑一次。
+
+    ``ocr_guard`` 是调用方提供的上下文管理器；桥服务用它逐页借用预标注推理
+    锁，使后台抽样最多只挡住一次前台点击，而不是整轮识别。
+    """
+    book_root = os.path.abspath(book_root)
+    name_profile, name_word = infer_book_profile_detail(book_root)
+    base = {
+        'book_root': book_root,
+        'name': os.path.basename(os.path.normpath(book_root)),
+        'name_profile': name_profile,
+        'revision': BOOK_PROFILE_REVISION,
+    }
+    if name_profile != 'general':
+        return {**base, 'profile': name_profile, 'source': 'name',
+                'reason': f'书名含“{name_word}”', 'sampled': [], 'cached': False}
+
+    paths = list(image_paths) if image_paths is not None else list_images(book_root)
+    sample = _profile_sample_paths(paths, sample_limit)
+    signature = _profile_sample_signature(sample)
+    cached = None if force else read_book_profile_cache(book_root, runtime_root)
+    if cached and cached.get('sample') == signature:
+        return {**base, 'profile': cached['profile'], 'source': 'cache',
+                'reason': cached.get('reason', ''), 'sampled': cached.get('sampled', []),
+                'cached': True}
+    if not sample:
+        return {**base, 'profile': 'general', 'source': 'general',
+                'reason': '教材目录下没有可抽样的页面', 'sampled': [], 'cached': False}
+
+    started = time.perf_counter()
+    texts = []
+    sampled = []
+    for path in sample:
+        if texts and time.perf_counter() - started > ocr_budget:
+            break
+        try:
+            img = cv2_imread(path)
+            if img is None:
+                continue
+            if ocr_guard is None:
+                items = ocr_page_structure(path, img)
+            else:
+                with ocr_guard:
+                    items = ocr_page_structure(path, img)
+            texts.extend(_profile_title_lines(items))
+            sampled.append(os.path.basename(path))
+        except Exception as exc:  # 单页失败不能拖垮整本教材的判定
+            print(f'[警告] 版式抽样识别失败（{os.path.basename(path)}）：{exc}')
+    profile, reason = refine_profile_from_text_detail('general', '\n'.join(texts))
+    payload = {
+        **base,
+        'profile': profile,
+        'reason': reason or ('已读抽样页但未命中版式关键词，保持通用' if texts else '抽样页没有读出文字'),
+        'sampled': sampled,
+        'sample': signature,
+        'created_at': datetime.now().isoformat(timespec='seconds'),
+    }
+    _write_book_profile_cache(book_root, payload, runtime_root)
+    return {**payload, 'source': 'text', 'cached': False}
+
+
+def auto_book_profile(book_root, runtime_root=None):
+    """不跑 OCR 的版式判定：书名优先，其次复用抽样结论。返回 (profile, source, reason)。"""
+    profile, word = infer_book_profile_detail(book_root)
+    if word:
+        return profile, 'auto_name', f'书名含“{word}”'
+    cached = read_book_profile_cache(book_root, runtime_root)
+    if cached:
+        return cached['profile'], 'auto_text', str(cached.get('reason', '') or '')
+    return 'general', 'default', '书名未提供版式线索，暂用通用版式'
+
+
+def resolve_book_profile(src_dir, image_root=None):
+    """命令行入口使用的版式：书名优先，其次复用界面落盘的抽样结论。
+
+    界面（桥服务）会把抽样正文判出的版式写进 ``runtime/profile_cache``；
+    命令行对同一本书必须拿到同一个结论，否则“界面切得对、命令行切得错”。
+    """
+    profile, word = infer_book_profile_detail(src_dir)
+    if word:
+        return profile
+    for candidate in (image_root, src_dir):
+        if not candidate:
+            continue
+        cached = read_book_profile_cache(candidate)
+        if cached and cached.get('profile') in BOOK_PROFILE_CHOICES:
+            return cached['profile']
     return profile
 
 
@@ -1417,16 +1595,17 @@ def classify_page(img, ocr_items, profile='general'):
     instruction_score = sum(1 for word in INSTRUCTIONAL_KEYWORDS if word in compact)
     exercise_score = sum(1 for word in EXERCISE_KEYWORDS if word in compact)
     title = detect_page_title(ocr_items, height)
+    strategy = layout_strategy.strategy_for(profile)
 
     if answer_score >= 3:
         kind = 'answer'
     elif any(word in compact for word in NON_CONTENT_PAGE_KEYWORDS) and major_count == 0:
         kind = 'non_content'
-    elif profile == 'exam' and '大试卷' in compact and major_count == 0 and minor_count == 0:
+    elif strategy.wide_title_as_cover and '大试卷' in compact and major_count == 0 and minor_count == 0:
         kind = 'non_content'
     elif cover_score >= 2 and major_count == 0 and minor_count <= 1:
         kind = 'non_content'
-    elif profile == 'instructional' and instruction_score >= 2 and exercise_score == 0:
+    elif strategy.instructional_without_exercise and instruction_score >= 2 and exercise_score == 0:
         kind = 'instruction'
     elif len(ocr_items) <= 3 and major_count == 0:
         kind = 'non_content'
@@ -1514,13 +1693,13 @@ def paper_start_reason(page_info, profile='general'):
     ):
         return 'VLM卷名'
     # “思维拓展32练”“奥数练习册”等平铺扫描文件没有子目录；每一练
-    # 的页眉“第X练”就是可靠的新单元边界。仅在奥数/训练场景启用，
+    # 的页眉“第X练”就是可靠的新单元边界。仅在启用该策略的版式打开，
     # 以免普通教材正文出现“第X练”时被误拆。
-    if profile in {'olympiad', 'workbook', 'drill'} and title:
+    if layout_strategy.strategy_for(profile).practice_title_boundary and title:
         practice_match = RE_PRACTICE_TITLE.fullmatch(title)
         if practice_match:
             return '第X练'
-    if profile != 'exam':
+    if not layout_strategy.strategy_for(profile).exam_cover_fallback:
         return ''
 
     # 某些扫描件的花体卷名会被轻量 OCR 漏读，但每份卷子首页稳定带有
@@ -1548,7 +1727,14 @@ def find_minor_boundaries(ocr_items, crop_width, crop_height):
     这样可过滤正文中被 OCR 误读成“数字+点”的碎片。
     """
     candidates = []
-    left_limit = max(90, int(crop_width * 0.28))
+    # 疑似题号：形状像“题号+点+数字”，但被 extract_minor_anchor 判成小数。
+    # 不立即采信，等主序列建好后只用来填补空缺。
+    suspects = []
+    # 题号一般贴着栏的左缘，用来挡住正文里的数字碎片。但横向并排的小问，
+    # 题号本来就落在块中部，继续套"左 28%"会把 2. 3. 全丢掉。横排长条改为
+    # 只做纵向合法性判断，横向交给 side_by_side 的连续序列校验兜底。
+    side_by_side_layout = crop_height < crop_width * 0.6
+    left_limit = crop_width if side_by_side_layout else max(90, int(crop_width * 0.28))
     line_heights = []
     for item in ocr_items:
         text = item['text'].strip()
@@ -1572,13 +1758,28 @@ def find_minor_boundaries(ocr_items, crop_width, crop_height):
             )
             if joined:
                 num, style = int(joined.group(1)), 'primary'
-        if num is None or num > 150 or item.get('conf', 1.0) < MIN_OCR_CONFIDENCE:
-            continue
         bbox = item['bbox']
         x = int(min(point[0] for point in bbox))
         y = int(min(point[1] for point in bbox))
         box_height = max(point[1] for point in bbox) - min(point[1] for point in bbox)
         if x < 0 or x > left_limit or y < 0 or y >= crop_height:
+            continue
+        if num is None:
+            # 题号与题目正文之间没有空格时（“2.0.42的计数单位是”），整段开头
+            # 会被当成小数 2.0，题号整批丢失——密排填空题因此塌缩成一道题。
+            # 这里只登记为疑似，因为正文里的“4.75×0.98”“10.01×0.11”形状相同。
+            leading = re.match(r'^([0-9]{1,2})[\.．]\s*\S', text)
+            if leading and item.get('conf', 1.0) >= MIN_OCR_CONFIDENCE:
+                suspect_num = int(leading.group(1))
+                if 1 <= suspect_num <= 150:
+                    suspects.append({
+                        'num': suspect_num, 'style': 'primary', 'text': text,
+                        'y': y, 'x': x,
+                        'confidence': float(item.get('conf', 1.0)),
+                        '_suspect': True,
+                    })
+            continue
+        if num > 150 or item.get('conf', 1.0) < MIN_OCR_CONFIDENCE:
             continue
         line_heights.append(max(1, box_height))
         candidates.append({
@@ -1612,7 +1813,19 @@ def find_minor_boundaries(ocr_items, crop_width, crop_height):
                 and candidate['num'] == boundaries[-1]['num'] + 1
                 and gap >= max(16, int(typical_height * 0.72))
             )
-            if compact_sequential:
+            # 横向并排的小问（1. 2. 3. 排在同一条水平线上）题号 y 差通常只有
+            # 几个像素，靠 y 永远分不开。连续编号 + 明显横向间隔是可靠证据，
+            # 先保留，由 split_major_into_minors 按 x 切开。
+            side_by_side = (
+                candidate['style'] == 'primary'
+                and boundaries[-1]['style'] == 'primary'
+                and candidate['num'] == boundaries[-1]['num'] + 1
+                and candidate['x'] - boundaries[-1]['x'] >= max(120, int(crop_width * 0.12))
+            )
+            if compact_sequential or side_by_side:
+                if side_by_side:
+                    candidate['side_by_side'] = True
+                    boundaries[-1]['side_by_side'] = True
                 boundaries.append(candidate)
             elif candidate['x'] < boundaries[-1]['x']:
                 # 同一行/相邻噪点只保留靠左的一个题号。
@@ -1620,9 +1833,34 @@ def find_minor_boundaries(ocr_items, crop_width, crop_height):
             continue
         boundaries.append(candidate)
 
+    # 疑似题号只在“正好补上已确认序列的空缺”时采纳，即前一道已确认题的
+    # 编号 +1。这样 2.0.42 / 3.3.47 / 4.1里面有 能救回成第 2、3、4 题，
+    # 而第 8 题选项里的 4.75×0.98、10.01×0.11 因为编号不接续而继续被忽略。
+    if suspects:
+        merged = sorted(
+            [(candidate['y'], 0, candidate) for candidate in boundaries]
+            + [(suspect['y'], 1, suspect) for suspect in suspects],
+            key=lambda value: (value[0], value[1]),
+        )
+        rescued = []
+        for _y, kind, candidate in merged:
+            if kind == 1:
+                if rescued and candidate['num'] == rescued[-1]['num'] + 1:
+                    candidate.pop('_suspect', None)
+                    rescued.append(candidate)
+                continue
+            rescued.append(candidate)
+        boundaries = rescued
+
     # 单个孤立“题号”很容易是正文数字；除非它确实是第1题，否则不据此强切。
+    # 例外：多栏延续页/栏的顶部整段是上一题跨栏续文，栏内通常只有栏中部一个
+    # 非1题号（如三栏试卷页第二栏只有“35.”，上方全部是上一题的子问续写）。
+    # 此时题号距栏顶足够远、其上方存在可观续文，保留该边界由装配阶段剥离
+    # 顶部续文；贴近栏顶的孤立数字仍按正文数字处理。
     if len(boundaries) == 1 and boundaries[0]['num'] != 1:
-        return []
+        min_fragment_height = max(60, min(150, int(crop_height * 0.30)))
+        if boundaries[0]['y'] < min_fragment_height:
+            return []
 
     # 选择整体最连贯的题号序列。允许同号重新开始，但过滤明显的随机跳号。
     coherent = []
@@ -1646,7 +1884,8 @@ def find_minor_boundaries(ocr_items, crop_width, crop_height):
 
 def find_unnumbered_boundaries(ocr_items, crop_width, crop_height, profile):
     """对装饰图标题号等 OCR 难以读出的场景，用大段垂直留白恢复题块。"""
-    if profile == 'holiday':
+    strategy = layout_strategy.strategy_for(profile)
+    if strategy.unnumbered_activity:
         activity_starts = []
         for item in ocr_items:
             text = re.sub(r'\s+', '', item.get('text', ''))
@@ -1661,7 +1900,7 @@ def find_unnumbered_boundaries(ocr_items, crop_width, crop_height, profile):
                 for index, y in enumerate([0] + activity_starts, 1)
             ]
 
-    if profile != 'olympiad' or len(ocr_items) < 3:
+    if not strategy.unnumbered_whitespace or len(ocr_items) < 3:
         return []
     lines = []
     for item in ocr_items:
@@ -1750,6 +1989,43 @@ def _run_ocr(image_input):
     return _parse_ocr_result(engine.ocr(image_input, cls=True))
 
 
+_STRIP_OCR_CACHE_ENABLED = True
+
+
+def _run_ocr_cached_strip(strip):
+    """对内存图片做内容寻址缓存后跑 OCR。
+
+    跳号补救会对每处跳号单独重识别一条横条带，同一页反复切分（界面里
+    改一次框就重跑一次、离线审计要跑多轮）时会重复计算。缓存只存 OCR
+    原文，切分逻辑仍然逐次重跑，所以改判据不受缓存影响。
+
+    单元测试会 patch ``_run_ocr`` 换取不同结果，同一张合成图的缓存会跨
+    用例命中；需要时把 ``_STRIP_OCR_CACHE_ENABLED`` 置 False。
+    """
+    if not _STRIP_OCR_CACHE_ENABLED:
+        return _run_ocr(strip)
+    if strip is None or not hasattr(strip, 'shape'):
+        return _run_ocr(strip)
+    digest = hashlib.sha1()
+    digest.update(f'{OCR_CACHE_VERSION}|{strip.shape}'.encode('ascii'))
+    digest.update(np.ascontiguousarray(strip).tobytes())
+    key = digest.hexdigest()
+    path = os.path.join(RUNTIME_DIR, 'ocr_cache', 'strip', key[:2], f'{key}.json')
+    try:
+        with open(path, encoding='utf-8') as file:
+            return json.load(file)
+    except (OSError, ValueError):
+        pass
+    items = _run_ocr(strip)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as file:
+            json.dump(items, file, ensure_ascii=False)
+    except OSError:
+        pass
+    return items
+
+
 def _run_fast_ocr(image_input):
     """运行项目内轻量模型；不可用时安全回退到既有高精度 OCR。
     接受图片路径或 BGR numpy 数组，避免为 OCR 输入额外写临时文件。
@@ -1809,23 +2085,31 @@ def _ocr_cache_location(img_path, max_side=OCR_MAX_SIDE, crop_box=None, cache_ta
     )
 
 
-def ocr_image(img_path, max_side=OCR_MAX_SIDE, crop_box=None):
-    """对整图或指定区域做 OCR；区域结果坐标始终映射回原始页面。"""
+def ocr_image(img_path, max_side=OCR_MAX_SIDE, crop_box=None, force_refresh=False):
+    """对整图或指定区域做 OCR；区域结果坐标始终映射回原始页面。
+
+    ``force_refresh`` is reserved for an annotator explicitly asking to
+    regenerate a page.  That action must exercise the current OCR + cutting
+    pipeline, rather than returning an earlier disk or process-memory result.
+    The newly recognised result still refreshes the normal cache afterwards.
+    """
     max_side = max(640, int(max_side))
     crop_box = _normalized_crop_box(crop_box)
     cache_key, cache_path, legacy_cache_path = _ocr_cache_location(
         img_path, max_side=max_side, crop_box=crop_box,
     )
-    if cache_key and cache_key in _ocr_memory_cache:
+    if not force_refresh and cache_key and cache_key in _ocr_memory_cache:
         RUN_STATS['ocr_cache_hit_count'] += 1
         return [dict(item) for item in _ocr_memory_cache[cache_key]]
-    readable_cache_path = next(
-        (
-            path for path in (cache_path, legacy_cache_path)
-            if path and os.path.isfile(path)
-        ),
-        None,
-    )
+    readable_cache_path = None
+    if not force_refresh:
+        readable_cache_path = next(
+            (
+                path for path in (cache_path, legacy_cache_path)
+                if path and os.path.isfile(path)
+            ),
+            None,
+        )
     if readable_cache_path:
         try:
             with open(readable_cache_path, 'r', encoding='utf-8') as file:
@@ -2019,7 +2303,7 @@ def _merge_ocr_items(*groups):
     return merged
 
 
-def ocr_page_structure(img_path, img, profile='general'):
+def ocr_page_structure(img_path, img, profile='general', force_refresh=False):
     """将标题和题号带拼成较小画布，只做一次 OCR 后映射回原页坐标。
 
     试卷首页的卷名常印在页高 13%～25% 的居中位置；旧版只保留最上方
@@ -2027,7 +2311,8 @@ def ocr_page_structure(img_path, img, profile='general'):
     因此 exam 场景扩大标题带，但仍只用轻量 OCR，不增加整页高精度 OCR。
     """
     height, width = img.shape[:2]
-    header_ratio = 0.28 if profile == 'exam' else 0.13
+    strategy = layout_strategy.strategy_for(profile)
+    header_ratio = strategy.header_ratio
     header_height = min(height, max(150, int(height * header_ratio)))
     header_scale = 0.72
     header_width = max(1, int(width * header_scale))
@@ -2038,12 +2323,19 @@ def ocr_page_structure(img_path, img, profile='general'):
     # for ordinary facing-page scans, but it silently discards the middle
     # column and makes later layout detection impossible.  For the exam
     # profile, keep the complete page in the one-pass structure OCR canvas.
-    if profile == 'exam':
+    if strategy.full_width_structure:
         left_width = width
         right_source_x = None
         right_width = 0
     elif split is None:
-        left_width = min(width, max(180, int(width * 0.30)))
+        # 单页竖版没有装订缝，“只读左 30% 边条”就失去了前提：练习册常把
+        # 四、五、六大题排在页面中右部，边条采样会整批丢掉，右半页只能退回
+        # “整页”单块（全能测控 0002586A、奥赛天天练 006_0069 都是这个形态）。
+        # 宽幅对开扫描仍保留边条采样，避免中间的装订白带白跑。
+        if width / max(1, height) < 1.24:
+            left_width = width
+        else:
+            left_width = min(width, max(180, int(width * 0.30)))
         right_source_x = None
         right_width = 0
     else:
@@ -2072,10 +2364,10 @@ def ocr_page_structure(img_path, img, profile='general'):
     cache_key, cache_path, legacy_cache_path = _ocr_cache_location(
         img_path, max_side=OCR_ANCHOR_MAX_SIDE, cache_tag=cache_tag,
     )
-    if cache_key and cache_key in _ocr_memory_cache:
+    if not force_refresh and cache_key and cache_key in _ocr_memory_cache:
         RUN_STATS['ocr_cache_hit_count'] += 1
         return [dict(item) for item in _ocr_memory_cache[cache_key]]
-    if cache_path and os.path.isfile(cache_path):
+    if not force_refresh and cache_path and os.path.isfile(cache_path):
         try:
             with open(cache_path, 'r', encoding='utf-8') as file:
                 cached = json.load(file)
@@ -2150,11 +2442,16 @@ def _init_structure_ocr_worker():
     os.environ['PAPERCUTTER_OCR_THREADS'] = str(min(4, os.cpu_count() or 4))
 
 
-def _structure_ocr_worker(image_path):
-    """子进程任务：只做独立页面的结构 OCR，不写正式结果目录。"""
+def _structure_ocr_worker(image_path, profile='general'):
+    """子进程任务：只做独立页面的结构 OCR，不写正式结果目录。
+
+    ``profile`` 决定结构 OCR 的画布范围（exam 覆盖整页以保留多栏），必须
+    与 ``prepare_structured_unit_ocr`` 中该页所属单元的 profile 一致，
+    否则预计算缓存会被“只抽样两侧条带”的低覆盖结果取代。
+    """
     reset_run_stats()
     img = cv2_imread(image_path)
-    items = ocr_page_structure(image_path, img) if img is not None else []
+    items = ocr_page_structure(image_path, img, profile=profile) if img is not None else []
     return image_path, items, dict(RUN_STATS)
 
 
@@ -2427,21 +2724,54 @@ def _remove_detached_footer(mask):
         stats for stats in component_stats[1:]
         if stats[cv2.CC_STAT_AREA] >= 5
     ]
-    horizontal_strokes = sum(
-        1 for stats in meaningful_components
-        if (
-            stats[cv2.CC_STAT_WIDTH] >= max(12, int(width * 0.012))
-            and stats[cv2.CC_STAT_WIDTH] >= stats[cv2.CC_STAT_HEIGHT] * 4
-        )
-    )
     footer_area = int(np.count_nonzero(footer_region))
-    # 常见页码是“— 1 —”：末段居中、很窄，由一个数字和两条短横线组成。
+    # 末段墨迹可能在同一行带混入页边拾噪（如左缘“1”、右缘“2”这类孤立小墨点），
+    # 把整段宽度/中心测偏。以面积最大的连通块为锚，只把水平上相邻的块并入
+    # “核心块组”，据此重测页脚形状；真·正文宽行（如长公式、横线）仍会保持大跨度而落选。
+    proximity = max(4, int(width * 0.18))
+    anchor = (
+        max(meaningful_components, key=lambda s: s[cv2.CC_STAT_AREA])
+        if meaningful_components else None
+    )
+    core_components = []
+    if anchor is not None:
+        anchor_left = anchor[cv2.CC_STAT_LEFT]
+        anchor_right = anchor[cv2.CC_STAT_LEFT] + anchor[cv2.CC_STAT_WIDTH]
+        core_components = [
+            stats for stats in meaningful_components
+            if max(
+                stats[cv2.CC_STAT_LEFT] - anchor_right,
+                anchor_left - (stats[cv2.CC_STAT_LEFT] + stats[cv2.CC_STAT_WIDTH]),
+                0,
+            ) <= proximity
+        ]
+    if core_components:
+        core_left = min(stats[cv2.CC_STAT_LEFT] for stats in core_components)
+        core_right = max(
+            stats[cv2.CC_STAT_LEFT] + stats[cv2.CC_STAT_WIDTH]
+            for stats in core_components
+        )
+        core_span = (core_right - core_left + 1) / width
+        core_center = (core_right + core_left) / (2 * width)
+        core_strokes = sum(
+            1 for stats in core_components
+            if (
+                stats[cv2.CC_STAT_WIDTH] >= max(12, int(width * 0.012))
+                and stats[cv2.CC_STAT_WIDTH] >= stats[cv2.CC_STAT_HEIGHT] * 4
+            )
+        )
+    else:
+        core_span = 0.0
+        core_center = 0.0
+        core_strokes = 0
+    # 常见页码是“— 1 —”：核心块组居中、很窄，由一个数字和两条短横线组成。
     # 它可能位于原始裁块中部（页码下面还有整段扫描白边），不能只看相对页底位置。
     looks_like_page_number = (
-        0.02 <= footer_span <= 0.28
-        and 0.32 <= footer_center <= 0.68
-        and 2 <= len(meaningful_components) <= 7
-        and horizontal_strokes >= 2
+        core_components
+        and 0.02 <= core_span <= 0.28
+        and 0.32 <= core_center <= 0.68
+        and 2 <= len(core_components) <= 7
+        and core_strokes >= 2
         and footer_end - footer_start <= max(60, int(height * 0.24))
     )
     # Some books print the footer as a very small coloured “- 2 -”.  After
@@ -2450,22 +2780,33 @@ def _remove_detached_footer(mask):
     # centred, three-part footprint is still strong evidence when isolated
     # beneath real question content.
     compact_page_marker = (
-        0.015 <= footer_span <= 0.12
-        and 0.38 <= footer_center <= 0.62
-        and 2 <= len(meaningful_components) <= 5
+        core_components
+        and 0.015 <= core_span <= 0.12
+        and 0.38 <= core_center <= 0.62
+        and 2 <= len(core_components) <= 5
         and footer_end - footer_start <= max(32, int(height * 0.12))
         and footer_area <= max(360, int(width * 0.40))
+    )
+    # 页脚文字有时紧贴在最后一行正文之下（隔 ~20~30px），常见阈值 `0.12*height`
+    # 会漏掉；只要页脚形状成立、下方还有一段明显留白直达裁块底，就按“终段页脚”处置。
+    footer_tail = height - footer_end
+    terminal_footer = (
+        (looks_like_page_number or compact_page_marker)
+        and footer_tail >= max(80, int(height * 0.20))
+        and footer_start >= int(height * 0.35)
     )
     detached = footer_start - previous_end >= max(30, int(height * 0.12))
     if compact_page_marker:
         detached = footer_start - previous_end >= max(18, int(height * 0.06))
+    if terminal_footer:
+        detached = footer_start - previous_end >= max(12, int(height * 0.02))
     looks_marginal = (
         footer_start >= height * 0.62
         # 扫描页通常在页脚装饰带之后还保留一截白边，不能要求墨迹贴住图底。
         and footer_end >= height * 0.75
         and footer_end - footer_start <= height * 0.28
         and footer_span >= 0.72
-    ) or looks_like_page_number or compact_page_marker
+    ) or looks_like_page_number or compact_page_marker or terminal_footer
     if detached and looks_marginal:
         cleaned = mask.copy()
         # 抗锯齿会在分段起点上方残留一两行淡墨；回退数行一起清掉，
@@ -2814,6 +3155,52 @@ def trim_cuts_to_page_sidebar_exclusions(minor_cuts, page_img, exclusions):
     return minor_cuts
 
 
+def trim_cuts_to_column_bounds(minor_cuts, page_img, column_bounds):
+    """Keep every emitted question box inside its verified reading column.
+
+    Rule-based cuts already start with these bounds, but an optional detector
+    refinement can enlarge a box afterwards.  In a multi-column page that
+    enlargement must never cross a confirmed gutter and absorb a neighbour.
+    """
+    if page_img is None or page_img.size == 0 or not minor_cuts:
+        return minor_cuts
+    if not isinstance(column_bounds, (list, tuple)) or len(column_bounds) != 2:
+        return minor_cuts
+    height, width = page_img.shape[:2]
+    try:
+        column_x0 = max(0, min(width, int(column_bounds[0])))
+        column_x1 = max(0, min(width, int(column_bounds[1])))
+    except (TypeError, ValueError):
+        return minor_cuts
+    if column_x1 <= column_x0:
+        return minor_cuts
+    for minor in minor_cuts:
+        # A shared-context crop is already composed from several segments and
+        # no longer equals the raw ``_source_box`` rectangle on this page;
+        # re-cropping it flat would silently strip the attached preamble.
+        if minor.get('_shared_context_attached'):
+            continue
+        box = minor.get('_source_box', [])
+        if not isinstance(box, (list, tuple)) or len(box) != 4:
+            continue
+        x0, y0, x1, y1 = (int(value) for value in box)
+        bounded_x0 = max(column_x0, min(width, x0))
+        bounded_x1 = min(column_x1, max(0, x1))
+        bounded_y0 = max(0, min(height, y0))
+        bounded_y1 = max(0, min(height, y1))
+        if bounded_x1 <= bounded_x0 or bounded_y1 <= bounded_y0:
+            continue
+        if (bounded_x0, bounded_y0, bounded_x1, bounded_y1) == (x0, y0, x1, y1):
+            continue
+        minor['_source_box'] = [bounded_x0, bounded_y0, bounded_x1, bounded_y1]
+        minor['crop_img'] = page_img[bounded_y0:bounded_y1, bounded_x0:bounded_x1].copy()
+        minor['_column_bounds_trimmed'] = True
+        segments = minor.get('_source_segments')
+        if isinstance(segments, list) and len(segments) == 1:
+            segments[0]['question_box'] = list(minor['_source_box'])
+    return minor_cuts
+
+
 def trim_cuts_to_detached_page_footer(minor_cuts, page_img, bottom_tolerance=2):
     """Remove a proven detached footer from cuts that reach the page bottom.
 
@@ -2988,14 +3375,17 @@ def crop_quality_issues(img, content_mask=None):
         issues.append('高度过小')
     if width < 80:
         issues.append('宽度过小')
-    if width / max(1, height) > 28 and height < 80:
-        issues.append('疑似空白细条')
     mask = content_mask
     if mask is None or mask.shape[:2] != img.shape[:2]:
         mask = _content_mask(img)
     ink = int(np.count_nonzero(mask))
     if ink < max(18, img.size // 5000):
         issues.append('有效内容过少')
+    # 横向细条只有在几乎没有墨迹时才是碎片。密排填空题的一行题干本来就
+    # 又宽又扁（2484×79 时宽高比 31），只看宽高比会把每一道正常小题都判成
+    # 空白条，进而触发一次无意义的质量回退，把归一化裁切换成未归一化原图。
+    if width / max(1, height) > 28 and height < 80 and ink < height * width * 0.02:
+        issues.append('疑似空白细条')
     return issues
 
 
@@ -3246,8 +3636,8 @@ def _split_cross_column_items(ocr_items, split_x):
     return left_items, right_items
 
 
-def _local_column_split(img, ocr_items):
-    """Return one reliable internal column gutter, including off-centre gutters.
+def _local_column_split_candidates(img, ocr_items):
+    """Return verified internal column gutters, ranked by visual/OCR evidence.
 
     ``detect_columns`` intentionally concentrates on the page centre because it
     originally served two-page scans.  A real three-column exercise page has
@@ -3257,17 +3647,17 @@ def _local_column_split(img, ocr_items):
     """
     height, width = img.shape[:2]
     if width < 520 or height < 420 or len(ocr_items) < 6:
-        return None
+        return []
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     y0, y1 = int(height * 0.10), int(height * 0.95)
     if y1 - y0 < 100:
-        return None
+        return []
     density = np.count_nonzero(gray[y0:y1] < 210, axis=0).astype(np.float32)
     window = max(11, width // 100)
     smooth = np.convolve(density, np.ones(window, dtype=np.float32) / window, mode='same')
     nonzero = smooth[smooth > 0]
     if not len(nonzero):
-        return None
+        return []
     baseline = float(np.percentile(nonzero, 60))
     low = smooth <= max(1.0, baseline * 0.20)
     min_gutter = max(8, width // 145)
@@ -3298,7 +3688,7 @@ def _local_column_split(img, ocr_items):
             (min(point[0] for point in bbox) + max(point[0] for point in bbox)) / 2,
         ))
     if len(centers) < 6:
-        return None
+        return []
     scored = []
     for start, end in candidates:
         run_width = end - start
@@ -3324,9 +3714,11 @@ def _local_column_split(img, ocr_items):
         if shoulder_density <= 0:
             continue
         balance = min(left_count, right_count) / max(left_count, right_count)
-        scored.append((run_width * (1.0 + balance), split_x))
-    if scored:
-        return max(scored)[1]
+        scored.append({
+            'split_x': int(split_x),
+            'score': float(run_width * (1.0 + balance)),
+            'source': 'whitespace',
+        })
 
     # Some exam sheets use a dotted/solid vertical rule instead of whitespace.
     # Reuse the visual evidence, but accept an off-centre divider only when the
@@ -3347,13 +3739,180 @@ def _local_column_split(img, ocr_items):
         left_count = sum(center < split_x for _x0, _x1, center in centers)
         right_count = sum(center >= split_x for _x0, _x1, center in centers)
         if left_count >= 3 and right_count >= 3 and not has_spanning_body_text(ocr_items, split_x, height, width):
-            divider_candidates.append((min(left_count, right_count), split_x))
-    return max(divider_candidates)[1] if divider_candidates else None
+            divider_candidates.append({
+                'split_x': int(split_x),
+                'bar_start': int(x),
+                'bar_end': int(x + component_width),
+                'score': float(min(left_count, right_count)),
+                'source': 'divider',
+            })
+
+    # A whitespace gutter is the stronger signal.  A drawn divider remains a
+    # useful fallback, but is never allowed to hide a nearby whitespace gutter.
+    # When both describe the *same* gutter (a blank band next to a printed
+    # rule), the divider wins: its outer edges mark the true column boundary,
+    # while the whitespace centre sits inside the blank band and would pull
+    # the neighbouring box left over the rule.
+    ranked = (
+        sorted(divider_candidates, key=lambda item: item['score'], reverse=True)
+        + sorted(scored, key=lambda item: item['score'], reverse=True)
+    )
+    distinct = []
+    minimum_separation = max(12, int(width * 0.018))
+    for candidate in ranked:
+        if any(abs(candidate['split_x'] - previous['split_x']) < minimum_separation
+               for previous in distinct):
+            continue
+        distinct.append(candidate)
+    return distinct
+
+
+def _local_column_split(img, ocr_items):
+    """Return the strongest reliable internal column gutter, if any."""
+    candidates = _local_column_split_candidates(img, ocr_items)
+    if not candidates:
+        return None
+    first = candidates[0]
+    # A printed divider rule is not part of either column: its right edge is
+    # where the right-side column text starts, its left edge where the
+    # left-side column text ends.  The centre would leak the rule into both.
+    if first.get('source') == 'divider':
+        return first['bar_end']
+    return first['split_x']
+
+
+def _verified_three_column_layout(img, ocr_items):
+    """Return three globally-consistent reading columns, or ``None``.
+
+    Recursive splitting is intentionally conservative, but a wide local blank
+    inside one column can still win the first greedy split.  For a real
+    three-column page the two gutters must jointly form three similarly sized
+    text-bearing regions.  Selecting that pair before recursion avoids a
+    false first split that would make subsequent question boxes cross columns.
+    """
+    height, width = img.shape[:2]
+    # A global three-column decision needs two independent gutters.  Printed
+    # divider rules are the physical ground truth of the column boundaries:
+    # their outer edges mark exactly where each column's text must stop.  A
+    # whitespace blank, by contrast, can be ordinary trailing whitespace
+    # inside one column: the left column's text ends early and the large
+    # blank band up to the printed rule scores as a huge gutter, which would
+    # wrongly pull the cut out of the true gutter line and swallow the
+    # neighbour's content.  So when a pair of printed rules verifies it always
+    # wins; pure whitespace pairs are only consulted when the page has no
+    # verified printed rules.
+    all_candidates = _local_column_split_candidates(img, ocr_items)
+    whitespace = [
+        candidate for candidate in all_candidates
+        if candidate.get('source') == 'whitespace'
+    ]
+    divider = [
+        candidate for candidate in all_candidates
+        if candidate.get('source') == 'divider'
+    ]
+    if width < 780 or height < 420:
+        return None
+    # Pair candidates within the same source only: a stray wide blank inside
+    # one column must never pair with a competing divider.  Everything below
+    # runs the same verification on each pool, but a verified printed-rule
+    # pair takes precedence because the rules physically delimit the columns.
+    divider_pair = _pick_three_column_pair(img, ocr_items, divider)
+    if divider_pair:
+        return divider_pair[1]
+    whitespace_pair = _pick_three_column_pair(img, ocr_items, whitespace)
+    return whitespace_pair[1] if whitespace_pair else None
+
+
+def _pick_three_column_pair(img, ocr_items, candidates):
+    """Return the best scored ``(score, regions)`` from one same-source pool."""
+    height, width = img.shape[:2]
+    if len(candidates) < 2:
+        return None
+    # The pair loop relies on candidate order being spatial: the first gutter
+    # in the pair is the left one, the second the right one.  Candidate order
+    # from _local_column_split_candidates is score-ranked, so sort here.
+    candidates = sorted(candidates, key=lambda candidate: candidate['split_x'])
+
+    best = None
+    minimum_width = max(250, int(width * 0.18))
+    for left_index, left_gutter in enumerate(candidates):
+        for right_gutter in candidates[left_index + 1:]:
+            left_split = int(min(left_gutter['split_x'], right_gutter['split_x']))
+            right_split = int(max(left_gutter['split_x'], right_gutter['split_x']))
+            widths = (left_split, right_split - left_split, width - right_split)
+            if min(widths) < minimum_width or max(widths) / max(1, min(widths)) > 1.75:
+                continue
+            # Three-column gutters normally sit around one third and two
+            # thirds of the page.  This rejects a large internal blank in a
+            # single wide question while allowing moderately uneven columns.
+            if not (width * 0.22 <= left_split <= width * 0.45
+                    and width * 0.55 <= right_split <= width * 0.78):
+                continue
+            if (has_spanning_body_text(ocr_items, left_split, height, width)
+                    or has_spanning_body_text(ocr_items, right_split, height, width)):
+                continue
+
+            left_items, remaining_items = _split_cross_column_items(ocr_items, left_split)
+            middle_items, right_items = _split_cross_column_items(remaining_items, right_split)
+            item_counts = (len(left_items), len(middle_items), len(right_items))
+            if min(item_counts) < 2:
+                continue
+            # A column with very few OCR lines (short calculation questions or
+            # a diagram legend) is still a genuine column.  Only guard against
+            # a single stray fragment accidentally certifying a third slot:
+            # sparse columns must carry a question-number anchor or a printed
+            # group heading to be trusted.
+            if min(item_counts) < 3 and any(
+                not any(
+                    extract_minor_idx(re.sub(r'\s+', '', it.get('text', ''))) is not None
+                    or it.get('text', '').strip().startswith('知识点')
+                    for it in group
+                )
+                for group in (left_items, middle_items, right_items)
+                if len(group) < 3
+            ):
+                continue
+            width_balance = min(widths) / max(widths)
+            item_balance = min(item_counts) / max(item_counts)
+            score = (
+                left_gutter['score'] + right_gutter['score']
+            ) * (0.75 + width_balance) * (0.75 + item_balance)
+            # A printed divider rule belongs to neither column: each neighbour
+            # starts/ends at the rule's outer edge so the rule itself is never
+            # absorbed into a question box.  Whitespace gutters keep the
+            # centred split used by the item-grouping checks above.
+            left_start, left_end = (left_split, left_split)
+            if left_gutter.get('source') == 'divider':
+                left_start, left_end = (
+                    left_gutter.get('bar_start', left_split),
+                    left_gutter.get('bar_end', left_split),
+                )
+            right_start, right_end = (right_split, right_split)
+            if right_gutter.get('source') == 'divider':
+                right_start, right_end = (
+                    right_gutter.get('bar_start', right_split),
+                    right_gutter.get('bar_end', right_split),
+                )
+            proposal = (
+                score,
+                [(0, left_start, left_items),
+                 (left_end, right_start, middle_items),
+                 (right_end, width, right_items)],
+            )
+            if best is None or proposal[0] > best[0]:
+                best = proposal
+    return best
 
 
 def split_question_layout_columns(img, ocr_items, max_columns=4):
     """Recursively split question pages into 1–4 reading-order columns."""
     _height, width = img.shape[:2]
+    # Resolve a complete three-column layout before greedy recursion.  This is
+    # more reliable on exam pages where an unusually wide blank inside one
+    # column could otherwise be picked as the first split.
+    verified_three = _verified_three_column_layout(img, ocr_items)
+    if verified_three:
+        return verified_three
     regions = [(0, width, list(ocr_items))]
     while len(regions) < max_columns:
         expanded = []
@@ -3380,11 +3939,142 @@ def split_question_layout_columns(img, ocr_items, max_columns=4):
     return sorted(regions, key=lambda region: region[0])
 
 
+def _answer_matrix_crosses_split(img, ocr_items, split_x):
+    """Whether a proposed column split cuts through a dense answer matrix.
+
+    Answer keys frequently arrange short ``① 35 / ② 9 / ③ 57`` cells in a
+    grid.  The gaps between those cells look exactly like reading-column
+    gutters to the generic layout splitter, but splitting there produces
+    incomplete answer crops.  This guard is deliberately narrow: it only
+    rejects a split when at least three OCR rows each contain two compact,
+    numbered answer cells on *both* sides of that same split.  Normal prose,
+    ordinary two-column answer pages, and sparse layouts retain the existing
+    recursive behaviour.
+    """
+    if img is None or img.size == 0 or split_x is None:
+        return False
+    height, width = img.shape[:2]
+    if not (max(36, int(width * 0.18)) <= split_x <= min(width - 36, int(width * 0.82))):
+        return False
+
+    numbered_cell = re.compile(
+        r'^\s*(?:[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳㉑㉒㉓㉔㉕]'
+        r'|\d{1,3}\s*[\.．、])'
+    )
+    matched_rows = []
+    for row in group_ocr_rows(ocr_items):
+        cells = []
+        for item in row.get('items', []):
+            text = str(item.get('text', '')).strip()
+            bbox = item.get('bbox') or []
+            if not text or not bbox or len(re.sub(r'\s+', '', text)) > 14:
+                continue
+            if not numbered_cell.match(text):
+                continue
+            x0 = min(point[0] for point in bbox)
+            x1 = max(point[0] for point in bbox)
+            # A long OCR paragraph beginning with ``1.`` is a question/answer
+            # line, not a matrix cell.  Keep the matrix rule away from it.
+            if x1 - x0 > width * 0.28:
+                continue
+            cells.append(((x0 + x1) / 2, x0, x1))
+        left_count = sum(center < split_x for center, _, _ in cells)
+        right_count = sum(center > split_x for center, _, _ in cells)
+        if left_count >= 2 and right_count >= 2:
+            matched_rows.append(row)
+
+    if len(matched_rows) < 3:
+        return False
+    # Require the pattern to occupy a real vertical run, rather than three
+    # OCR fragments accidentally aligned around a decorative heading.
+    first_y = min(row['y0'] for row in matched_rows)
+    last_y = max(row['y1'] for row in matched_rows)
+    typical_height = float(np.median([row['height'] for row in matched_rows]))
+    return last_y - first_y >= max(typical_height * 2.0, height * 0.045)
+
+
+def _has_answer_reading_divider(img, split_x):
+    """Detect a long printed rule that proves two answer reading columns.
+
+    A dense matrix can happen to line up on both sides of a true column
+    divider.  In that case retaining the divider is safer than preserving the
+    matrix as one crop: the rule is physical layout evidence, whereas the
+    alignment is only a statistical clue.  Short table borders do not qualify
+    because the ink must form one near-continuous line through most of the
+    page body.
+    """
+    if img is None or img.size == 0 or split_x is None:
+        return False
+    height, width = img.shape[:2]
+    if not (max(12, int(width * 0.15)) <= split_x <= min(width - 12, int(width * 0.85))):
+        return False
+    y0, y1 = int(height * 0.12), int(height * 0.94)
+    if y1 - y0 < 80:
+        return False
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # ``detect_columns`` returns the centre of a whitespace gutter; a printed
+    # rule can sit near either gutter edge.  Search only this small local
+    # neighbourhood, never the full page, so ordinary text cannot certify an
+    # unrelated split.
+    half_width = max(8, min(28, int(width * 0.045)))
+    strip = gray[y0:y1, max(0, split_x - half_width):min(width, split_x + half_width + 1)]
+    if strip.size == 0:
+        return False
+    inked = np.any(strip < 205, axis=1).astype(np.uint8)
+    # Keep a scanned/rasterised rule continuous across tiny pixel gaps, but do
+    # not join the unrelated text lines of a normal answer list.
+    bridge = max(2, min(8, (y1 - y0) // 90))
+    inked = cv2.morphologyEx(
+        inked.reshape(-1, 1), cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (1, bridge)),
+    ).ravel()
+    longest = current = 0
+    for value in inked:
+        if value:
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return longest >= int((y1 - y0) * 0.58)
+
+
+def _answer_split_has_independent_numbered_streams(ocr_items, split_x):
+    """Require evidence before recursively splitting an answer-grid gutter.
+
+    A real extra reading column normally has several printed ``1.``/``2.``
+    anchors on both sides.  A grid of circled response cells has neither; its
+    internal whitespace must not become a third or fourth column merely
+    because OCR happened to split the cells into separate text items.
+    """
+    left_items, right_items = _split_cross_column_items(ocr_items, split_x)
+
+    def numbered_rows(items):
+        count = 0
+        for row in group_ocr_rows(items):
+            matches = [
+                match for match in _answer_minor_matches(row.get('text', ''))
+                if not _answer_match_is_decimal_literal(row.get('text', ''), *match)
+            ]
+            if matches:
+                count += 1
+        return count
+
+    return numbered_rows(left_items) >= 2 and numbered_rows(right_items) >= 2
+
+
 def split_answer_layout_columns(img, ocr_items, max_columns=4):
-    """递归拆分答案页栏位；支持常见双页×双栏的四栏答案排版。"""
+    """递归拆分答案页阅读栏，且不拆开横向排列的答案矩阵。"""
     height, width = img.shape[:2]
     del height
-    regions = [(0, width, list(ocr_items))]
+    # A long visual page gutter is stronger evidence than OCR whitespace.  It
+    # establishes the two physical answer columns first, then recursion may
+    # add a column only with its own divider or two independent numbered flows.
+    physical_split = _visual_column_split(img)
+    if physical_split is not None:
+        left, right = _split_cross_column_items(ocr_items, physical_split)
+        regions = [(0, physical_split, left), (physical_split, width, right)]
+    else:
+        regions = [(0, width, list(ocr_items))]
     while len(regions) < max_columns:
         changed = False
         expanded = []
@@ -3393,9 +4083,26 @@ def split_answer_layout_columns(img, ocr_items, max_columns=4):
             if splits_remaining <= 0 or x1 - x0 < 420:
                 expanded.append((x0, x1, items))
                 continue
+            local_img = img[:, x0:x1]
             local_items = rebase_ocr_items(items, x_offset=x0)
-            local_split = detect_columns(img[:, x0:x1], local_items)
+            local_split = detect_columns(local_img, local_items)
             if local_split is None:
+                expanded.append((x0, x1, items))
+                continue
+            # Preserve the initial split of a clearly horizontal spread: it
+            # may be two physical pages.  Once a portrait-like page/column is
+            # reached, a repeated two-cells-on-each-side pattern is evidence
+            # of one answer matrix rather than separate reading columns.
+            is_horizontal_spread = local_img.shape[1] / max(1, local_img.shape[0]) >= 1.28
+            has_reading_divider = _has_answer_reading_divider(local_img, local_split)
+            if (
+                not is_horizontal_spread
+                and not has_reading_divider
+                and (
+                    _answer_matrix_crosses_split(local_img, local_items, local_split)
+                    or not _answer_split_has_independent_numbered_streams(local_items, local_split)
+                )
+            ):
                 expanded.append((x0, x1, items))
                 continue
             absolute_split = x0 + local_split
@@ -3419,7 +4126,7 @@ def split_answer_layout_columns(img, ocr_items, max_columns=4):
 # 阶段1：按大题边界切分页面
 # ═══════════════════════════════════════════════════════════════
 def find_major_boundaries(ocr_items):
-    """找页面中的大题边界，返回 [{text, y, idx}]"""
+    """找页面中的大题边界，返回 [{text, y, x, idx}]"""
     boundaries = []
     for item in ocr_items:
         text = item['text'].strip()
@@ -3427,6 +4134,7 @@ def find_major_boundaries(ocr_items):
             boundaries.append({
                 'text': text,
                 'y': int(min(p[1] for p in item['bbox'])),
+                'x': int(min(p[0] for p in item['bbox'])),
                 'idx': extract_major_idx(text),
             })
     
@@ -3438,7 +4146,28 @@ def find_major_boundaries(ocr_items):
         if key not in seen:
             seen.add(key)
             unique.append(b)
-    return sorted(unique, key=lambda b: b['y'])
+
+    # 同一行标题被 OCR 拆成两个文字框时，两个框的 y 只差十几到几十像素，
+    # 但恰好跨过 30 的整数倍就各占一个桶、都留下来。后续切块会把它们当成
+    # 两个相邻大题，产出「高度 9~13px、标题与下一块完全相同」的空壳块
+    # （金版卷王四年级 56260587、六年级 15260935 都是这个形态）。
+    # 因此再按「同一大题号 + y 足够近」合并，保留更靠上的那个。
+    unique.sort(key=lambda value: value['y'])
+    merged = []
+    for boundary in unique:
+        previous = merged[-1] if merged else None
+        if (
+            previous is not None
+            and boundary['idx'] is not None
+            and boundary['idx'] == previous['idx']
+            and boundary['y'] - previous['y'] < SPLIT_MAJOR_MERGE_GAP
+            # 对开页左右两页可能印着同一个大题号且在同一水平线，
+            # 只有 x 也在同一段（一行标题的宽度范围内）才算同一行被拆开。
+            and abs(boundary.get('x', 0) - previous.get('x', 0)) < SPLIT_MAJOR_MERGE_DX
+        ):
+            continue
+        merged.append(boundary)
+    return merged
 
 
 def _is_olympiad_lesson_heading(item, page_height):
@@ -3454,6 +4183,49 @@ def _is_olympiad_lesson_heading(item, page_height):
     y = min(point[1] for point in bbox)
     # 页码或页眉中的“第X讲”不作为正文讲解的起点。
     return page_height * 0.08 <= y <= page_height * 0.55
+
+
+def find_knowledge_point_boundaries(ocr_items, page_height):
+    """识别“知识点一 有理数”这类节标题，作为大题边界候选。
+
+    周测/练习册常以知识点组织题目，且题目本身不再使用“一、二、三”大题号。
+    只认 RE_MAJOR 时这类标题一次都不会命中，整页退回“整页”单块，知识点
+    标题被并进相邻小题的裁图。这里接收 OCR 项，返回的边界不限定左右位置
+    （知识点标题有左对齐也有居中），但要求短小且形如“知识点+中文数字”。
+    """
+    boundaries = []
+    min_body_y = page_height * 0.04
+    max_body_y = page_height * 0.96
+    for item in ocr_items:
+        text = re.sub(r'\s+', '', item.get('text', ''))
+        if not text.startswith('知识点') or len(text) > 20:
+            continue
+        if not (
+            re.match(r'^知识点[一二三四五六七八九十]{1,3}', text)
+            or re.match(r'^知识点[0-9]{1,3}', text)
+        ):
+            continue
+        bbox = item.get('bbox') or []
+        if not bbox:
+            continue
+        y = min(point[1] for point in bbox)
+        if not (min_body_y <= y <= max_body_y):
+            continue
+        boundaries.append({
+            'text': item.get('text', '').strip(),
+            'y': int(y),
+            'idx': None,
+        })
+    # 同一行被 OCR 拆成多个文字框时按 y 去重。
+    seen = set()
+    unique = []
+    for boundary in sorted(boundaries, key=lambda value: value['y']):
+        key = boundary['y'] // 30
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(boundary)
+    return unique
 
 
 def find_olympiad_field_boundaries(ocr_items, page_height):
@@ -3509,6 +4281,76 @@ def find_olympiad_field_boundaries(ocr_items, page_height):
     return sorted(boundaries, key=lambda boundary: boundary['y'])
 
 
+def find_circled_number_boundaries(ocr_items, crop_width, crop_height):
+    """识别用 ①②③ 编号的整道练习（部分奥数书不用“一、二、三”）。
+
+    规则刻意保守，只认“圈号 + 至少 4 个字的题干”且靠左起行：
+    图注、选项标记常常只有一个圈号，正文里的“如图①”也不在行首。
+    """
+    if crop_height <= 0 or crop_width <= 0:
+        return []
+    boundaries = []
+    for item in ocr_items:
+        if item.get('conf', 1.0) < MIN_OCR_CONFIDENCE:
+            continue
+        match = RE_CIRCLED_STEM.match(item.get('text', '').strip())
+        if not match:
+            continue
+        stem = re.sub(r'\s+', '', match.group(2))
+        if len(stem) < 4:
+            continue
+        bbox = item.get('bbox') or []
+        if not bbox:
+            continue
+        x0 = int(min(point[0] for point in bbox))
+        y = int(min(point[1] for point in bbox))
+        if x0 > crop_width * 0.22:
+            continue
+        if not crop_height * 0.05 <= y < crop_height * 0.95:
+            continue
+        if any(abs(y - known['y']) <= 35 for known in boundaries):
+            continue
+        boundaries.append({
+            'y': y,
+            'text': f'{match.group(1)} {stem[:20]}',
+            'idx': 5000 + OLYMPIAD_CIRCLED_NUMBERS.index(match.group(1)) + 1,
+        })
+    return sorted(boundaries, key=lambda boundary: boundary['y'])
+
+
+def _apply_layout_arbiter(img, multi_regions, ocr_items):
+    """用版面模型复核“≥3 栏”的判定，避免把整页正文吞进单块。
+
+    ``split_question_layout_columns`` 的栏缝证据全部来自页内局部几何，
+    当某栏右侧只剩一条括号/答案标记列时，栏目内部的白带会被当成第二道
+    栏缝，于是页被切成 3 块、右侧整页大题并进同一个“整页”块。
+
+    版面裁判（PP-DocLayout）按区域框判断“这条竖带有没有被正文穿过”，
+    只在现有结论为 ≥3 栏时介入；模型缺失或关闭时原样返回，主流程行为不变。
+    返回 ``(regions, overridden)``。
+    """
+    if len(multi_regions) < 3:
+        return multi_regions, False
+    try:
+        import layout_arbiter
+    except Exception:  # noqa: BLE001
+        return multi_regions, False
+    try:
+        corrected = layout_arbiter.resolve_regions(
+            img, multi_regions, ocr_items, log=print,
+        )
+    except Exception as error:  # noqa: BLE001
+        print(f'[版面裁判] 跳过（{type(error).__name__}: {error}）')
+        return multi_regions, False
+    if not corrected:
+        return multi_regions, False
+    same = len(corrected) == len(multi_regions) and all(
+        abs(float(a0) - float(b0)) <= 1 and abs(float(a1) - float(b1)) <= 1
+        for (a0, a1, _x), (b0, b1, _y) in zip(corrected, multi_regions)
+    )
+    return corrected, not same
+
+
 def split_page_into_majors(img, ocr_items, padding=6, profile='general'):
     """将页面按大题边界切分成大题块
     
@@ -3523,15 +4365,23 @@ def split_page_into_majors(img, ocr_items, padding=6, profile='general'):
     # full before moving to the next one.  Keep the established two-column
     # branch below as a conservative fallback for ordinary spreads.
     multi_regions = split_question_layout_columns(img, ocr_items, max_columns=4)
-    if len(multi_regions) >= 3:
+    multi_regions, arbiter_used = _apply_layout_arbiter(img, multi_regions, ocr_items)
+    # 裁判覆盖后即使只剩两栏，也按“逐栏切开”处理：栏缝由裁判给出，
+    # 不再让下方基于局部空隙的启发式重新决定栏位（那正是误判来源）。
+    if len(multi_regions) >= 3 or (arbiter_used and len(multi_regions) == 2):
         blocks = []
+        two_columns = len(multi_regions) == 2
         for column_index, (x0, x1, column_items) in enumerate(multi_regions):
             local_items = rebase_ocr_items(column_items, x_offset=x0)
             column_blocks = _split_single_col_majors(
                 img[:, x0:x1], local_items, padding, profile=profile,
             )
             for block in column_blocks:
-                block['_col'] = f'column_{column_index + 1}'
+                # 两栏沿用 left/right 语义：跨页延续逻辑靠它区分左右半页。
+                block['_col'] = (
+                    ('left' if column_index == 0 else 'right')
+                    if two_columns else f'column_{column_index + 1}'
+                )
                 block['_x_start'] = x0
                 block['_column_bounds'] = [x0, x1]
             blocks.extend(column_blocks)
@@ -3588,6 +4438,7 @@ def split_page_into_majors(img, ocr_items, padding=6, profile='general'):
         return left_blocks + right_blocks
     else:
         blocks = _split_single_col_majors(img, ocr_items, padding, profile=profile)
+        blocks = _reorder_mixed_blocks(blocks, width)
         for block in blocks:
             block['_x_start'] = 0
             block['_column_bounds'] = [0, width]
@@ -3637,15 +4488,66 @@ def _find_major_section_cut(
     return search_start + (best_start + best_end) // 2
 
 
+def _reorder_mixed_blocks(blocks, page_width):
+    """校正“左右两栏按 y 混排”的阅读顺序。
+
+    练习册常以一条点划线分开两栏。视觉分栏找的是纯留白或连续实线，虚线两条
+    都不满足，于是没被识别成两栏；单栏切分把所有大题按 y 排序，得到
+    一、四、五、二、六、三 这种交错顺序。每个块的内容都是对的，但交付文件
+    会按数组顺序编号，顺序就跟着错了（全能测控 image0002586A）。
+
+    这里只在证据明确时重排：标题 x 能分成两组、组心相距 >25% 页宽、两组各
+    至少 2 块，且按 y 排出来的大题号确实回头。
+    """
+    if len(blocks) < 4 or page_width <= 0:
+        return blocks
+    x_values = sorted(
+        block['_title_x'] for block in blocks if block.get('_title_x') is not None
+    )
+    if len(x_values) < 4:
+        return blocks
+    gaps = [
+        (x_values[index + 1] - x_values[index], index)
+        for index in range(len(x_values) - 1)
+    ]
+    biggest_gap, cut_index = max(gaps)
+    if biggest_gap < page_width * 0.25:
+        return blocks
+    threshold = (x_values[cut_index] + x_values[cut_index + 1]) / 2
+    left = [
+        block for block in blocks
+        if block.get('_title_x') is not None and block['_title_x'] < threshold
+    ]
+    right = [
+        block for block in blocks
+        if block.get('_title_x') is not None and block['_title_x'] >= threshold
+    ]
+    if len(left) < 2 or len(right) < 2:
+        return blocks
+    sequence = [
+        block['idx'] for block in blocks
+        if isinstance(block.get('idx'), int) and 0 < block['idx'] < 100
+    ]
+    if len(sequence) < 3:
+        return blocks
+    if all(later > earlier for earlier, later in zip(sequence, sequence[1:])):
+        return blocks
+    head = [block for block in blocks if block.get('_title_x') is None]
+    left.sort(key=lambda block: block.get('_y_start', 0))
+    right.sort(key=lambda block: block.get('_y_start', 0))
+    return head + left + right
+
+
 def _split_single_col_majors(img, ocr_items, padding=6, profile='general'):
     """单栏大题切分"""
     h, w = img.shape[:2]
+    strategy = layout_strategy.strategy_for(profile)
     boundaries = find_major_boundaries(ocr_items)
 
     # 奥数辅导书多以“难题点拨”“想一想做一做”等栏目组织，而没有
     # “一、二、三”大题号。把这些短标题提升为一级分类，避免整讲题目
     # 都落到“未分类题目”。普通正文中的“点拨/拓展”不参与此处切分。
-    if profile == 'olympiad':
+    if strategy.field_headings:
         existing_y = [boundary['y'] for boundary in boundaries]
         for boundary in find_olympiad_field_boundaries(ocr_items, h):
             if any(abs(boundary['y'] - known_y) <= 35 for known_y in existing_y):
@@ -3654,9 +4556,20 @@ def _split_single_col_majors(img, ocr_items, padding=6, profile='general'):
             existing_y.append(boundary['y'])
         boundaries.sort(key=lambda boundary: boundary['y'])
 
+    # 有些奥数书连“难题点拨”都不印，直接用 ①②③ 给整道练习编号；
+    # extract_major_idx 只认中文大题号，页面会整页塌成一块。
+    if strategy.circled_major_numbers:
+        existing_y = [boundary['y'] for boundary in boundaries]
+        for boundary in find_circled_number_boundaries(ocr_items, w, h):
+            if any(abs(boundary['y'] - known_y) <= 35 for known_y in existing_y):
+                continue
+            boundaries.append(boundary)
+            existing_y.append(boundary['y'])
+        boundaries.sort(key=lambda boundary: boundary['y'])
+
     # 暑假/寒假作业常把“数学游戏、假期体验”作为独立活动区，却不用中文
     # 大题号。把这些醒目的活动标题提升为独立块，避免统统塞进前一个大题。
-    if profile == 'holiday':
+    if strategy.activity_headings:
         existing_y = [boundary['y'] for boundary in boundaries]
         activity_index = 0
         for item in ocr_items:
@@ -3681,11 +4594,24 @@ def _split_single_col_majors(img, ocr_items, padding=6, profile='general'):
             })
             existing_y.append(y)
         boundaries.sort(key=lambda boundary: boundary['y'])
+
+    # 周测/练习册常以“知识点一 有理数”为节标题，不再使用中文大题号。
+    # 提升为独立大题块，避免知识点标题被并进相邻小题的裁图。
+    existing_y = [boundary['y'] for boundary in boundaries]
+    knowledge_index = 0
+    for boundary in find_knowledge_point_boundaries(ocr_items, h):
+        if any(abs(boundary['y'] - known_y) <= 40 for known_y in existing_y):
+            continue
+        knowledge_index += 1
+        boundary['idx'] = 3000 + knowledge_index
+        boundaries.append(boundary)
+        existing_y.append(boundary['y'])
+    boundaries.sort(key=lambda boundary: boundary['y'])
     
     if not boundaries:
         # 讲次首页往往先是概念讲解或示例，随后才出现“难题点拨”。
         # 这类内容也应有可读的字段名，而不是直接被标为未分类。
-        if profile == 'olympiad' and any(
+        if strategy.lesson_opening_fallback and any(
             _is_olympiad_lesson_heading(item, h) for item in ocr_items
         ):
             return [{
@@ -3697,7 +4623,7 @@ def _split_single_col_majors(img, ocr_items, padding=6, profile='general'):
     blocks = []
     section_row_density = (
         np.count_nonzero(_content_mask(img), axis=1)
-        if profile == 'holiday' and len(boundaries) > 1
+        if strategy.density_section_cut and len(boundaries) > 1
         else None
     )
 
@@ -3708,7 +4634,7 @@ def _split_single_col_majors(img, ocr_items, padding=6, profile='general'):
     first = boundaries[0]
     prefix_end = max(0, int(first['y']) - padding)
     if (
-        (1 < first['idx'] < 100 or first.get('semantic_field'))
+        (1 < first['idx'] < 100 or first.get('semantic_field') or first['idx'] >= 3000)
         and prefix_end >= max(70, int(h * 0.06))
     ):
         prefix_items = []
@@ -3746,7 +4672,7 @@ def _split_single_col_majors(img, ocr_items, padding=6, profile='general'):
     for i, bd in enumerate(boundaries):
         y_start = max(0, bd['y'] - padding)
         if i + 1 < len(boundaries):
-            if profile == 'holiday':
+            if strategy.density_section_cut:
                 y_end = _find_major_section_cut(
                     img, bd['y'], boundaries[i + 1]['y'], padding,
                     row_density=section_row_density,
@@ -3777,6 +4703,8 @@ def _split_single_col_majors(img, ocr_items, padding=6, profile='general'):
             'idx': bd['idx'],
             'crop_img': crop,
             '_y_start': y_start,
+            # 标题左缘的 x，仅用于单栏分支里校正“左右两栏按 y 混排”的阅读顺序。
+            '_title_x': int(bd.get('x', 0) or 0),
             'semantic_field': bd.get('semantic_field', False),
         })
     
@@ -3834,7 +4762,246 @@ def _find_clean_horizontal_cut(
     return search_start + (best_start + best_end) // 2
 
 
-def split_major_into_minors(major_crop, ocr_items=None, padding=4, profile='general'):
+def _recover_missed_minor_boundaries(major_crop, boundaries):
+    """找回被结构 OCR 整条漏读的题号，补回缺失的小题边界。
+
+    结构 OCR 是整页降采样后的一次轻量识别，偶会漏掉一整条题干（典型如
+    一个小题号独占一行的题干）。`find_minor_boundaries` 因此得到的序列会
+    跳号（1→3），相邻两道题被并入同一个裁剪框。本函数对跳号两侧之间的
+    条带按原生分辨率单独重识别（条带小，成本远低于整页高精度 OCR），
+    找回缺失的题号后插回边界序列。
+
+    只处理“同一编号序列内跳号 ≥2”的确定签名；回到 1 是新分节/知识点，
+    不属于漏读。重识别结果必须同时满足：题号样式合法、位于左缘、且编号
+    正好填补跳号（前一号 +1 或后一号 -1），否则宁可不拆，保持现状。
+    """
+    if len(boundaries) < 2 or major_crop is None or major_crop.size == 0:
+        return boundaries
+    crop_height, crop_width = major_crop.shape[:2]
+    if crop_height < 100 or crop_width < 200:
+        return boundaries
+    recovered = []
+    for index in range(len(boundaries) - 1):
+        left, right = boundaries[index], boundaries[index + 1]
+        left_num = left.get('num')
+        right_num = right.get('num')
+        if not isinstance(left_num, int) or not isinstance(right_num, int):
+            continue
+        if right_num == 1 or right_num - left_num < 2:
+            continue
+        y_start = int(left.get('y', 0)) + 4
+        y_end = int(right.get('y', crop_height)) - 4
+        if y_end - y_start < 40:
+            continue
+        # 题号只出现在左缘：x 超出 left_limit 的识别结果下面会被整批丢弃，
+        # 所以条带右侧一大半像素是白跑的。裁窄后 OCR 面积降到约 1/3，
+        # 对开扫描上实测这一项是小题切分的主要耗时来源。
+        # 比左缘判据多留 8% 页宽余量，避免缩进题号的前几个字被切掉、
+        # 文本长度掉到 body_min 以下反而漏题。
+        strip_width = min(crop_width, max(160, int(crop_width * 0.36)))
+        strip = major_crop[y_start:y_end, :strip_width]
+        if strip.size == 0 or strip.shape[0] < 30:
+            continue
+        try:
+            strip_items = _run_ocr_cached_strip(strip)
+        except Exception:
+            continue
+        left_limit = max(90, int(crop_width * 0.28))
+        candidates = []
+        for item in strip_items:
+            text = str(item.get('text', '')).strip()
+            num, style = extract_minor_anchor(text)
+            if num is None or num > 150 or item.get('conf', 1.0) < MIN_OCR_CONFIDENCE:
+                continue
+            bbox = item.get('bbox') or []
+            if not bbox:
+                continue
+            try:
+                x = float(min(point[0] for point in bbox))
+                y = float(min(point[1] for point in bbox))
+            except (TypeError, ValueError):
+                continue
+            if x < 0 or x > left_limit or y < 0 or y >= strip.shape[0]:
+                continue
+            compact = re.sub(r'\s+', '', text)
+            body_min = 5 if style == 'primary' else 3
+            if len(compact) < body_min:
+                continue
+            if num not in {left_num + 1, right_num - 1}:
+                continue
+            candidates.append((y, num, style, x, text, item.get('conf', 1.0)))
+        if not candidates:
+            continue
+        candidates.sort(key=lambda value: (value[0], value[1]))
+        chosen = next(
+            (candidate for candidate in candidates if candidate[1] == left_num + 1),
+            candidates[0],
+        )
+        y, num, style, x, text, confidence = chosen
+        recovered.append({
+            'num': num, 'style': style, 'text': text,
+            'y': int(y_start + y), 'x': int(x),
+            'confidence': float(confidence),
+        })
+
+    if not recovered:
+        return boundaries
+    merged = list(boundaries) + recovered
+    merged.sort(key=lambda boundary: boundary['y'])
+    min_gap = max(28, int(crop_height * 0.015))
+    deduped = []
+    for candidate in merged:
+        if deduped and candidate['y'] - deduped[-1]['y'] < min_gap:
+            continue
+        deduped.append(candidate)
+    return deduped
+
+
+def _side_by_side_columns(ocr_items, crop_width, crop_height=0):
+    """把横向长条里的文字按左缘聚成阅读列，返回每列的 (x0, x1)。
+
+    只统计"窄"文本块，并剔除顶部横跨整块的大题标题：它本来就不属于任何
+    一列，参与聚类会把相邻两列粘成一组。
+
+    列区间允许轻微重叠：题号与左列题干在水平方向交叉时（"有（）个平行四边形"
+    的末字与下一题题号同一水平带），宁可两张裁图各带一点重复内容，也不要
+    把题干或题号切掉。
+    """
+    width = max(1, int(crop_width))
+    height = max(1, int(crop_height or width))
+    narrow_limit = int(width * 0.45)
+    title_band = height * 0.2
+    boxes = []
+    for item in ocr_items:
+        if not (item.get('text') or '').strip():
+            continue
+        xs = [float(point[0]) for point in item['bbox']]
+        ys = [float(point[1]) for point in item['bbox']]
+        left, right = min(xs), max(xs)
+        if right - left > narrow_limit:
+            continue
+        if min(ys) < title_band and right - left > width * 0.2:
+            continue  # 顶部横跨的块级标题
+        boxes.append((left, right))
+    if len(boxes) < 2:
+        return []
+    boxes.sort()
+    min_gap = max(300, int(width * 0.14))
+    groups = [[boxes[0]]]
+    for box in boxes[1:]:
+        previous_left = min(entry[0] for entry in groups[-1])
+        if box[0] - previous_left >= min_gap:
+            groups.append([box])
+        else:
+            groups[-1].append(box)
+    if len(groups) < 2 or width / len(groups) < 200:
+        return []
+    pad = 24
+    spans = []
+    last = len(groups) - 1
+    for index, group in enumerate(groups):
+        left = min(entry[0] for entry in group)
+        right = max(entry[1] for entry in group)
+        x0 = 0 if index == 0 else max(0, int(left) - pad)
+        x1 = width if index == last else min(width, int(right) + pad)
+        if x1 - x0 < 180:
+            return []
+        spans.append((x0, x1))
+    return spans
+
+
+def _split_side_by_side_minors(major_crop, ocr_items, boundaries, padding, profile):
+    """按 x 切开横向并排的小问；证据不足时返回 None 交给原来的按 y 逻辑。
+
+    只处理"明显是横向长条"的块（高 < 宽的 60%），并且必须有横向并排的
+    连续题号作为证据，避免把普通密排页切开。
+    """
+    if len(boundaries) < 2:
+        return None
+    if not any(boundary.get('side_by_side') for boundary in boundaries):
+        return None
+    height, width = major_crop.shape[:2]
+    if width < 400 or height > width * 0.6:
+        return None
+    spans = _side_by_side_columns(ocr_items, width, height)
+    if not spans:
+        return None
+    starts = [span[0] for span in spans]
+
+    def column_of(x_position):
+        index = 0
+        for position, start in enumerate(starts):
+            if x_position >= start:
+                index = position
+        return index
+
+    # 大题标题横跨整块，只应跟第一列在一起；其余列从标题下沿开始，否则
+    # 每列顶部都会带一截标题碎片（例如只剩 ")分）"）。
+    title_bottom = 0
+    for item in ocr_items:
+        if not (item.get('text') or '').strip():
+            continue
+        xs = [float(point[0]) for point in item['bbox']]
+        ys = [float(point[1]) for point in item['bbox']]
+        if min(ys) < height * 0.2 and max(xs) - min(xs) > width * 0.2:
+            title_bottom = max(title_bottom, int(max(ys)))
+    if title_bottom and title_bottom > height * 0.6:
+        title_bottom = 0
+
+    pieces = []
+    for index, (x0, x1) in enumerate(spans):
+        top = 0 if index == 0 else min(title_bottom, height - 1)
+        local_items = [
+            item for item in ocr_items
+            if column_of(min(point[0] for point in item['bbox'])) == index
+        ]
+        sub_cuts = split_major_into_minors(
+            major_crop[top:, x0:x1], rebase_ocr_items(local_items, x_offset=x0),
+            padding, profile, _depth=1,
+        )
+        detected = [
+            boundary for boundary in boundaries
+            if column_of(boundary['x']) == index
+        ]
+        for cut in sub_cuts:
+            cut['_x_start'] = x0
+            cut['_x_end'] = x1
+            cut['_side_by_side'] = True
+            if detected:
+                cut['num'] = detected[0]['num']
+                cut['number_detected'] = True
+                cut['_boundary_source'] = 'ocr_number'
+                cut['_number_confidence'] = float(detected[0].get('confidence', 0.0))
+            else:
+                cut['num'] = 0
+            if top:
+                cut['_y_start'] = int(cut.get('_y_start', 0)) + top
+                cut['_y_end'] = int(cut.get('_y_end', 0)) + top
+                cut['_anchor_y'] = int(cut.get('_anchor_y', 0)) + top
+        pieces.extend(sub_cuts)
+
+    # 列数必须与题号跨度吻合，否则说明按 x 聚类并不成立。
+    numbers = [piece['num'] for piece in pieces]
+    known = [number for number in numbers if number]
+    if not known:
+        return None
+    for index in range(len(numbers) - 1, 0, -1):
+        if not numbers[index - 1] and numbers[index]:
+            numbers[index - 1] = numbers[index] - 1
+    for index in range(1, len(numbers)):
+        if not numbers[index] and numbers[index - 1]:
+            numbers[index] = numbers[index - 1] + 1
+    if any(number <= 0 for number in numbers):
+        return None
+    if max(numbers) - min(numbers) + 1 != len(numbers):
+        return None
+    for piece, number in zip(pieces, numbers):
+        piece['num'] = number
+    return pieces
+
+
+def split_major_into_minors(major_crop, ocr_items=None, padding=4, profile='general',
+                            _depth=0):
     """将大题块内按小题编号切分成单题
     
     参数:
@@ -3862,7 +5029,27 @@ def split_major_into_minors(major_crop, ocr_items=None, padding=4, profile='gene
     boundaries = find_minor_boundaries(ocr_items, w, h)
     if not boundaries:
         boundaries = find_unnumbered_boundaries(ocr_items, w, h, profile)
+    else:
+        # 结构 OCR 偶尔整条漏读小题号，序列会跳号并把相邻题并入同一框。
+        # 对跳号条带做原生分辨率重识别，找回缺失边界（无发现则保持现状）。
+        # 一次连漏多个号时（如 1→4 缺 2、3），补回一个后仍会跳号，故迭代
+        # 至不再有新边界，上限 3 轮，避免罕见情况下失控反复重识别。
+        for _recovery_pass in range(3):
+            _recovered = _recover_missed_minor_boundaries(major_crop, boundaries)
+            if len(_recovered) == len(boundaries):
+                break
+            boundaries = _recovered
     
+    # 横排小问：题号在同一水平线上并排，按 y 一切就只剩一道题。此时改为
+    # 按 x 分列再各自递归切分（XY-Cut 的横切步骤）。只在有并排题号证据时
+    # 触发，其余页面走原有逻辑，保证零行为变化。
+    if boundaries and _depth == 0:
+        side_by_side = _split_side_by_side_minors(
+            major_crop, ocr_items, boundaries, padding, profile,
+        )
+        if side_by_side:
+            return side_by_side
+
     if not boundaries:
         # 未识别到编号不等于包含多题：按一个未编号题正常输出。
         return [{
@@ -3955,16 +5142,23 @@ def attach_question_source_metadata(
         )
         if local_y1 <= local_y0:
             local_y1 = min(int(block_height), local_y0 + minor['crop_img'].shape[0])
+        # 横排小问只占块内一段宽度，_source_box 的 x 范围必须跟着收窄，
+        # 否则标注工作台与导出会按整块宽再裁一次，把邻题一起带出来。
+        local_x0 = max(0, int(minor.get('_x_start', 0)))
+        local_x1 = min(int(block_width), int(minor.get('_x_end', block_width)))
+        if local_x1 <= local_x0:
+            local_x0, local_x1 = 0, int(block_width)
         minor['_source_path'] = os.path.abspath(source_path)
         minor['_source_size'] = [source_width, source_height]
         minor['_source_box'] = [
-            block_box[0],
+            min(source_width, block_x0 + local_x0),
             max(0, block_y0 + local_y0),
-            block_box[2],
+            min(source_width, block_x0 + local_x1),
             min(source_height, block_y0 + local_y1),
         ]
         minor['_major_box'] = block_box.copy()
         minor['_page_deskew_angle'] = float(deskew_angle or 0.0)
+        minor['_col'] = block.get('_col', '')
     return minor_cuts
 
 
@@ -3984,7 +5178,10 @@ def attach_shared_context_to_dependent_minors(minors, page_img, *, gap=0):
         return minors, stats
     ordered = sorted(
         minors,
-        key=lambda item: item.get('_source_box', [0, 0, 0, 0])[1],
+        key=lambda item: (
+            item.get('_source_box', [0, 0, 0, 0])[1],
+            item.get('_source_box', [0, 0, 0, 0])[0],
+        ),
     )
     first, second = ordered[0], ordered[1]
     major_box = first.get('_major_box')
@@ -4096,10 +5293,33 @@ def should_merge_cross_page_question(previous, continuation):
     # elsewhere must remain separate.
     page_width = max(1, previous_size[0])
     split_x = page_width * 0.50
-    return (
+    if (
         previous_box[2] <= split_x * 1.04
         and continuation_box[0] >= split_x * 0.96
-    )
+    ):
+        return True
+    # 多栏试卷页：同一张图内按栏序阅读，前栏末尾题会在下一栏顶部继续。
+    # 双页对开扫描的 50% 中线判据不适用于三/四栏页，改用栏序 + 横向不相交。
+    # 只有确实来自不同栏的顶部无编号片段才合并，普通同栏同页内容不受影响。
+    previous_col = previous.get('_col', '')
+    continuation_col = continuation.get('_col', '')
+    if not (
+        str(previous_col).startswith('column_')
+        and str(continuation_col).startswith('column_')
+        and previous_col != continuation_col
+        and previous_box[2] < continuation_box[0]
+    ):
+        return False
+    # 相邻栏顶部的“空白上边距”不是续文，只是单栏留白。只合并确实存在
+    # 墨迹的片段，避免把空白带进上一道题；与“宁可少拼接也不错并题干”
+    # 的既有保守取向一致。
+    continuation_img = continuation.get('crop_img')
+    if continuation_img is None or continuation_img.size == 0:
+        return False
+    gray = cv2.cvtColor(continuation_img, cv2.COLOR_BGR2GRAY)
+    ink = int(np.count_nonzero(gray < 200))
+    area = max(1, continuation_img.shape[0] * continuation_img.shape[1])
+    return ink >= max(12, int(area * 0.001))
 
 
 def _minor_source_segments(minor):
@@ -4138,7 +5358,39 @@ def merge_cross_page_question(previous, continuation):
     return previous
 
 
-def peel_leading_cross_page_fragment(minor):
+def _self_contained_option_question(ocr_items, box):
+    """框内是否自包含一道完整的选择题（题干 + 完整 A/B/C/D 选项）。
+
+    多栏延续页的栏顶无编号片段若是独立选择题，说明它是新题而不是上一题
+    的续文（题号常因 OCR 漏读而未成为切分边界）。这里只要求出现至少 3 行
+    以 A-D 开头的选项；同一选项被 OCR 拆成多行的重复行不计入。
+    """
+    option_count = 0
+    seen_positions = set()
+    for item in ocr_items:
+        text = re.sub(r'\s+', '', item.get('text', ''))
+        if not re.match(r'^[A-D](?:[\.．、)）]|$)', text):
+            continue
+        xs = [point[0] for point in item['bbox']]
+        ys = [point[1] for point in item['bbox']]
+        center_x = sum(xs) / len(xs)
+        center_y = sum(ys) / len(ys)
+        if not (box[0] - 8 <= center_x <= box[2] + 8
+                and box[1] - 8 <= center_y <= box[3] + 8):
+            continue
+        # OCR 常把同一选项识别成相邻两行（y 与 x 几乎重合），按 (y带, x带)
+        # 去重后计数；同一行横向排开的 A/B/C/D 各带 x 不同，不会被误去重。
+        position = (int(round(center_y / 12)), int(round(center_x / 20)))
+        if position in seen_positions:
+            continue
+        seen_positions.add(position)
+        option_count += 1
+        if option_count >= 3:
+            return True
+    return False
+
+
+def peel_leading_cross_page_fragment(minor, ocr_items=None, option_guard=True):
     """从“续文后紧跟新题”的首题中剥离顶部无编号续文。
 
     ``split_major_into_minors`` 为了保留图表/题干，会把首题裁切从块顶部开始。
@@ -4181,6 +5433,13 @@ def peel_leading_cross_page_fragment(minor):
     fragment['_boundary_source'] = 'cross_page_leading_fragment'
     fragment['_number_confidence'] = 0.0
     fragment['_cross_page_fragment'] = True
+    # 剥出的区域若自包含一道完整选择题，说明它是栏顶漏掉题号的新题，而不
+    # 是上一题的续文。此时保留原裁切（新题内容留在首题里），不把它错并进
+    # 上一题。调用方在副本上操作，返回 None 不会改动真实首题。
+    if option_guard and ocr_items and _self_contained_option_question(
+        ocr_items, fragment['_source_box'],
+    ):
+        return None
 
     # 剩余部分仍是原来的新题，保留题号、编号和后续答案配对关系。
     minor['crop_img'] = crop[cut_y:].copy()
@@ -4194,7 +5453,7 @@ def peel_leading_cross_page_fragment(minor):
     return fragment
 
 
-def merge_cross_page_continuation_prefix(previous, minor_cuts):
+def merge_cross_page_continuation_prefix(previous, minor_cuts, ocr_items=None):
     """合并延续页顶部续文，返回 ``(是否合并, 合并方式)``。
 
     先处理本来就无题号的首片段；若首片段包含了下一道已编号题，则谨慎剥离
@@ -4214,7 +5473,16 @@ def merge_cross_page_continuation_prefix(previous, minor_cuts):
     crop = first.get('crop_img')
     if crop is not None:
         candidate_first['crop_img'] = crop.copy()
-    fragment = peel_leading_cross_page_fragment(candidate_first)
+    # 题号连续（上一题号 +1 == 首题号）时，栏顶大都是上一题跨栏排版的选项
+    # 或解答（如 7→8 的 C/D 选项、4→5 的选项组），属于真实续文；题号不连续
+    # 才可能是中间漏了一道独立选择题。选项防护因此只在跳号时启用。
+    sequential = (
+        int(previous.get('num', 0) or 0) + 1
+        == int(first.get('num', 0) or 0)
+    )
+    fragment = peel_leading_cross_page_fragment(
+        candidate_first, ocr_items=ocr_items, option_guard=not sequential,
+    )
     if fragment and should_merge_cross_page_question(previous, fragment):
         merge_cross_page_question(previous, fragment)
         first.clear()
@@ -4236,6 +5504,27 @@ def continuation_target_major(last_left_midx, last_right_midx, page_left_midx, c
     primary = last_right_midx if column == 'left' else last_right_midx
     secondary = last_left_midx
     return primary if primary is not None else secondary
+
+
+def _previous_column_key(col):
+    """Return the reading-order column key immediately before a multi-column key.
+
+    ``column_2`` reads after ``column_1``, and so on.  Ordinary two-column or
+    single-column blocks use ``left``/``right`` and return ``None`` here, so
+    the caller falls back to the spread-oriented continuation choice.
+    """
+    if not isinstance(col, str):
+        return None
+    prefix, separator, index_text = col.rpartition('_')
+    if separator != '_' or prefix != 'column':
+        return None
+    try:
+        column_index = int(index_text)
+    except ValueError:
+        return None
+    if column_index <= 1:
+        return None
+    return f'column_{column_index - 1}'
 
 
 def attach_leading_whole_block_to_first_numbered_minor(material, first_minor, gap=0):
@@ -4330,6 +5619,18 @@ def _answer_context_title(text, typical_height, row_height, allow_lesson=True):
     compact = re.sub(r'\s+', '', text)
     if RE_UNIT_TITLE.match(compact) or PAPER_START_RE.search(compact):
         return compact
+    # Answer keys in workbooks frequently restart their minor numbering below
+    # short headings such as "知识点二 数轴".  Treating the whole page as one
+    # context makes every later "1." look like a duplicate answer and invites
+    # incorrect cross-section pairing.  Keep this deliberately as strict as
+    # the question-page heading detector: a short line beginning with
+    # "知识点" and an explicit ordinal is structural; prose merely mentioning
+    # knowledge points is not.
+    if (
+        len(compact) <= 20
+        and re.match(r'^知识点(?:[一二三四五六七八九十]{1,3}|\d{1,3})', compact)
+    ):
+        return compact
     lesson = LESSON_TITLE_RE.match(text) if allow_lesson else None
     chinese_count = len(re.findall(r'[\u4e00-\u9fff]', text))
     digit_count = len(re.findall(r'\d', text))
@@ -4343,14 +5644,39 @@ def _answer_context_title(text, typical_height, row_height, allow_lesson=True):
 
 
 def _answer_minor_matches(body):
-    """解析答案行里的“1. 2.”锚点；行首1.6按第1题答案6处理。"""
+    """解析答案行里的“1. 2.”锚点；行首1.6按第1题答案6处理。
+
+    OCR 会把高密度选择题串成 ``1.B2.C3.D``。除了行首和空白后的
+    编号外，只把紧随选项字母（A-D）后的编号视为下一题，避免把公式、
+    小数中的数字泛化成题号。
+    """
     matches = []
-    for match in re.finditer(r'(?:^|\s)(\d{1,3})\s*[\.．、]', body):
+    for match in re.finditer(
+        r'(?:^|\s|(?<=[A-Da-dＡ-Ｄａ-ｄ]))(\d{1,3})\s*[\.．、]', body,
+    ):
         number = int(match.group(1))
         if 1 <= number <= 40:
             start = match.start(1)
             matches.append((number, start))
     return matches
+
+
+def _answer_match_is_decimal_literal(body, minor_num, char_pos):
+    """Whether an apparent ``1.`` marker is actually a decimal literal.
+
+    Answer sheets frequently contain rows such as ``1.42 × 100 = 142``.
+    Treating the leading ``1.`` as a question number splits one worked answer
+    into several tiny, duplicated frames.  A real printed question marker has
+    whitespace, text, or an option after its punctuation; only an immediately
+    following digit is rejected here.
+    """
+    start = max(0, int(char_pos))
+    end = start + len(str(int(minor_num)))
+    while end < len(body) and body[end].isspace():
+        end += 1
+    if end >= len(body) or body[end] not in '.．':
+        return False
+    return end + 1 < len(body) and body[end + 1].isdigit()
 
 
 def _match_signature(text):
@@ -4564,7 +5890,212 @@ def _inline_answer_continuation_rows(anchor, page_rows, page_anchors):
     return selected
 
 
-def process_answer_pages(answer_imgs, profile='general', context_hint=''):
+def _recover_missed_answer_anchors(page_img, page_anchors, page_rows):
+    """用局部原图 OCR 补回答案页中明确跳过的题号。
+
+    高密度答案页的降采样 OCR 偶尔会漏掉整行，例如同一知识点内读成
+    ``1、2、4``。旧逻辑会让第 2 题的框一直延伸到第 4 题，造成两题合框。
+    这里只处理同栏、同上下文且跳过 1--3 个连续编号的情况；仅当局部 OCR
+    找到恰好填补该跳号的编号时才插入锚点，宁可保留原框也不凭空拆分。
+    """
+    if page_img is None or page_img.size == 0 or len(page_anchors) < 2:
+        return page_anchors
+    height, _ = page_img.shape[:2]
+    recovered = []
+    grouped = defaultdict(list)
+    for anchor in page_anchors:
+        grouped[(
+            anchor.get('context', ''), anchor.get('major_idx', 0),
+            anchor.get('column_index', 0),
+        )].append(anchor)
+
+    for anchors in grouped.values():
+        anchors.sort(key=lambda anchor: (anchor['y'], anchor['x']))
+        for left, right in zip(anchors, anchors[1:]):
+            same_visual_row = abs(right['y'] - left['y']) <= max(
+                10, left['row_y1'] - left['y'], right['row_y1'] - right['y'],
+            )
+            missing_count = right['num'] - left['num'] - 1
+            if same_visual_row or right['num'] == 1 or not 1 <= missing_count <= 3:
+                continue
+            y_start = min(height, max(0, int(left['row_y1']) + 3))
+            y_end = min(height, max(y_start, int(right['y']) - 3))
+            if y_end - y_start < 36:
+                continue
+            column_x0, column_x1 = int(left['column_x0']), int(left['column_x1'])
+            strip = page_img[y_start:y_end, column_x0:column_x1]
+            if strip.size == 0:
+                continue
+            try:
+                strip_items = _run_ocr(strip)
+            except Exception:
+                continue
+            expected_numbers = set(range(left['num'] + 1, right['num']))
+            candidates = []
+            for row in group_ocr_rows(strip_items):
+                row_text = row['text'].strip()
+                for minor_num, char_pos in _answer_minor_matches(row_text):
+                    if minor_num not in expected_numbers:
+                        continue
+                    confidence = float(np.median([
+                        float(item.get('conf', 1.0)) for item in row.get('items', [])
+                    ])) if row.get('items') else 0.0
+                    if confidence < MIN_OCR_CONFIDENCE:
+                        continue
+                    relative = char_pos / max(1, len(row_text))
+                    candidates.append((
+                        int(row['y0']), int(row['x0'] + (row['x1'] - row['x0']) * relative),
+                        minor_num, row, char_pos, confidence,
+                    ))
+            if not candidates:
+                continue
+            candidates.sort(key=lambda candidate: (candidate[0], candidate[2], candidate[1]))
+            row_y, row_x, minor_num, row, char_pos, confidence = candidates[0]
+            anchor_y = y_start + row_y
+            if any(
+                anchor['num'] == minor_num
+                and abs(anchor['y'] - anchor_y) < 16
+                and anchor['column_index'] == left['column_index']
+                for anchor in page_anchors
+            ):
+                continue
+            row_text = row['text'].strip()
+            recovered_anchor = {
+                'context': left['context'], 'major_idx': left['major_idx'],
+                'num': minor_num, 'column_index': left['column_index'],
+                'column_x0': left['column_x0'], 'column_x1': left['column_x1'],
+                'x': max(left['column_x0'], column_x0 + row_x), 'y': anchor_y,
+                'row_y1': y_start + int(row['y1']), 'row_text': row_text,
+                'ocr_confidence': confidence, 'char_pos': char_pos,
+                'same_row_next_x': None, 'same_row_next_char': None,
+                'recovered_by_strip': True,
+            }
+            recovered.append(recovered_anchor)
+            page_rows.append({
+                'column_index': left['column_index'],
+                'column_x0': left['column_x0'], 'column_x1': left['column_x1'],
+                'x0': column_x0 + int(row['x0']), 'x1': column_x0 + int(row['x1']),
+                'y0': anchor_y, 'y1': y_start + int(row['y1']),
+                'text': row_text, 'has_anchor': True, 'structural': False,
+            })
+
+    if not recovered:
+        return page_anchors
+    RUN_STATS['answer_anchor_strip_recovered_count'] += len(recovered)
+    return [*page_anchors, *recovered]
+
+
+def _next_answer_structure_start(anchor, page_rows):
+    """Return the next confirmed section heading in the anchor's own column.
+
+    The final numbered answer before a new ``知识点``/major heading used to
+    extend all the way to the next number (or the page bottom), thereby
+    swallowing that heading.  Structural rows are produced by the existing,
+    intentionally conservative title/major recognisers, so they are safe
+    bounds without inventing new OCR evidence.
+    """
+    starts = [
+        int(row['y0']) for row in page_rows
+        if row.get('structural')
+        and row.get('column_index') == anchor.get('column_index')
+        and int(row.get('y0', 0)) > int(anchor.get('row_y1', anchor.get('y', 0)))
+    ]
+    return min(starts) if starts else None
+
+
+def _is_circled_answer_matrix_row(row):
+    """Return true for a row containing several compact circled answers."""
+    text = re.sub(r'\s+', '', str(row.get('text', '') or ''))
+    if len(text) > 180:
+        return False
+    labels = re.findall(r'[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳㉑㉒㉓㉔㉕]', text)
+    return len(labels) >= 2
+
+
+def _unanchored_answer_matrix_sections(page_rows, page_anchors, page_height):
+    """Produce review-only boxes for a dense answer column with no anchors.
+
+    A page can contain one ordinary calculation column and one column composed
+    entirely of circled answer cells.  The latter has no decimal ``1.`` anchor
+    for the normal parser, so previously it disappeared whenever another
+    column did produce records.  These boxes deliberately carry no inferred
+    question number: they make the missing content visible to the annotator,
+    but are excluded from automatic number matching until a person supplies
+    the hierarchy.
+    """
+    by_column = defaultdict(list)
+    for row in page_rows:
+        by_column[row.get('column_index')].append(row)
+
+    sections = []
+    for column_index, rows in by_column.items():
+        rows = sorted(rows, key=lambda row: (int(row['y0']), int(row['x0'])))
+        matrix_rows = [row for row in rows if _is_circled_answer_matrix_row(row)]
+        if len(matrix_rows) < 3:
+            continue
+        typical_height = float(np.median([max(1, row['y1'] - row['y0']) for row in matrix_rows]))
+        gap_limit = max(34, typical_height * 2.8, page_height * 0.025)
+        groups = []
+        current = []
+        for row in matrix_rows:
+            if current and int(row['y0']) - int(current[-1]['y1']) > gap_limit:
+                groups.append(current)
+                current = []
+            current.append(row)
+        if current:
+            groups.append(current)
+
+        for group_index, group in enumerate(groups):
+            first, last = group[0], group[-1]
+            y0 = int(first['y0']) - 6
+            # Retain one immediately-adjacent short heading, but never reach
+            # backward across a preceding answer group.
+            preceding = [
+                row for row in rows
+                if int(row['y1']) <= int(first['y0'])
+                and int(first['y0']) - int(row['y1']) <= max(28, typical_height * 2.2)
+                and not _is_circled_answer_matrix_row(row)
+            ]
+            if preceding:
+                y0 = min(y0, int(preceding[-1]['y0']) - 4)
+            next_start = int(groups[group_index + 1][0]['y0']) - 5 if group_index + 1 < len(groups) else None
+            if next_start is not None:
+                y1 = next_start
+            else:
+                # The final matrix group may be followed by calculation-style
+                # answers without enough circled labels to make another
+                # matrix.  It is still the same otherwise-unanchored column;
+                # keep that tail reviewable instead of silently losing it.
+                tail_rows = [
+                    row for row in rows
+                    if int(row['y0']) >= int(last['y1'])
+                    and not re.fullmatch(r'[—–-]*\d{1,3}[—–-]*', re.sub(r'\s+', '', str(row.get('text', ''))))
+                ]
+                tail_bottom = max((int(row['y1']) for row in tail_rows), default=int(last['y1']))
+                y1 = max(int(last['y1']) + max(8, int(typical_height * 0.7)), tail_bottom + 8)
+            x0, x1 = int(first['column_x0']), int(first['column_x1'])
+            y0, y1 = max(0, y0), min(page_height, y1)
+            # One column can contain a normal numbered answer block above an
+            # unnumbered circled matrix below.  Do not discard the latter just
+            # because the *column* has an anchor; only an anchor inside this
+            # matrix section proves it is already represented by a normal cut.
+            section_has_anchor = any(
+                anchor.get('column_index') == column_index
+                and y0 - 8 <= int(anchor.get('y', -10_000)) <= y1 + 8
+                for anchor in page_anchors
+            )
+            if section_has_anchor:
+                continue
+            if x1 > x0 and y1 > y0:
+                sections.append({
+                    'column_index': column_index,
+                    'source_box': [x0, y0, x1, y1],
+                    'text': ' '.join(str(row.get('text', '')).strip() for row in group),
+                })
+    return sections
+
+
+def process_answer_pages(answer_imgs, profile='general', context_hint='', force_refresh=False):
     """用答案专用的行/上下文解析器处理答案页，返回答案记录列表。"""
     if not answer_imgs:
         return []
@@ -4572,15 +6103,18 @@ def process_answer_pages(answer_imgs, profile='general', context_hint=''):
     records = []
     current_context = ''
     current_major = None
+    answer_strategy = layout_strategy.strategy_for(profile)
     for ans_path in answer_imgs:
         img = cv2_imread(ans_path)
         if img is None:
             continue
         page_record_start = len(records)
-        ocr_items = ocr_image(ans_path, max_side=ANSWER_OCR_MAX_SIDE)
+        ocr_items = ocr_image(
+            ans_path, max_side=ANSWER_OCR_MAX_SIDE, force_refresh=force_refresh,
+        )
         if needs_high_precision_answer_ocr(ocr_items):
             # 答案页的错漏会直接影响配对；降采样证据不足时宁可慢一点，也不牺牲结果。
-            ocr_items = ocr_image(ans_path)
+            ocr_items = ocr_image(ans_path, force_refresh=force_refresh)
             RUN_STATS['answer_ocr_high_precision_fallback_count'] += 1
         # VLM only supplies coarse titled answer regions.  Re-read those
         # regions locally at full resolution before the established OCR parser
@@ -4613,7 +6147,7 @@ def process_answer_pages(answer_imgs, profile='general', context_hint=''):
                     float(item.get('conf', 1.0)) for item in row.get('items', [])
                 ])) if row.get('items') else 0.0
                 holiday_context_row = False
-                if profile == 'holiday':
+                if answer_strategy.answer_leading_day_number:
                     # 假期作业答案用栏首方框数字表示“第几天/第几课”。
                     # OCR可能漏掉紧随其后的“一、”，所以主要依靠栏首位置识别。
                     holiday_context = re.match(r'^\s*(\d{1,3})(?:\s+|$)(.*)$', row_text)
@@ -4632,7 +6166,7 @@ def process_answer_pages(answer_imgs, profile='general', context_hint=''):
                     row_text,
                     typical_height,
                     row['height'],
-                    allow_lesson=profile in {'workbook', 'general', 'instructional'},
+                    allow_lesson=answer_strategy.answer_lesson_context,
                 )
                 if context_title:
                     page_row['structural'] = True
@@ -4655,7 +6189,10 @@ def process_answer_pages(answer_imgs, profile='general', context_hint=''):
                     body = row_text[body_offset:].lstrip()
                     body_offset = len(row_text) - len(body)
 
-                minor_matches = _answer_minor_matches(body)
+                minor_matches = [
+                    match for match in _answer_minor_matches(body)
+                    if not _answer_match_is_decimal_literal(body, *match)
+                ]
                 if not minor_matches and major_match and current_major is not None:
                     minor_matches = [(1, 0)]
                 elif not minor_matches and holiday_context_row and body:
@@ -4664,7 +6201,9 @@ def process_answer_pages(answer_imgs, profile='general', context_hint=''):
                 elif not minor_matches and current_major is not None:
                     stripped = body.lstrip()
                     continuation = re.match(r'^(\d{1,3})\s*[\.．、]', stripped)
-                    if continuation:
+                    if continuation and not _answer_match_is_decimal_literal(
+                        stripped, int(continuation.group(1)), continuation.start(1),
+                    ):
                         minor_matches = [(int(continuation.group(1)), len(body) - len(stripped))]
                 page_row['has_anchor'] = bool(minor_matches)
 
@@ -4692,6 +6231,17 @@ def process_answer_pages(answer_imgs, profile='general', context_hint=''):
                     same_row = page_anchors[-len(minor_matches):]
                     for left_anchor, right_anchor in zip(same_row, same_row[1:]):
                         left_anchor['same_row_next_x'] = right_anchor['x']
+
+        # 补回明确的纵向跳号，避免相邻题在高密度答案页被合成一个框。
+        # 最多三轮可处理 1→4 这类连续漏掉多个编号的情况，且每轮只会在
+        # 局部 OCR 给出精确编号证据时增加锚点。
+        for _recovery_pass in range(3):
+            recovered_anchors = _recover_missed_answer_anchors(
+                img, page_anchors, page_rows,
+            )
+            if len(recovered_anchors) == len(page_anchors):
+                break
+            page_anchors = recovered_anchors
 
         page_anchors.sort(key=lambda anchor: (
             anchor['column_index'], anchor['y'], anchor['x'],
@@ -4722,6 +6272,9 @@ def process_answer_pages(answer_imgs, profile='general', context_hint=''):
                 if left_anchor['row_text'] == right_anchor['row_text']:
                     left_anchor['same_row_next_char'] = right_anchor['char_pos']
 
+        fallback_sections = _unanchored_answer_matrix_sections(
+            page_rows, page_anchors, height,
+        )
         for index, anchor in enumerate(page_anchors):
             next_anchor = page_anchors[index + 1] if index + 1 < len(page_anchors) else None
             x0 = max(anchor['column_x0'], int(anchor['x']) - 8)
@@ -4735,6 +6288,9 @@ def process_answer_pages(answer_imgs, profile='general', context_hint=''):
                 else:
                     y1 = height
             y0 = max(0, int(anchor['y']) - 7)
+            section_start = _next_answer_structure_start(anchor, page_rows)
+            if section_start is not None:
+                y1 = min(y1, max(y0 + 1, section_start - 5))
             if x1 <= x0 or y1 <= y0:
                 continue
             continuation_rows = _inline_answer_continuation_rows(
@@ -4795,6 +6351,46 @@ def process_answer_pages(answer_imgs, profile='general', context_hint=''):
             )
             RUN_STATS['answer_detector_matched_count'] += detector_stats['matched']
             RUN_STATS['answer_detector_refined_count'] += detector_stats['refined']
+        for section in fallback_sections:
+            x0, y0, x1, y1 = section['source_box']
+            records.append({
+                'context': '',
+                'major_idx': '',
+                'num': '',
+                'number_detected': False,
+                'crop_img': img[y0:y1, x0:x1].copy(),
+                'text': section['text'],
+                'source': ans_path,
+                'source_size': [width, height],
+                'source_box': [x0, y0, x1, y1],
+                'source_segments': [],
+                'continuation_attached': False,
+                'column': section['column_index'],
+                'y': y0,
+                'ocr_confidence': 0.0,
+                'unanchored_matrix_fallback': True,
+            })
+        page_records = records[page_record_start:]
+        if not page_records:
+            # OCR can occasionally miss every printed number on a sparse answer
+            # page.  It is still more useful to give PaperFlow one visible
+            # reviewable answer frame than to silently lose the entire page.
+            records.append({
+                'context': current_context or context_hint,
+                'major_idx': 0,
+                'num': 0,
+                'crop_img': img,
+                'text': '',
+                'source': ans_path,
+                'source_size': [width, height],
+                'source_box': [0, 0, width, height],
+                'source_segments': [],
+                'continuation_attached': False,
+                'column': 0,
+                'y': 0,
+                'ocr_confidence': 0.0,
+                'fallback_full_page': True,
+            })
     return records
 
 
@@ -4948,8 +6544,10 @@ def detect_printed_page_number(img, ocr_items):
 
 def partition_flat_document(image_paths, profile, announce=False):
     """逐页分类平铺扫描图，并按新试卷标题分成多个逻辑单元。"""
+    strategy = layout_strategy.strategy_for(profile)
     entries = []
     answer_imgs = []
+    ignored_imgs = []
     in_answer_section = False
 
     page_total = len(image_paths)
@@ -5012,18 +6610,20 @@ def partition_flat_document(image_paths, profile, announce=False):
             answer_imgs.append(image_path)
             continue
         if in_answer_section:
-            if info['kind'] == 'non_content':
+            if info['kind'] in {'non_content', 'instruction'}:
+                ignored_imgs.append(image_path)
                 continue
             # “参考答案”标题通常只印在第一页，后续密集编号页仍属于答案。
             answer_imgs.append(image_path)
             continue
         if info['kind'] in {'non_content', 'instruction'}:
+            ignored_imgs.append(image_path)
             if announce:
                 print(f"  跳过{info['kind']}页: {os.path.basename(image_path)}")
             continue
         entries.append(info)
 
-    if profile == 'holiday':
+    if strategy.page_per_unit:
         # 假期作业通常每张扫描页就是一份独立日练；合并整本会让重复大题号和答案串单元。
         groups = [[entry] for entry in entries]
     else:
@@ -5047,7 +6647,7 @@ def partition_flat_document(image_paths, profile, announce=False):
     units = []
     for unit_index, group in enumerate(groups, 1):
         title = next((entry['title'] for entry in group if entry.get('title')), '')
-        if profile == 'holiday' and group:
+        if strategy.numbered_day_units and group:
             # 答案页的方框编号按“第几份日练”排列，通常与印刷页码相差封面/说明页。
             title = f"第{unit_index}课时"
         units.append({
@@ -5064,6 +6664,9 @@ def partition_flat_document(image_paths, profile, announce=False):
                 for entry in group
             },
             'answer_imgs': list(answer_imgs),
+            # 平铺教材的封面、说明等页不进入 question_imgs，仍需随预标注项目
+            # 写入 ignored_pages；每个逻辑单元携带一份，最终输出阶段会去重。
+            'ignored_img_paths': unique_paths(ignored_imgs),
             'answer_source': '逐页分类',
             'unit_path': os.path.dirname(group[0]['path']) if group else '',
             'profile': profile,
@@ -5077,7 +6680,7 @@ def partition_flat_document(image_paths, profile, announce=False):
 def collect_units(src_dir, profile=None):
     """收集所有单元，返回 [{unit_num, unit_name, question_imgs, answer_imgs}]"""
     units = []
-    profile = profile or infer_book_profile(src_dir)
+    profile = profile or resolve_book_profile(src_dir)
     
     # 尝试结构1: src_dir/子目录/数字/题目/
     book_dir = None
@@ -5187,9 +6790,12 @@ def prepare_structured_unit_ocr(units):
     results = {}
 
     if workers == 1 or total == 1:
-        for index, (_, image_path) in enumerate(pending, 1):
+        for index, (unit, image_path) in enumerate(pending, 1):
             img = cv2_imread(image_path)
-            results[image_path] = ocr_page_structure(image_path, img) if img is not None else []
+            profile = unit.get('profile', 'general')
+            results[image_path] = ocr_page_structure(
+                image_path, img, profile=profile,
+            ) if img is not None else []
             emit_progress('page_scan', index, total, f'预识别题目页面 {index}/{total}')
     else:
         # 每页结构 OCR 完全独立；并行只用于这个预扫描阶段。题目裁切、编号、
@@ -5202,8 +6808,11 @@ def prepare_structured_unit_ocr(units):
                 max_workers=min(workers, total),
                 initializer=_init_structure_ocr_worker,
             ) as executor:
-                for _, image_path in pending:
-                    future_paths[executor.submit(_structure_ocr_worker, image_path)] = image_path
+                for unit, image_path in pending:
+                    profile = unit.get('profile', 'general')
+                    future_paths[executor.submit(
+                        _structure_ocr_worker, image_path, profile,
+                    )] = image_path
                 for future in as_completed(future_paths):
                     image_path = future_paths[future]
                     try:
@@ -5223,9 +6832,13 @@ def prepare_structured_unit_ocr(units):
         if failures:
             failed_paths = {image_path for image_path, _ in failures if image_path not in results}
             print(f'  [性能] 结构 OCR 并行有{len(failed_paths)}页未完成，已自动改为单进程补做。')
-            for image_path in failed_paths:
-                img = cv2_imread(image_path)
-                results[image_path] = ocr_page_structure(image_path, img) if img is not None else []
+            for unit, image_path in pending:
+                if image_path not in results:
+                    img = cv2_imread(image_path)
+                    profile = unit.get('profile', 'general')
+                    results[image_path] = ocr_page_structure(
+                        image_path, img, profile=profile,
+                    ) if img is not None else []
 
     _add_timing('structure_scan_wall', time.perf_counter() - scan_started)
     # 以原始页序写回，保持后续场景判断、题号和输出顺序完全一致。
@@ -5284,7 +6897,7 @@ def archive_legacy_flat_practice_output(out_dir, units, profile):
     正好是旧版回退生成的“第一课时”完整目录时触发。采用同盘移动至备份
     目录，不删除任何旧题图；普通教材和真实的单一课时不会受影响。
     """
-    if profile != 'olympiad':
+    if not layout_strategy.strategy_for(profile).legacy_flat_unit_guard:
         return None
     practice_units = [
         unit for unit in units
@@ -5316,16 +6929,18 @@ def archive_legacy_flat_practice_output(out_dir, units, profile):
     return destination
 
 
-def process_book(src_dir, out_base, skip_unit_paths=None):
+def process_book(src_dir, out_base, skip_unit_paths=None, export_crops=False):
     """处理一本教材。
 
     skip_unit_paths 仅由批量恢复机制在本次运行内传入；其中的单元已经连续
     两次失败，会被记录并跳过，避免一页异常图片反复拖垮整批任务。
     """
     book_name = os.path.basename(src_dir)
+    paperflow_book_root = resolve_paperflow_book_root(src_dir)
     out_dir = os.path.join(out_base, book_name)
-    profile = infer_book_profile(src_dir)
+    profile = resolve_book_profile(src_dir, paperflow_book_root)
     source_fingerprint = source_book_fingerprint(src_dir)
+    paperflow_source_fingerprint = source_book_fingerprint(paperflow_book_root)
     CURRENT_RUN_CONTEXT.update({
         'book_path': os.path.abspath(src_dir),
         'book_name': book_name,
@@ -5335,21 +6950,27 @@ def process_book(src_dir, out_base, skip_unit_paths=None):
         'unit_position': None,
     })
     completed, _completion_data = is_completed_book(
-        src_dir, out_dir, source_fingerprint,
+        paperflow_book_root if not export_crops else src_dir,
+        out_dir,
+        source_fingerprint if export_crops else paperflow_source_fingerprint,
+        output_mode='crops' if export_crops else 'paperflow',
     )
     if completed:
         print(f'\n教材已完成，启动前整本跳过：{book_name}')
         emit_progress('book_skip', 1, 1, '已跳过已完成教材（未进行页面OCR）')
         return
-    if adopt_legacy_completed_book(src_dir, out_dir, profile, source_fingerprint):
+    if export_crops and adopt_legacy_completed_book(src_dir, out_dir, profile, source_fingerprint):
         print(f'\n教材已完成，已兼容旧版结果并整本跳过：{book_name}')
         emit_progress('book_skip', 1, 1, '已跳过旧版已完成教材（未进行页面OCR）')
         return
 
     reset_run_stats()
+    # PaperFlow 预标注数据收集
+    units_pf_data = []
     book_started = time.perf_counter()
     skip_unit_paths = {os.path.abspath(path) for path in (skip_unit_paths or set())}
-    os.makedirs(out_dir, exist_ok=True)
+    if export_crops:
+        os.makedirs(out_dir, exist_ok=True)
     
     print(f"\n{'='*60}")
     print(f"教材: {book_name}")
@@ -5357,7 +6978,8 @@ def process_book(src_dir, out_base, skip_unit_paths=None):
     
     print(f"场景: {profile}")
     units = collect_units(src_dir, profile)
-    archive_legacy_flat_practice_output(out_dir, units, profile)
+    if export_crops:
+        archive_legacy_flat_practice_output(out_dir, units, profile)
     prepare_structured_unit_ocr(units)
     print(f"发现 {len(units)} 个单元\n")
     emit_progress('units', 0, len(units), '已完成页面识别，准备切题')
@@ -5425,36 +7047,49 @@ def process_book(src_dir, out_base, skip_unit_paths=None):
         used_unit_dir_names.add(unit_dir_name)
         final_unit_dir = os.path.join(out_dir, unit_dir_name)
         
-        # 仅在已有有效完成标记时跳过；旧目录或半成品必须重新处理。
-        if os.path.isdir(final_unit_dir):
-            completed, completion_data = is_completed_unit(final_unit_dir)
-            if completed:
-                print(f"  跳过（完成标记：{completion_data['question_count']}道小题，"
-                      f"答案配对{completion_data.get('matched_answer_count', 0)}）")
-                emit_progress('unit', ui, len(units), f'已跳过已完成单元 {ui}/{len(units)}')
-                CURRENT_RUN_CONTEXT.update({
-                    'unit_path': None,
-                    'unit_num': None,
-                    'unit_name': None,
-                    'unit_position': None,
-                })
-                continue
-            existing_jpg = sum(1 for _, _, files in os.walk(final_unit_dir)
-                              for f in files if f.lower().endswith('.jpg'))
-            if existing_jpg:
-                print(f"  [提示] 检测到{existing_jpg}张旧版/半成品图片，将生成完整新结果后再替换")
-        
-        # 始终写入独立暂存目录，整单元成功后才发布，避免新旧算法图片混在一起。
-        staging_root = os.path.join(out_dir, '_运行中')
-        os.makedirs(staging_root, exist_ok=True)
-        staging_name = f'{unit_dir_name}.building-{uuid.uuid4().hex[:8]}'
-        unit_dir = os.path.join(staging_root, staging_name)
-        os.makedirs(unit_dir, exist_ok=True)
-        
+        # 裁图模式才需要单元目录、暂存树和历史完成标记；预标注模式只保留内存结果。
+        if export_crops:
+            if os.path.isdir(final_unit_dir):
+                completed, completion_data = is_completed_unit(final_unit_dir)
+                if completed:
+                    print(f"  跳过（完成标记：{completion_data['question_count']}道小题，"
+                          f"答案配对{completion_data.get('matched_answer_count', 0)}）")
+                    emit_progress('unit', ui, len(units), f'已跳过已完成单元 {ui}/{len(units)}')
+                    CURRENT_RUN_CONTEXT.update({
+                        'unit_path': None,
+                        'unit_num': None,
+                        'unit_name': None,
+                        'unit_position': None,
+                    })
+                    continue
+                existing_jpg = sum(1 for _, _, files in os.walk(final_unit_dir)
+                                  for f in files if f.lower().endswith('.jpg'))
+                if existing_jpg:
+                    print(f"  [提示] 检测到{existing_jpg}张旧版/半成品图片，将生成完整新结果后再替换")
+
+            staging_root = os.path.join(out_dir, '_运行中')
+            os.makedirs(staging_root, exist_ok=True)
+            staging_name = f'{unit_dir_name}.building-{uuid.uuid4().hex[:8]}'
+            unit_dir = os.path.join(staging_root, staging_name)
+            os.makedirs(unit_dir, exist_ok=True)
+        else:
+            unit_dir = None
+            staging_root = None
+
+        # PaperFlow 页面分类记录
+        pf_pages_classification = {}
+        pf_answer_img_set = set()
+        pf_ignored_img_set = {
+            os.path.abspath(path)
+            for path in unit.get('ignored_img_paths', [])
+        }
+        pf_pairs_data = []
+
         # ── 处理答案 ──
         print(f"  处理答案页...")
         all_answer_records = []
         for ans_path in unit['answer_imgs']:
+            pf_answer_img_set.add(os.path.abspath(ans_path))
             try:
                 stat = os.stat(ans_path)
                 cache_key = (os.path.abspath(ans_path), stat.st_size, stat.st_mtime_ns)
@@ -5498,7 +7133,7 @@ def process_book(src_dir, out_base, skip_unit_paths=None):
         # 记录左右栏最后出现的大题号（用于延续页归属）
         last_left_midx = None
         last_right_midx = None
-        
+
         for qi_path in unit['question_imgs']:
             qi_name = os.path.basename(qi_path)
             read_started = time.perf_counter()
@@ -5520,17 +7155,21 @@ def process_book(src_dir, out_base, skip_unit_paths=None):
             if fast_page_ocr is None:
                 # 目录式教材此前直接走整页高精度 OCR，是本机耗时的主要来源。
                 # 与平铺教材保持同一策略：先读标题和题号带，不确定才回退整页。
-                fast_page_ocr = ocr_page_structure(qi_path, img)
+                # profile 必须传下去：exam 场景结构 OCR 覆盖整页宽，否则三栏
+                # 试卷页的中栏会被“两侧条带抽样”丢弃，导致栏位检测退回单栏。
+                fast_page_ocr = ocr_page_structure(qi_path, img, profile=unit_profile)
                 fast_page_side = OCR_ANCHOR_MAX_SIDE
                 question_ocr[qi_path] = fast_page_ocr
                 question_ocr_side[qi_path] = fast_page_side
             used_fast_ocr = fast_page_side < OCR_MAX_SIDE
             ocr_items = fast_page_ocr if used_fast_ocr else ocr_image(qi_path)
             page_info = classify_page(img, ocr_items, unit_profile)
+            pf_pages_classification[os.path.abspath(qi_path)] = page_info['kind']
             if used_fast_ocr and needs_high_precision_page_ocr(ocr_items, page_info):
                 # 快速结果只要有一点不确定，就完全沿用原来的高精度 OCR 流程。
                 ocr_items = ocr_image(qi_path)
                 page_info = classify_page(img, ocr_items, unit_profile)
+                pf_pages_classification[os.path.abspath(qi_path)] = page_info['kind']
                 RUN_STATS['ocr_high_precision_fallback_count'] += 1
                 print(f"    {qi_name}: OCR证据不足，已回退高精度识别")
             # The VLM may recognise an answer card even where dense numbered
@@ -5560,6 +7199,9 @@ def process_book(src_dir, out_base, skip_unit_paths=None):
             # For a two-page spread, an untitled right page continues the
             # final major found on this page's left half.
             page_left_midx = None
+            # column_N 是当前页内部的栏序；跨页延续由 last_left/right_midx
+            # 与 continuation_target_major 决定，不能沿用上一页的栏记录。
+            column_last_midx = {}
             
             for mb in major_blocks:
                 midx = mb['idx']
@@ -5673,19 +7315,17 @@ def process_book(src_dir, out_base, skip_unit_paths=None):
                     )
                 # Detector/context refinements are allowed to expand a box
                 # for question content, but never back into a page-level seal
-                # strip that was proven from the complete column.
+                # strip that was proven from the complete column.  The column
+                # bound guard is separate: it only fires when a verified
+                # multi-column layout supplied real column bounds, and it can
+                # only shrink a box that escaped its column, never delete it.
+                trim_cuts_to_column_bounds(
+                    minor_cuts, img, mb.get('_column_bounds'),
+                )
                 trim_cuts_to_page_sidebar_exclusions(
                     minor_cuts, img, page_sidebar_exclusions,
                 )
                 trim_cuts_to_detached_page_footer(minor_cuts, img)
-                # In live-review mode, show this source page with all cuts in
-                # the current major before it is appended to the final unit.
-                # Gate mode may revise, delete or add boxes here; downstream
-                # normalisation and metadata writing then use those edits.
-                minor_cuts = review_page_cuts(
-                    img, qi_path, minor_cuts,
-                    unit_name=unit_name, major_title=mtitle, page_label=qi_name,
-                )
                 _add_timing('minor_split', time.perf_counter() - minor_split_started)
                 
                 if not is_fullpage:
@@ -5708,57 +7348,63 @@ def process_book(src_dir, out_base, skip_unit_paths=None):
                         page_left_midx = midx
                     else:
                         last_right_midx = midx
+                    column_last_midx[col] = midx
                 
                 else:
                     # 整页块（延续页）：归入对应栏的上一个大题
-                    target_midx = continuation_target_major(
-                        last_left_midx, last_right_midx, page_left_midx, col,
-                    )
-                    
-                    if target_midx is not None and target_midx in major_questions:
-                        target_minors = major_questions[target_midx]['minors']
-                        # The left half of a spread may contain only a chart
-                        # or data table while its first numbered question is
-                        # printed at the top of the right half.  Do not emit
-                        # that material as a duplicate "第1题"; compose it
-                        # into the actual numbered item instead.
-                        if (
-                            target_minors and minor_cuts
-                            and attach_leading_whole_block_to_first_numbered_minor(
-                                target_minors[-1], minor_cuts[0],
-                            )
-                        ):
-                            target_minors.pop()
-                        merged_cross_page, merge_mode = merge_cross_page_continuation_prefix(
-                            target_minors[-1] if target_minors else None,
-                            minor_cuts,
-                        )
-                        if merged_cross_page:
-                            unmatched_report.append({
-                                'type': 'cross_page_merge_review',
-                                'detail': (
-                                    f'跨页题顶部续文已拼接并进入审核'
-                                    f'（{merge_mode}）: {qi_name}'
-                                ),
-                            })
-                        # 即使顶部续文已合并，后续识别出的新题也必须继续输出。
-                        for mc in minor_cuts:
-                            target_minors.append(mc)
+                    previous_col = _previous_column_key(col)
+                    if previous_col and previous_col in column_last_midx:
+                        # 多栏试卷页在同一张图内按栏序阅读：本栏顶部可能是
+                        # 上一栏末尾题的续文，续块归属上一栏的最后一个大题。
+                        target_midx = column_last_midx[previous_col]
                     else:
+                        target_midx = None
+                    if target_midx is None:
+                        target_midx = continuation_target_major(
+                            last_left_midx, last_right_midx, page_left_midx, col,
+                        )
+                    if target_midx is None or target_midx not in major_questions:
                         # 缺少大题标题只影响目录归类，不应阻断正常切题输出。
-                        fallback_title = '未分类题目'
-                        fallback_idx = -1
-                        if fallback_idx not in major_questions:
-                            major_questions[fallback_idx] = {
-                                'title': fallback_title,
+                        target_midx = -1
+                        if target_midx not in major_questions:
+                            major_questions[target_midx] = {
+                                'title': '未分类题目',
                                 'minors': [],
                             }
-                        for mc in minor_cuts:
-                            major_questions[fallback_idx]['minors'].append(mc)
                         unmatched_report.append({
                             'type': 'unclassified_page',
                             'detail': f'延续页无法归属到大题: {qi_name}'
                         })
+                    column_last_midx[col] = target_midx
+                    target_minors = major_questions[target_midx]['minors']
+                    # The left half of a spread may contain only a chart
+                    # or data table while its first numbered question is
+                    # printed at the top of the right half.  Do not emit
+                    # that material as a duplicate "第1题"; compose it
+                    # into the actual numbered item instead.
+                    if (
+                        target_minors and minor_cuts
+                        and attach_leading_whole_block_to_first_numbered_minor(
+                            target_minors[-1], minor_cuts[0],
+                        )
+                    ):
+                        target_minors.pop()
+                    merged_cross_page, merge_mode = merge_cross_page_continuation_prefix(
+                        target_minors[-1] if target_minors else None,
+                        minor_cuts,
+                        ocr_items=ocr_items,
+                    )
+                    if merged_cross_page:
+                        unmatched_report.append({
+                            'type': 'cross_page_merge_review',
+                            'detail': (
+                                f'跨页题顶部续文已拼接并进入审核'
+                                f'（{merge_mode}）: {qi_name}'
+                            ),
+                        })
+                    # 即使顶部续文已合并，后续识别出的新题也必须继续输出。
+                    for mc in minor_cuts:
+                        target_minors.append(mc)
             
             fp_count = sum(1 for b in major_blocks if b['title'] == '整页')
             tp_count = len(major_blocks) - fp_count
@@ -5795,8 +7441,9 @@ def process_book(src_dir, out_base, skip_unit_paths=None):
         for midx, mq in major_questions.items():
             # 大题目录名
             major_dir_name = safe_dirname(mq['title'], 50)
-            major_dir = os.path.join(unit_dir, major_dir_name)
-            os.makedirs(major_dir, exist_ok=True)
+            major_dir = os.path.join(unit_dir, major_dir_name) if export_crops else None
+            if export_crops:
+                os.makedirs(major_dir, exist_ok=True)
             
             # 该大题对应的答案
             avail_answers = answer_blocks.get(midx, [])
@@ -5864,16 +7511,35 @@ def process_book(src_dir, out_base, skip_unit_paths=None):
                 pairing = pairings[seq - 1]
                 answer = pairing.get('answer')
                 decision_band = pairing['decision_band']
+
+                # 收集 PaperFlow 配对数据
+                if not export_crops:
+                    pf_q_id = mc.get('_pf_id') or _generate_paperflow_id('Q')
+                    mc['_pf_id'] = pf_q_id
+                    if answer:
+                        pf_a_id = answer.get('_pf_id') or _generate_paperflow_id('A')
+                        answer['_pf_id'] = pf_a_id
+                        pf_pairs_data.append({
+                            'q_id': pf_q_id,
+                            'a_ids': [pf_a_id],
+                            'decision_band': decision_band,
+                            'score': float(pairing.get('score', 0.0)),
+                        })
                 
                 # 小题目录：第X题（用统一编号）
                 minor_dir_name = f"第{seq}题"
-                minor_dir = os.path.join(major_dir, minor_dir_name)
-                os.makedirs(minor_dir, exist_ok=True)
+                minor_dir = os.path.join(major_dir, minor_dir_name) if export_crops else None
+                if export_crops:
+                    os.makedirs(minor_dir, exist_ok=True)
                 
                 # 保存题目
                 write_started = time.perf_counter()
-                question_written = cv2_imwrite(os.path.join(minor_dir, "题目.jpg"), normalized_crop)
-                _add_timing('final_write', time.perf_counter() - write_started)
+                if export_crops:
+                    question_written = cv2_imwrite(os.path.join(minor_dir, "题目.jpg"), normalized_crop)
+                    _add_timing('final_write', time.perf_counter() - write_started)
+                else:
+                    _add_timing('final_write', time.perf_counter() - write_started)
+                    question_written = True  # PaperFlow 模式跳过裁图
                 if not question_written:
                     unmatched_report.append({
                         'type': 'write_fail',
@@ -5881,8 +7547,11 @@ def process_book(src_dir, out_base, skip_unit_paths=None):
                     })
                     continue
 
-                relative_minor_dir = os.path.relpath(minor_dir, unit_dir).replace('\\', '/')
-                question_relative_path = f'{relative_minor_dir}/题目.jpg'
+                relative_minor_dir = (
+                    os.path.relpath(minor_dir, unit_dir).replace('\\', '/')
+                    if export_crops else ''
+                )
+                question_relative_path = f'{relative_minor_dir}/题目.jpg' if export_crops else ''
                 answer_source = None
                 answer_review_data = None
                 if answer is not None:
@@ -5915,7 +7584,7 @@ def process_book(src_dir, out_base, skip_unit_paths=None):
                     pairing=pairing_metadata,
                     answer_source=answer_source,
                 )
-                if not write_json_atomic(os.path.join(minor_dir, 'metadata.json'), metadata):
+                if export_crops and not write_json_atomic(os.path.join(minor_dir, 'metadata.json'), metadata):
                     unmatched_report.append({
                         'type': 'metadata_write_fail',
                         'detail': f'大题{midx} 第{seq}题来源元数据写入失败',
@@ -5925,9 +7594,12 @@ def process_book(src_dir, out_base, skip_unit_paths=None):
                 if answer:
                     answer_filename = '答案.jpg' if decision_band == 'auto' else '候选答案.jpg'
                     write_started = time.perf_counter()
-                    answer_written = cv2_imwrite(
-                        os.path.join(minor_dir, answer_filename), answer['crop_img'],
-                    )
+                    if export_crops:
+                        answer_written = cv2_imwrite(
+                            os.path.join(minor_dir, answer_filename), answer['crop_img'],
+                        )
+                    else:
+                        answer_written = True
                     _add_timing('final_write', time.perf_counter() - write_started)
                     if answer_written:
                         proposed_path = f'{relative_minor_dir}/{answer_filename}'
@@ -6036,14 +7708,14 @@ def process_book(src_dir, out_base, skip_unit_paths=None):
             review_manifest = review_queue.create_review_queue(
                 unit_name, unit_review_items, algorithm_version=ALGORITHM_VERSION,
             )
-            if not write_json_atomic(os.path.join(unit_dir, 'review_queue.json'), review_manifest):
+            if export_crops and not write_json_atomic(os.path.join(unit_dir, 'review_queue.json'), review_manifest):
                 unmatched_report.append({
                     'type': 'review_queue_write_fail',
                     'detail': '题目—答案审核清单写入失败',
                 })
         
-        # 写入未配对报告
-        if unmatched_report:
+        # 裁图模式保留未配对报告；PaperFlow 项目中的未配对题由标注员直接复核。
+        if export_crops and unmatched_report:
             report_path = os.path.join(unit_dir, 'unmatched_report.txt')
             with open(report_path, 'w', encoding='utf-8') as f:
                 for i, item in enumerate(unmatched_report, 1):
@@ -6056,29 +7728,54 @@ def process_book(src_dir, out_base, skip_unit_paths=None):
 
         detected_answer_count = len(selected_answers)
         if unit_minor_count:
-            write_completion_marker(
-                unit_dir,
-                question_count=unit_minor_count,
-                matched_count=unit_matched_count,
-                answer_count=detected_answer_count,
-            )
-            publish_started = time.perf_counter()
-            backup_dir = publish_staged_unit(unit_dir, final_unit_dir)
-            _add_timing('publish', time.perf_counter() - publish_started)
-            unit_dir = final_unit_dir
-            if backup_dir:
-                print(f"  旧结果已保留: {os.path.basename(backup_dir)}")
-            try:
-                os.rmdir(staging_root)
-            except OSError:
-                pass
+            if export_crops:
+                write_completion_marker(
+                    unit_dir,
+                    question_count=unit_minor_count,
+                    matched_count=unit_matched_count,
+                    answer_count=detected_answer_count,
+                )
+                publish_started = time.perf_counter()
+                backup_dir = publish_staged_unit(unit_dir, final_unit_dir)
+                _add_timing('publish', time.perf_counter() - publish_started)
+                unit_dir = final_unit_dir
+                if backup_dir:
+                    print(f"  旧结果已保留: {os.path.basename(backup_dir)}")
+                try:
+                    os.rmdir(staging_root)
+                except OSError:
+                    pass
         else:
+            # 与旧裁图模式一致：一个单元没有产出题框时，不得把整本预标注
+            # 发布成 complete，否则下次会因教材指纹相同而永久跳过这本书。
+            skipped_incomplete_unit = True
             print("  [警告] 未生成小题，不写完成标记；下次运行将再次处理此单元")
         
         elapsed = time.time() - t0
         total_minors += unit_minor_count
         total_matched += unit_matched_count
         
+        # 收集 PaperFlow 单元数据
+        if not export_crops:
+            pf_scope_id = 'scope-' + uuid.uuid4().hex[:12]
+            pf_unit_data = {
+                'scope_id': pf_scope_id,
+                'unit_name': unit_name,
+                'unit_num': unit_num,
+                'unit_profile': unit_profile,
+                'pages_classification': pf_pages_classification,
+                'major_questions': major_questions,
+                'answer_records': selected_answers,
+                # Keep every OCR-derived answer record too.  The project writer
+                # emits records outside the selected context as unassigned
+                # answer frames, never as automatic matches.
+                'all_answer_records': all_answer_records,
+                'answer_img_paths': list(pf_answer_img_set),
+                'ignored_img_paths': list(pf_ignored_img_set),
+                'pairs_data': pf_pairs_data,
+            }
+            units_pf_data.append(pf_unit_data)
+
         match_pct = f"{unit_matched_count/unit_minor_count:.0%}" if unit_minor_count else "N/A"
         print(f"  完成: {unit_minor_count}道小题, 答案配对{unit_matched_count}({match_pct}), {elapsed:.0f}秒")
         emit_progress('unit', ui, len(units), f'已完成第 {ui}/{len(units)} 个单元')
@@ -6101,9 +7798,23 @@ def process_book(src_dir, out_base, skip_unit_paths=None):
     print(f"  总用时: {time.perf_counter() - book_started:.0f}秒")
     if skipped_incomplete_unit:
         print('  [提示] 本书含已跳过的异常单元，未写入整本完成标记。')
-    else:
+    elif export_crops:
         write_book_completion_marker(out_dir, source_fingerprint, len(units))
         print('  已写入整本完成标记；下次将跳过页面识别和切题。')
+
+    # 仅完整处理整本后才发布项目；否则下次不能把缺单元的半成品误判为完成。
+    if not export_crops and skipped_incomplete_unit:
+        print('  [提示] 本书未完整处理，未发布 PaperFlow 预标注项目；下次会重新处理。')
+    elif not export_crops and units_pf_data:
+        project = write_paperflow_project(
+            paperflow_book_root,
+            units_pf_data,
+            profile,
+            source_fingerprint=paperflow_source_fingerprint,
+        )
+        if project is None:
+            raise RuntimeError('PaperFlow 预标注项目写入失败，本书不会标记为完成。')
+
     emit_progress('complete', 1, 1, '处理完成')
 
 
@@ -6194,7 +7905,7 @@ def _init_book_worker(progress_queue):
     _WORKER_PROGRESS_QUEUE = progress_queue
 
 
-def _process_book_worker(book_dir, out_dir, skip_unit_paths, log_path):
+def _process_book_worker(book_dir, out_dir, skip_unit_paths, log_path, export_crops=False):
     """并行子进程任务：完整处理一本书。
 
     输出同时追加到本次运行日志，并通过继承的进度队列回传主进程，
@@ -6215,7 +7926,14 @@ def _process_book_worker(book_dir, out_dir, skip_unit_paths, log_path):
         except (OSError, ValueError):
             log_file = None
     try:
-        process_book(book_dir, out_dir, skip_unit_paths=skip_unit_paths)
+        if export_crops:
+            process_book(
+                book_dir, out_dir,
+                skip_unit_paths=skip_unit_paths,
+                export_crops=True,
+            )
+        else:
+            process_book(book_dir, out_dir, skip_unit_paths=skip_unit_paths)
         return {'ok': True, 'book': os.path.abspath(book_dir), 'error': None,
                 'traceback': None, 'context': None}
     except KeyboardInterrupt:
@@ -6253,7 +7971,7 @@ def _drain_progress_queue(progress_q):
             break
 
 
-def process_year(src_year_dir, out_base):
+def process_year(src_year_dir, out_base, export_crops=False):
     """批量处理一个年份下所有教材，单元异常不会终止整批任务。
 
     默认同时切 2 本教材（环境变量 PAPERCUTTER_BOOK_WORKERS 可调整，设为 1
@@ -6299,11 +8017,19 @@ def process_year(src_year_dir, out_base):
             book_path = os.path.abspath(book_dir)
             while True:
                 try:
-                    process_book(
-                        book_dir,
-                        out_year_dir,
-                        skip_unit_paths=skipped_units_by_book[book_path],
-                    )
+                    if export_crops:
+                        process_book(
+                            book_dir,
+                            out_year_dir,
+                            skip_unit_paths=skipped_units_by_book[book_path],
+                            export_crops=True,
+                        )
+                    else:
+                        process_book(
+                            book_dir,
+                            out_year_dir,
+                            skip_unit_paths=skipped_units_by_book[book_path],
+                        )
                     break
                 except KeyboardInterrupt:
                     print('\n用户中断任务，停止批量处理。')
@@ -6339,6 +8065,7 @@ def process_year(src_year_dir, out_base):
                         _process_book_worker, book, out_year_dir,
                         frozenset(skipped_units_by_book[os.path.abspath(book)]),
                         log_path,
+                        export_crops,
                     )
                     pending[future] = book
                 while pending:
@@ -6372,6 +8099,7 @@ def process_year(src_year_dir, out_base):
                                 _process_book_worker, book, out_year_dir,
                                 frozenset(skipped_units_by_book[book_path]),
                                 log_path,
+                                export_crops,
                             )] = book
         except KeyboardInterrupt:
             print('\n用户中断任务，停止批量处理。')
@@ -6388,6 +8116,450 @@ def process_year(src_year_dir, out_base):
 
 
 # ═══════════════════════════════════════════════════════════════
+# PaperFlow 预标注项目输出
+# ═══════════════════════════════════════════════════════════════
+
+def _infer_book_metadata_from_name(book_name):
+    """从教材目录名推断 language/stage/grade/subject。
+
+    目录名示例：
+      必胜课冲刺100分二年级下册数学人教版2013__ISBN_9787541655425
+      人教版_英语_三年级上册_期末检测卷
+    """
+    name = str(book_name or '')
+
+    # 学段
+    stage = ''
+    for s in ('小学', '初中', '高中'):
+        if s in name:
+            stage = s
+            break
+
+    # 年级
+    grade = ''
+    for key in ('一年级', '二年级', '三年级', '四年级', '五年级', '六年级',
+                '七年级', '八年级', '九年级', '初一', '初二', '初三',
+                '高一', '高二', '高三'):
+        if key in name:
+            grade = key
+            break
+
+    # 学科
+    subject = ''
+    for s in ('数学', '语文', '英语', '物理', '化学', '生物', '历史',
+              '地理', '政治', '道德与法治', '科学', '美术', '音乐',
+              '体育', 'Python', '编程'):
+        if s in name:
+            subject = s
+            break
+
+    # 语言
+    language = 'zh'
+    if 'english' in name.lower():
+        language = 'en'
+
+    return {
+        'language': language,
+        'stage': stage,
+        'grade': grade,
+        'subject': subject,
+        'answer_mode': 'textbook',
+    }
+
+
+def _generate_paperflow_id(prefix='Q'):
+    """生成 PaperFlow 兼容的稳定 ID。"""
+    return f'{prefix}-{uuid.uuid4().hex[:12]}'
+
+
+def _paperflow_answer_record_key(record):
+    """Stable physical identity used to keep fallback answer frames unique."""
+    if not isinstance(record, dict):
+        return None
+    source = str(record.get('source', '') or '').strip()
+    box = record.get('source_box', [])
+    if not source or not isinstance(box, (list, tuple)) or len(box) != 4:
+        return None
+    try:
+        normalized = tuple(int(round(float(value))) for value in box)
+    except (TypeError, ValueError):
+        return None
+    if normalized[2] <= normalized[0] or normalized[3] <= normalized[1]:
+        return None
+    return os.path.abspath(source), normalized
+
+
+def _paperflow_scope_regions(records):
+    """Represent batch scopes as their actual pre-labelled boxes, never a page flag."""
+    regions = []
+    seen = set()
+    for record in records:
+        scope_id = str(record.get('match_scope_id', '') or '').strip()
+        box = record.get('bbox', [])
+        if not scope_id or not isinstance(box, (list, tuple)) or len(box) != 4:
+            continue
+        try:
+            normalized_box = [int(round(float(value))) for value in box]
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if normalized_box[2] <= normalized_box[0] or normalized_box[3] <= normalized_box[1]:
+            continue
+        key = (scope_id, tuple(normalized_box))
+        if key in seen:
+            continue
+        seen.add(key)
+        record_id = str(record.get('id', '') or '')
+        regions.append({
+            'id': f'region-prelabel-{record_id or len(regions) + 1}',
+            'scope_id': scope_id,
+            'bbox': normalized_box,
+        })
+    return regions
+
+
+def write_paperflow_project(src_dir, units_pf_data, book_profile, source_fingerprint=None):
+    """将旧工具处理结果写成 PaperFlow 标注项目 JSON。
+
+    Args:
+        src_dir: 教材源目录（JSON 写到这个目录下）
+        units_pf_data: list[dict]，每个单元的数据包
+        book_profile: 教材的 profile
+        source_fingerprint: 本次处理的教材源文件指纹，用于安全跳过重跑
+    """
+    from collections import defaultdict
+    from datetime import datetime, timezone
+
+    root = os.path.abspath(src_dir)
+    book_name = os.path.basename(root)
+    metadata = _infer_book_metadata_from_name(book_name)
+
+    all_pages = {}
+    all_answer_pages = {}
+    all_ignored_pages = {}
+    all_ignored_page_profiles = {}
+    all_match_scopes = []
+    all_pairs = []
+    emitted_answer_record_keys = set()
+    question_primary_by_scope_number = {}
+    selected_answer_record_keys = {
+        key
+        for unit_data in units_pf_data
+        for key in (_paperflow_answer_record_key(record)
+                    for record in unit_data.get('answer_records', []))
+        if key is not None
+    }
+
+    for unit_data in units_pf_data:
+        scope_id = unit_data['scope_id']
+        unit_name = unit_data['unit_name']
+        profile = unit_data.get('unit_profile') or book_profile
+
+        now_iso = datetime.now(timezone.utc).astimezone().isoformat(timespec='seconds')
+        all_match_scopes.append({
+            'id': scope_id,
+            'name': unit_name,
+            'created_at': now_iso,
+        })
+
+        pages_classification = unit_data.get('pages_classification', {})
+        major_questions = unit_data.get('major_questions', {})
+        answer_records = unit_data.get('answer_records', [])
+        for ignored_path in unit_data.get('ignored_img_paths', []):
+            page_key = os.path.abspath(ignored_path)
+            if page_key:
+                all_ignored_page_profiles.setdefault(page_key, profile)
+
+        # 题目框按页面分组
+        page_questions_map = defaultdict(list)
+        for midx, mq in major_questions.items():
+            major_title = mq.get('title', '')
+            # 提取大题号
+            major_num = ''
+            m = re.match(
+                r'^[（(]?([一二三四五六七八九十百千〇零两]+)[）)]?[、,，.．]'
+                r'|^第([一二三四五六七八九十百千〇零两]+|\d{1,3})(?:大题|题|部分|单元|章|节)'
+                r'|^[（(]?(\d{1,3})[）)]?[、,，.．]',
+                major_title.strip(),
+            )
+            if m:
+                captured = m.group(1) or m.group(2) or m.group(3)
+                # 简单转写中文数字
+                cn_map = {'一': '1', '二': '2', '三': '3', '四': '4', '五': '5',
+                          '六': '6', '七': '7', '八': '8', '九': '9', '十': '10',
+                          '十一': '11', '十二': '12', '十三': '13', '十四': '14', '十五': '15',
+                          '十六': '16', '十七': '17', '十八': '18', '十九': '19', '二十': '20'}
+                major_num = cn_map.get(captured, captured)
+            if not major_num and isinstance(midx, int) and midx > 0:
+                major_num = str(midx)
+
+            for mc in mq.get('minors', []):
+                page_key = os.path.abspath(mc.get('_source_path', ''))
+                if not page_key:
+                    continue
+                box = mc.get('_source_box', [])
+                if not isinstance(box, (list, tuple)) or len(box) != 4:
+                    continue
+
+                minor_num = str(mc.get('num', '') or '')
+                number_path = [major_num] if major_num else []
+                if minor_num:
+                    number_path.append(minor_num)
+
+                q_id = mc.get('_pf_id') or _generate_paperflow_id('Q')
+                mc['_pf_id'] = q_id
+
+                record = {
+                    'id': q_id,
+                    'bbox': [int(round(v)) for v in box],
+                    'number_path': number_path,
+                    'display_number': '-'.join(number_path),
+                    'major_number': major_num,
+                    'major_title': major_title,
+                    'minor_number': minor_num,
+                    'subsection_number': '',
+                    'subsection_title': '',
+                    'region_role': 'question',
+                    'origin': 'batch_rule',
+                    'boundary_source': str(mc.get('_boundary_source', 'rule')),
+                    # Keep the model metadata truthful.  OCR's question-number
+                    # confidence is recorded separately in review data; it is
+                    # not evidence that the YOLO question-box detector moved
+                    # this boundary.
+                    'detector_assisted': bool(mc.get('_detector_confidence', 0.0)),
+                    'detector_confidence': float(mc.get('_detector_confidence', 0.0)),
+                    'page_deskew_angle': float(mc.get('_page_deskew_angle', 0.0)),
+                    'match_scope_id': scope_id,
+                    'number': minor_num,
+                }
+                # A same-number whole-block that follows a numbered question is
+                # a cross-column/page continuation, not another matchable
+                # question.  Keep its box but attach it to the primary frame.
+                if number_path:
+                    number_key = (scope_id, tuple(number_path))
+                    primary = question_primary_by_scope_number.get(number_key)
+                    if primary is None:
+                        question_primary_by_scope_number[number_key] = record
+                    else:
+                        record['region_role'] = 'continuation'
+                        record['continuation_of'] = primary['id']
+                page_questions_map[page_key].append(record)
+
+        # 答案框按页面分组
+        page_answers_map = defaultdict(list)
+        selected_answer_records = list(answer_records)
+        fallback_answer_records = []
+        for rec in unit_data.get('all_answer_records', []):
+            record_key = _paperflow_answer_record_key(rec)
+            if record_key is not None and record_key not in selected_answer_record_keys:
+                fallback_answer_records.append(rec)
+        for rec, is_unassigned in (
+            [(record, False) for record in selected_answer_records]
+            + [(record, True) for record in fallback_answer_records]
+        ):
+            page_key = os.path.abspath(rec.get('source', ''))
+            if not page_key:
+                continue
+            box = rec.get('source_box', [])
+            if not isinstance(box, (list, tuple)) or len(box) != 4:
+                continue
+            record_key = _paperflow_answer_record_key(rec)
+            if record_key is not None:
+                if record_key in emitted_answer_record_keys:
+                    continue
+                emitted_answer_record_keys.add(record_key)
+
+            major_idx_str = str(rec.get('major_idx', '') or '')
+            minor_num = str(rec.get('num', '') or '')
+            number_path = []
+            if major_idx_str and major_idx_str != '0':
+                number_path.append(major_idx_str)
+            if minor_num:
+                number_path.append(minor_num)
+
+            a_id = rec.get('_pf_id') or _generate_paperflow_id('A')
+            rec['_pf_id'] = a_id
+
+            answer_text = str(rec.get('text', '') or '')
+            record = {
+                'id': a_id,
+                'bbox': [int(round(v)) for v in box],
+                'number_path': number_path,
+                'display_number': '-'.join(number_path),
+                'major_number': major_idx_str,
+                'minor_number': minor_num,
+                'region_role': 'question',
+                'origin': 'batch_unmatched_answer' if is_unassigned else 'batch_rule',
+                'answer': answer_text,
+                'text': answer_text,
+                'ocr_confidence': float(rec.get('ocr_confidence', 0.0)),
+                # An out-of-context answer must remain visible but cannot be
+                # auto-matched to this unit merely because it shares a page.
+                'match_scope_id': '' if is_unassigned else scope_id,
+                'unmatched_answer': bool(is_unassigned),
+                'number': minor_num,
+            }
+            page_answers_map[page_key].append(record)
+
+        # 写入 pages / answer_pages / ignored_pages
+        for page_abspath, kind in pages_classification.items():
+            try:
+                rel_path = os.path.relpath(page_abspath, root).replace(chr(92), '/')
+            except ValueError:
+                continue
+
+            if kind == 'answer':
+                answers = page_answers_map.get(page_abspath, [])
+                if page_abspath not in all_answer_pages:
+                    all_answer_pages[page_abspath] = {
+                        'image': rel_path, 'profile': profile,
+                        'status': 'accepted' if answers else 'unlabeled',
+                        'answers': [], 'match_scope_id': '', 'match_scope_regions': [],
+                    }
+                all_answer_pages[page_abspath]['answers'].extend(answers)
+                if answers:
+                    all_answer_pages[page_abspath]['status'] = 'accepted'
+            elif kind in ('non_content', 'instruction'):
+                if page_abspath not in all_ignored_pages:
+                    all_ignored_pages[page_abspath] = {
+                        'image': rel_path, 'profile': profile,
+                        'status': 'unlabeled', 'questions': [],
+                    }
+            elif kind == 'question':
+                q_list = page_questions_map.get(page_abspath, [])
+                if page_abspath not in all_pages:
+                    all_pages[page_abspath] = {
+                        'image': rel_path, 'profile': profile,
+                        'status': 'accepted' if q_list else 'unlabeled',
+                        'questions': [], 'match_scope_id': '', 'match_scope_regions': [],
+                    }
+                all_pages[page_abspath]['questions'].extend(q_list)
+                if q_list:
+                    all_pages[page_abspath]['status'] = 'accepted'
+
+        # 处理 formal answer_imgs（答案目录里的页面）
+        for ans_path in unit_data.get('answer_img_paths', []):
+            page_key = os.path.abspath(ans_path)
+            if page_key in pages_classification:
+                continue
+            try:
+                rel_path = os.path.relpath(page_key, root).replace(chr(92), '/')
+            except ValueError:
+                continue
+            answers = page_answers_map.get(page_key, [])
+            if page_key not in all_answer_pages:
+                all_answer_pages[page_key] = {
+                    'image': rel_path, 'profile': profile,
+                    'status': 'accepted' if answers else 'unlabeled',
+                    'answers': [], 'match_scope_id': '', 'match_scope_regions': [],
+                }
+            all_answer_pages[page_key]['answers'].extend(answers)
+            if answers:
+                all_answer_pages[page_key]['status'] = 'accepted'
+
+        # 只把高置信自动结果写成已确认关系；其余候选保持未配对，交给标注员复核。
+        for pair_item in unit_data.get('pairs_data', []):
+            if pair_item.get('decision_band') != 'auto':
+                continue
+            q_id = pair_item.get('q_id', '')
+            a_ids_list = pair_item.get('a_ids', [])
+            if not q_id or not a_ids_list:
+                continue
+            all_pairs.append({
+                'id': 'pair-' + uuid.uuid4().hex,
+                'question_id': q_id,
+                'answer_ids': list(a_ids_list),
+                'delivery_id': _generate_paperflow_id('R'),
+                'status': 'accepted',
+                'source': 'batch_number_match',
+                'score': float(pair_item.get('score', 0.0)),
+                'updated_at': now_iso,
+            })
+
+    # 平铺教材在分单元前已剔除封面、说明等页面。它们不在 question_imgs 中，
+    # 所以必须在这里补回 ignored_pages；题目/答案页优先，防止分类回退时重复入册。
+    for page_key, profile in all_ignored_page_profiles.items():
+        if page_key in all_pages or page_key in all_answer_pages or page_key in all_ignored_pages:
+            continue
+        try:
+            rel_path = os.path.relpath(page_key, root).replace(chr(92), '/')
+        except ValueError:
+            continue
+        all_ignored_pages[page_key] = {
+            'image': rel_path,
+            'profile': profile,
+            'status': 'unlabeled',
+            'questions': [],
+        }
+
+    # A batch preannotation scope is defined by the emitted question/answer
+    # frames.  Do not set a page-wide default here: doing so makes the main
+    # workbench display an answer sheet as one huge group and also lets a later
+    # unassigned fallback answer inherit the wrong scope.
+    for page in list(all_pages.values()) + list(all_answer_pages.values()):
+        records = page.get('answers', page.get('questions', []))
+        page['match_scope_regions'] = _paperflow_scope_regions(records)
+
+    # 去重 scope
+    seen_ids = set()
+    unique_scopes = []
+    for s in all_match_scopes:
+        if s['id'] not in seen_ids:
+            seen_ids.add(s['id'])
+            unique_scopes.append(s)
+
+    answer_image_root = root if all_answer_pages else ''
+    now_iso = datetime.now(timezone.utc).astimezone().isoformat(timespec='seconds')
+
+    project = {
+        'schema_version': 1,
+        'kind': 'papercutter_manual_annotation',
+        'preannotation_mode': 'paperflow',
+        'status': 'complete',
+        'algorithm_version': ALGORITHM_VERSION,
+        'source_fingerprint': source_fingerprint or source_book_fingerprint(root),
+        'annotation_version': 5,
+        'created_at': now_iso,
+        'updated_at': now_iso,
+        'coordinate_format': 'xyxy_pixels',
+        'book_root': root,
+        'image_root': root,
+        'answer_image_root': answer_image_root,
+        'pages': sorted(all_pages.values(), key=lambda p: p['image']),
+        'answer_pages': sorted(all_answer_pages.values(), key=lambda p: p['image']),
+        'ignored_pages': sorted(all_ignored_pages.values(), key=lambda p: p['image']),
+        'match_scopes': unique_scopes,
+        'pairs': all_pairs,
+        'language': metadata['language'],
+        'stage': metadata['stage'],
+        'grade': metadata['grade'],
+        'subject': metadata['subject'],
+        'answer_mode': metadata['answer_mode'],
+    }
+
+    # 写入文件
+    project_path = os.path.join(root, 'PaperFlow标注项目.json')
+    temp_path = project_path + '.tmp'
+    try:
+        with open(temp_path, 'w', encoding='utf-8') as f:
+            json.dump(project, f, ensure_ascii=False, indent=2)
+        os.replace(temp_path, project_path)
+        print(f'  PaperFlow预标注项目已写入：{project_path}')
+        print(f'    页面: {len(project["pages"])}, 答案页: {len(project["answer_pages"])}, '
+              f'忽略页: {len(project["ignored_pages"])}')
+        print(f'    分组数: {len(project["match_scopes"])}, 自动配对: {len(project["pairs"])}')
+    except (OSError, TypeError, ValueError) as exc:
+        print(f'  [警告] PaperFlow项目写入失败: {exc}')
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+        return None
+
+    return project
+
+
+# ═══════════════════════════════════════════════════════════════
 # 命令行
 # ═══════════════════════════════════════════════════════════════
 def main():
@@ -6399,10 +8571,6 @@ def main():
         help='输出根目录；单本模式会在其下自动建立教材同名目录',
     )
     parser.add_argument('--mode', choices=['book', 'year'], default='book')
-    parser.add_argument(
-        '--live-review', choices=['off', 'preview', 'gate'],
-        help='本地实时审核：preview 只展示预测框，gate 每个版块等待人工确认后再写入结果。',
-    )
     parser.add_argument(
         '--vlm-assist', action='store_true',
         help='启用 Qwen 页面语义辅助：只排除答题卡/非题页并标注题组，不替代 OCR 切题或答案配对。API 密钥只从 DASHSCOPE_API_KEY 读取。',
@@ -6416,12 +8584,11 @@ def main():
         '--vlm-thinking', action='store_true',
         help='启用 Qwen3-VL 推理模式；模型会先进行视觉推理，再返回最终结构化判断。',
     )
+    parser.add_argument('--export-crops', action='store_true',
+                        help='输出裁切图片（默认：输出 PaperFlow 预标注框 JSON）')
     parser.add_argument('--log-dir', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs'),
                         help='运行日志目录（默认：脚本目录下的 logs）')
     args = parser.parse_args()
-
-    if args.live_review:
-        os.environ['PAPERCUTTER_LIVE_REVIEW_MODE'] = args.live_review
 
     if args.vlm_assist:
         os.environ['PAPERCUTTER_VLM_MODE'] = 'assist'
@@ -6436,9 +8603,9 @@ def main():
     log_file, original_stdout, original_stderr = start_run_log(args.log_dir)
     try:
         if args.mode == 'year':
-            process_year(args.src, args.out)
+            process_year(args.src, args.out, export_crops=args.export_crops)
         else:
-            process_book(args.src, args.out)
+            process_book(args.src, args.out, export_crops=args.export_crops)
     finally:
         sys.stdout.flush()
         sys.stderr.flush()

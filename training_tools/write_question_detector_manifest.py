@@ -25,7 +25,13 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def write_manifest(model: str | Path, source_weights: str = "", output: str | Path | None = None) -> Path:
+def write_manifest(
+    model: str | Path,
+    source_weights: str = "",
+    output: str | Path | None = None,
+    *,
+    imgsz: int = 640,
+) -> Path:
     model_path = Path(model).resolve()
     if not model_path.is_file():
         raise FileNotFoundError(model_path)
@@ -80,7 +86,7 @@ def write_manifest(model: str | Path, source_weights: str = "", output: str | Pa
             "onnx_version": _version("onnx"),
             "onnxruntime_version": _version("onnxruntime"),
             "command": (
-                'model.export(format="onnx", imgsz=640, batch=1, dynamic=False, '
+                f'model.export(format="onnx", imgsz={int(imgsz)}, batch=1, dynamic=False, '
                 'simplify=True, half=False, nms=True, conf=0.0, iou=0.7, max_det=300, device="cpu")'
             ),
         },
@@ -98,8 +104,9 @@ def main() -> None:
     parser.add_argument("model")
     parser.add_argument("--source-weights", default="")
     parser.add_argument("--output")
+    parser.add_argument("--imgsz", type=int, default=640)
     args = parser.parse_args()
-    print(write_manifest(args.model, args.source_weights, args.output))
+    print(write_manifest(args.model, args.source_weights, args.output, imgsz=args.imgsz))
 
 
 if __name__ == "__main__":

@@ -20,6 +20,18 @@ class QuestionDetectorContractTests(unittest.TestCase):
         )
         self.assertEqual(errors, [])
 
+    def test_high_resolution_contract_metadata_is_accepted(self):
+        errors = validate_contract_metadata(
+            {
+                "schema_version": 2, "model_name": "question_detector", "classes": {"0": "question"},
+                "input": {"shape": [1, 3, 1600, 1600]},
+                "output": {"format": "ultralytics_nms", "nms_in_model": True, "shape": [1, 300, 6]},
+                "artifact": {"filename": "question_detector.onnx", "sha256": "test"},
+            },
+            [1, 3, 1600, 1600], "tensor(float)", [1, 300, 6], "tensor(float)",
+        )
+        self.assertEqual(errors, [])
+
     def test_raw_yolo_output_and_wrong_nms_are_rejected(self):
         errors = validate_contract_metadata(
             {

@@ -371,6 +371,230 @@ class SourceMetadataTests(unittest.TestCase):
         self.assertEqual(first_new_question['crop_img'].shape[0], 220)
 
 
+class SamePageThreeColumnContinuationTests(unittest.TestCase):
+    def _inked(self, height, width, stripe_h=None):
+        """A near-white canvas with a dark ink band near its top."""
+        canvas = np.full((height, width, 3), 245, dtype=np.uint8)
+        band_h = stripe_h if stripe_h is not None else max(1, height // 3)
+        canvas[:band_h, :] = 25
+        return canvas
+
+    def _column_previous(self, **overrides):
+        previous = {
+            'num': 34, 'number_detected': True,
+            'crop_img': np.full((280, 320, 3), 255, dtype=np.uint8),
+            '_source_path': 'page-1.jpg', '_source_size': [1000, 1400],
+            '_source_box': [0, 1120, 320, 1400], '_col': 'column_1',
+            '_page_deskew_angle': 0.2,
+        }
+        previous.update(overrides)
+        return previous
+
+    def _column_fragment(self, **overrides):
+        fragment = {
+            'num': 0, 'number_detected': False,
+            'crop_img': self._inked(160, 320),
+            '_source_path': 'page-1.jpg', '_source_size': [1000, 1400],
+            '_source_box': [340, 0, 660, 160], '_col': 'column_2',
+            '_boundary_source': 'whole_block',
+        }
+        fragment.update(overrides)
+        return fragment
+
+    def test_three_column_top_fragment_merges_into_previous_column_last_question(self):
+        previous = self._column_previous()
+        fragment = self._column_fragment()
+        self.assertTrue(
+            cutter.should_merge_cross_page_question(previous, fragment)
+        )
+        merged = cutter.merge_cross_page_question(previous, fragment)
+        self.assertEqual(merged['crop_img'].shape[:2], (440, 320))
+        self.assertEqual(len(merged['_source_segments']), 2)
+        self.assertTrue(merged['_cross_page_merge'])
+
+    def test_three_column_numbered_top_is_not_merged(self):
+        previous = self._column_previous()
+        numbered = self._column_fragment(num=36, number_detected=True, _col='column_3')
+        self.assertFalse(
+            cutter.should_merge_cross_page_question(previous, numbered)
+        )
+
+    def test_same_column_bottom_to_top_is_not_merged(self):
+        previous = self._column_previous(_col='column_2', _source_box=[340, 1120, 660, 1400])
+        fragment = self._column_fragment(_col='column_2')
+        self.assertFalse(
+            cutter.should_merge_cross_page_question(previous, fragment)
+        )
+
+    def test_unnumbered_three_column_prefix_merges_but_later_questions_remain(self):
+        previous = self._column_previous()
+        continuation = self._column_fragment()
+        next_question = {
+            'num': 35, 'number_detected': True,
+            'crop_img': np.full((80, 320, 3), 220, dtype=np.uint8),
+            '_source_path': 'page-1.jpg', '_source_size': [1000, 1400],
+            '_source_box': [340, 165, 660, 245], '_col': 'column_2',
+        }
+        cuts = [continuation, next_question]
+        merged, mode = cutter.merge_cross_page_continuation_prefix(previous, cuts)
+        self.assertTrue(merged)
+        self.assertEqual(mode, 'unnumbered_prefix')
+        self.assertEqual([cut['num'] for cut in cuts], [35])
+        self.assertTrue(previous['_cross_page_merge'])
+
+    def test_blank_column_top_margin_is_not_merged(self):
+        previous = self._column_previous()
+        blank = self._column_fragment(
+            crop_img=np.full((160, 320, 3), 255, dtype=np.uint8),
+        )
+        self.assertFalse(
+            cutter.should_merge_cross_page_question(previous, blank)
+        )
+
+    def test_three_column_numbered_first_cut_can_peel_large_leading_fragment(self):
+        previous = self._column_previous()
+        first_new_question = {
+            'num': 35, 'number_detected': True,
+            'crop_img': self._inked(220, 320),
+            '_source_path': 'page-1.jpg', '_source_size': [1000, 1400],
+            '_source_box': [340, 0, 660, 220], '_anchor_y': 120,
+            '_y_start': 0, '_col': 'column_2',
+            '_boundary_source': 'ocr_number',
+        }
+        later_question = {
+            'num': 36, 'number_detected': True,
+            'crop_img': np.full((70, 320, 3), 210, dtype=np.uint8),
+            '_source_path': 'page-1.jpg', '_source_size': [1000, 1400],
+            '_source_box': [340, 225, 660, 295], '_col': 'column_2',
+        }
+        cuts = [first_new_question, later_question]
+        merged, mode = cutter.merge_cross_page_continuation_prefix(previous, cuts)
+        self.assertTrue(merged)
+        self.assertEqual(mode, 'peeled_prefix')
+        self.assertEqual([cut['num'] for cut in cuts], [35, 36])
+        self.assertGreater(first_new_question['_source_box'][1], 0)
+        self.assertTrue(previous['_cross_page_merge'])
+
+    def test_previous_column_key_maps_reading_order(self):
+        self.assertEqual(cutter._previous_column_key('column_2'), 'column_1')
+        self.assertEqual(cutter._previous_column_key('column_3'), 'column_2')
+        self.assertIsNone(cutter._previous_column_key('column_1'))
+        self.assertIsNone(cutter._previous_column_key('left'))
+        self.assertIsNone(cutter._previous_column_key('right'))
+        self.assertIsNone(cutter._previous_column_key(''))
+
+    def test_self_contained_option_question_needs_three_option_lines(self):
+        ocr = [
+            item('x的值为', 340, 20, width=120),
+            item('A.2', 340, 300),
+            item('B.-2', 460, 300),
+            item('C.±2', 580, 300),
+            item('D.不确定', 700, 300),
+        ]
+        box = [340, 0, 900, 350]
+        self.assertTrue(cutter._self_contained_option_question(ocr, box))
+        self.assertFalse(
+            cutter._self_contained_option_question(ocr, [340, 0, 900, 200])
+        )
+        partial = [item('C.延长线段AB', 340, 40), item('D.画直线AB=5cm', 340, 90)]
+        self.assertFalse(
+            cutter._self_contained_option_question(partial, box)
+        )
+
+    def test_peel_keeps_self_contained_choice_question_in_first_cut(self):
+        first_new_question = {
+            'num': 6, 'number_detected': True,
+            'crop_img': self._inked(220, 320),
+            '_source_size': [1000, 1400], '_source_box': [340, 0, 660, 220],
+            '_anchor_y': 120, '_y_start': 0, '_col': 'column_2',
+        }
+        ocr = [
+            item('x的值为', 340, 20, width=120),
+            item('A.2', 340, 40),
+            item('B.-2', 400, 40),
+            item('C.±2', 460, 40),
+            item('D.不确定', 520, 40),
+        ]
+        fragment = cutter.peel_leading_cross_page_fragment(
+            first_new_question, ocr_items=ocr,
+        )
+        self.assertIsNone(fragment)
+        self.assertEqual(first_new_question['_source_box'], [340, 0, 660, 220])
+
+    def test_peel_still_merges_partial_option_continuation(self):
+        first_new_question = {
+            'num': 8, 'number_detected': True,
+            'crop_img': self._inked(220, 320),
+            '_source_size': [1000, 1400], '_source_box': [340, 0, 660, 220],
+            '_anchor_y': 120, '_y_start': 0, '_col': 'column_2',
+        }
+        ocr = [
+            item('C.延长线段AB到点C', 340, 40),
+            item('D.画直线AB=5cm', 340, 90),
+        ]
+        fragment = cutter.peel_leading_cross_page_fragment(
+            first_new_question, ocr_items=ocr,
+        )
+        self.assertIsNotNone(fragment)
+        self.assertEqual(fragment['_source_box'], [340, 0, 660, 114])
+
+    def test_merge_sequential_questions_ignores_full_option_row(self):
+        previous = {
+            'num': 7, 'number_detected': True,
+            'crop_img': np.full((60, 100, 3), 255, dtype=np.uint8),
+            '_source_path': 'page-1.jpg', '_source_size': [300, 300],
+            '_source_box': [0, 240, 100, 300], '_col': 'column_1',
+        }
+        first_new_question = {
+            'num': 8, 'number_detected': True,
+            'crop_img': self._inked(220, 100),
+            '_source_path': 'page-1.jpg', '_source_size': [300, 300],
+            '_source_box': [110, 0, 210, 220], '_anchor_y': 120,
+            '_y_start': 0, '_col': 'column_2',
+            '_boundary_source': 'ocr_number',
+        }
+        ocr = [
+            item('A.50°', 115, 30, width=30),
+            item('B.60°', 150, 30, width=30),
+            item('C.140°', 185, 30, width=30),
+            item('D.150°', 115, 60, width=30),
+        ]
+        merged, mode = cutter.merge_cross_page_continuation_prefix(
+            previous, [first_new_question], ocr_items=ocr,
+        )
+        self.assertTrue(merged)
+        self.assertEqual(mode, 'peeled_prefix')
+        self.assertTrue(previous['_cross_page_merge'])
+
+    def test_merge_skips_single_question_when_number_gap_and_full_options(self):
+        previous = {
+            'num': 4, 'number_detected': True,
+            'crop_img': np.full((60, 100, 3), 255, dtype=np.uint8),
+            '_source_path': 'page-1.jpg', '_source_size': [300, 300],
+            '_source_box': [0, 240, 100, 300], '_col': 'column_1',
+        }
+        first_new_question = {
+            'num': 6, 'number_detected': True,
+            'crop_img': self._inked(220, 100),
+            '_source_path': 'page-1.jpg', '_source_size': [300, 300],
+            '_source_box': [110, 0, 210, 220], '_anchor_y': 120,
+            '_y_start': 0, '_col': 'column_2',
+            '_boundary_source': 'ocr_number',
+        }
+        ocr = [
+            item('A.2', 115, 30, width=30),
+            item('B.-2', 150, 30, width=30),
+            item('C.±2', 185, 30, width=30),
+            item('D.不确定', 115, 60, width=60),
+        ]
+        merged, mode = cutter.merge_cross_page_continuation_prefix(
+            previous, [first_new_question], ocr_items=ocr,
+        )
+        self.assertFalse(merged)
+        self.assertEqual(first_new_question['_source_box'], [110, 0, 210, 220])
+        self.assertNotIn('_cross_page_merge', previous)
+
+
 class ColumnTests(unittest.TestCase):
     def test_three_column_question_layout_is_split_left_to_right(self):
         """Three independent exercise columns must never share one cut region."""
@@ -394,6 +618,41 @@ class ColumnTests(unittest.TestCase):
         self.assertEqual(
             [len(region[2]) for region in regions], [4, 4, 4],
         )
+
+    def test_verified_three_column_layout_uses_both_global_gutters(self):
+        """A balanced three-column page is resolved as one layout, not greedily."""
+        page = np.full((960, 1800, 3), 255, dtype=np.uint8)
+        items = []
+        for column_index, x in enumerate((50, 650, 1250), start=1):
+            for row_index, y in enumerate((120, 290, 460, 630), start=1):
+                cv2.rectangle(page, (x, y), (x + 430, y + 24), (0, 0, 0), -1)
+                items.append(item(
+                    f'{row_index}. COLUMN {column_index} EXERCISE', x, y,
+                    width=430, height=24,
+                ))
+
+        regions = cutter._verified_three_column_layout(page, items)
+
+        self.assertIsNotNone(regions)
+        self.assertEqual(len(regions), 3)
+        self.assertEqual([len(region[2]) for region in regions], [4, 4, 4])
+        self.assertLess(regions[0][1], 650)
+        self.assertGreater(regions[1][0], 550)
+        self.assertLess(regions[1][1], 1250)
+        self.assertGreater(regions[2][0], 1150)
+
+    def test_column_bounds_prevent_refined_box_from_crossing_gutter(self):
+        page = np.full((500, 1500, 3), 255, dtype=np.uint8)
+        cuts = [{
+            '_source_box': [80, 120, 980, 260],
+            'crop_img': page[120:260, 80:980].copy(),
+        }]
+
+        cutter.trim_cuts_to_column_bounds(cuts, page, [0, 500])
+
+        self.assertEqual(cuts[0]['_source_box'], [80, 120, 500, 260])
+        self.assertEqual(cuts[0]['crop_img'].shape[:2], (140, 420))
+        self.assertTrue(cuts[0]['_column_bounds_trimmed'])
 
     def test_cross_gutter_minor_and_next_major_are_split(self):
         merged = item('2. 列式计算。六、下面是调查结果', 180, 240, width=280)
@@ -491,6 +750,50 @@ class ColumnTests(unittest.TestCase):
         blocks = cutter._split_single_col_majors(page, items, profile='exam')
         self.assertGreater(blocks[0]['crop_img'].shape[0], 700)
 
+    def test_knowledge_point_heading_becomes_major_block(self):
+        """周测/练习册以“知识点一 …”为节标题且无中文大题号；标题应成为
+        独立大题块，而不是被并进相邻小题的裁图。"""
+        page = np.full((1600, 700, 3), 255, dtype=np.uint8)
+        items = [
+            item('知识点一 有理数的加法', 25, 120),
+            item('1. 第一题', 30, 220),
+            item('（1）子问', 90, 300),
+            item('知识点二 加法运算律', 25, 620),
+            item('1. 第二题', 30, 720),
+            item('2. 第三题', 30, 880),
+        ]
+        blocks = cutter._split_single_col_majors(page, items)
+        self.assertEqual([block['idx'] for block in blocks], [3001, 3002])
+        self.assertEqual(
+            [block['title'] for block in blocks],
+            ['知识点一 有理数的加法', '知识点二 加法运算律'],
+        )
+        # 标题行保留在各自大题块的顶部，不流入相邻块。
+        self.assertLess(blocks[0]['crop_img'].shape[0], blocks[1]['crop_img'].shape[0])
+
+    def test_knowledge_point_heading_works_alongside_major_numbers(self):
+        """同一列既有一、二大题号又有知识点标题时，两类边界并存且去重。"""
+        page = np.full((1400, 700, 3), 255, dtype=np.uint8)
+        items = [
+            item('一、选择题', 25, 100),
+            item('1. 第一题', 30, 200),
+            item('知识点一 有理数的运算', 25, 500),
+            item('1. 第二题', 30, 600),
+        ]
+        blocks = cutter._split_single_col_majors(page, items)
+        self.assertEqual([block['idx'] for block in blocks], [1, 3001])
+
+    def test_inline_knowledge_text_is_not_a_boundary(self):
+        """正文里出现“知识点”的长句不应被当作节标题边界。"""
+        page = np.full((1000, 700, 3), 255, dtype=np.uint8)
+        items = [
+            item('本段讲的知识点是绝对值与相反数', 25, 120),
+            item('1. 第一题', 30, 260),
+        ]
+        blocks = cutter._split_single_col_majors(page, items)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]['title'], '整页')
+
 
 class OlympiadFieldTests(unittest.TestCase):
     def test_colored_olympiad_fields_become_major_blocks(self):
@@ -558,6 +861,104 @@ class OlympiadFieldTests(unittest.TestCase):
         self.assertEqual([block['title'] for block in blocks], ['难题点拨'])
 
 
+class CircledExerciseNumberTests(unittest.TestCase):
+    """部分奥数书用 ①②③ 给整道练习编号，不印“一、二、三”。"""
+
+    def build_items(self):
+        return [
+            item('①把动物按两只脚的、四只脚的和会游泳的分类。', 60, 600, width=520),
+            item('②看图数一数，填一填。', 60, 1000, width=420),
+            item('③', 900, 1400, width=40),                    # 图注：只有圈号
+            item('如图①所示的图形', 60, 1600, width=400),        # 不在行首
+            item('④这一条离左边太远', 700, 1750, width=300),     # 不在栏首
+        ]
+
+    def test_only_stem_lines_become_boundaries(self):
+        fields = cutter.find_circled_number_boundaries(
+            self.build_items(), crop_width=800, crop_height=2000,
+        )
+        self.assertEqual([field['y'] for field in fields], [600, 1000])
+        self.assertEqual([field['idx'] for field in fields], [5001, 5002])
+        self.assertTrue(fields[0]['text'].startswith('① 把动物'))
+
+    def test_general_profile_keeps_the_page_in_one_block(self):
+        items = self.build_items()
+        page = np.full((2000, 800, 3), 255, dtype=np.uint8)
+        general = cutter._split_single_col_majors(page, items, profile='general')
+        self.assertEqual([block['title'] for block in general], ['整页'])
+        olympiad = cutter._split_single_col_majors(page, items, profile='olympiad')
+        self.assertEqual(len(olympiad), 2)
+        self.assertTrue(olympiad[0]['title'].startswith('① 把动物按两只脚的'))
+        self.assertTrue(olympiad[1]['title'].startswith('② 看图数一数'))
+
+
+class SideBySideMinorTests(unittest.TestCase):
+    """横排小问：1. 2. 3. 在同一条水平线上并排，只能按 x 切开。"""
+
+    PAGE = np.full((479, 2407, 3), 255, dtype=np.uint8)
+
+    def side_by_side_items(self):
+        # 取自 56260570「七、数一数，填一填」的真实坐标：题号 2./3. 的 y
+        # 只差 3px，题号 1. 被 OCR 整条漏读。
+        return [
+            item('七、数一数，填一填。（9分）', 252, 7, width=690),
+            item('有()个角', 413, 369, width=377),
+            item('2.', 878, 109, width=63),
+            item('有( )个平行四边形', 929, 373, width=676),
+            item('3.', 1541, 112, width=66),
+            item(')个梯形', 1805, 386, width=221),
+        ]
+
+    def test_columns_follow_left_edges(self):
+        spans = cutter._side_by_side_columns(self.side_by_side_items(), 2407, 479)
+        self.assertEqual(len(spans), 3)
+        starts = [span[0] for span in spans]
+        self.assertEqual(starts, sorted(starts))
+
+    def test_three_side_by_side_questions_are_cut_and_numbered(self):
+        minors = cutter.split_major_into_minors(
+            self.PAGE, self.side_by_side_items(), profile='exam',
+        )
+        self.assertEqual([minor['num'] for minor in minors], [1, 2, 3])
+        self.assertTrue(all(minor.get('_side_by_side') for minor in minors))
+        starts = [minor['_x_start'] for minor in minors]
+        self.assertEqual(starts, sorted(starts))
+        # 题号 3 落在最后一列里，不能被前两列吞掉。
+        last = minors[-1]
+        self.assertLessEqual(last['_x_start'], 1541)
+        self.assertLess(1541, last['_x_end'])
+
+    def test_vertical_block_is_left_to_the_y_based_splitter(self):
+        page = np.full((900, 700, 3), 255, dtype=np.uint8)
+        items = [
+            item('1. 计算', 40, 60, width=200),
+            item('2. 判断', 40, 260, width=200),
+            item('3. 选择', 40, 460, width=200),
+        ]
+        self.assertEqual(cutter._side_by_side_columns(items, 700, 900), [])
+        minors = cutter.split_major_into_minors(page, items, profile='exam')
+        self.assertFalse(any(minor.get('_side_by_side') for minor in minors))
+
+    def test_source_box_narrows_to_the_column(self):
+        block = {
+            'crop_img': np.full((400, 1200, 3), 255, dtype=np.uint8),
+            '_x_start': 100,
+            '_y_start': 200,
+        }
+        minors = [{
+            'num': 3,
+            'crop_img': np.full((400, 400, 3), 255, dtype=np.uint8),
+            '_x_start': 800,
+            '_x_end': 1200,
+            '_y_start': 0,
+            '_y_end': 400,
+        }]
+        cutter.attach_question_source_metadata(
+            minors, block, 'page.jpg', source_size=(1500, 2000),
+        )
+        self.assertEqual(minors[0]['_source_box'], [900, 200, 1300, 600])
+
+
 class BookCompletionTests(unittest.TestCase):
     def test_book_marker_matches_same_source_without_ocr(self):
         with tempfile.TemporaryDirectory() as root:
@@ -610,6 +1011,155 @@ class BookCompletionTests(unittest.TestCase):
                 source, output, 'general', fingerprint,
             ))
             self.assertFalse(cutter.is_completed_book(source, output)[0])
+
+    def test_explicitly_incomplete_paperflow_project_cannot_skip(self):
+        """显式未完成的 JSON 不能让下一轮整本跳过。"""
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, 'source_book')
+            output = os.path.join(root, 'output_book')
+            os.makedirs(source)
+            os.makedirs(output)
+            image = os.path.join(source, '1.jpg')
+            with open(image, 'wb') as file:
+                file.write(b'image-a')
+            fingerprint = cutter.source_book_fingerprint(source)
+            path = os.path.join(source, 'PaperFlow标注项目.json')
+            project = {
+                'kind': 'papercutter_manual_annotation',
+                'preannotation_mode': 'paperflow',
+                'algorithm_version': cutter.ALGORITHM_VERSION,
+                'source_fingerprint': fingerprint,
+                'status': 'incomplete',
+                'pages': [],
+                'answer_pages': [],
+            }
+            with open(path, 'w', encoding='utf-8') as file:
+                json.dump(project, file)
+            self.assertFalse(cutter.is_completed_book(
+                source, output, fingerprint, output_mode='paperflow',
+            )[0])
+            project['status'] = 'complete'
+            with open(path, 'w', encoding='utf-8') as file:
+                json.dump(project, file)
+            self.assertTrue(cutter.is_completed_book(
+                source, output, fingerprint, output_mode='paperflow',
+            )[0])
+
+
+class PaperFlowProjectExportTests(unittest.TestCase):
+    def test_flat_document_ignored_pages_are_preserved_in_project(self):
+        """封面/说明页虽不参加切题，也必须写入 ignored_pages。"""
+        with tempfile.TemporaryDirectory() as root:
+            question = os.path.join(root, '002.jpg')
+            answer = os.path.join(root, '003.jpg')
+            ignored = os.path.join(root, '001.jpg')
+            for path in (question, answer, ignored):
+                with open(path, 'wb') as file:
+                    file.write(b'image')
+            unit = {
+                'scope_id': 'scope-unit-1',
+                'unit_name': '第一单元',
+                'unit_profile': 'general',
+                'pages_classification': {question: 'question'},
+                'ignored_img_paths': [ignored],
+                'major_questions': {
+                    1: {
+                        'title': '一、计算',
+                        'minors': [{
+                            '_source_path': question,
+                            '_source_box': [1, 2, 100, 120],
+                            'num': 1,
+                            '_pf_id': 'Q-unit-1',
+                            '_number_confidence': 0.99,
+                            '_detector_confidence': 0.87,
+                        }, {
+                            # A cross-column whole block with the same number
+                            # is a continuation, never a second match target.
+                            '_source_path': question,
+                            '_source_box': [101, 2, 200, 120],
+                            'num': 1,
+                            '_pf_id': 'Q-unit-1-continuation',
+                            '_boundary_source': 'whole_block',
+                        }],
+                    },
+                },
+                'answer_records': [{
+                    'source': answer,
+                    'source_box': [3, 4, 90, 100],
+                    'major_idx': 1,
+                    'num': 1,
+                    '_pf_id': 'A-unit-1',
+                }],
+                'all_answer_records': [{
+                    'source': answer,
+                    'source_box': [3, 4, 90, 100],
+                    'major_idx': 1,
+                    'num': 1,
+                    '_pf_id': 'A-unit-1',
+                }, {
+                    # This answer belongs to another/unknown context.  It must
+                    # still become a visible unassigned answer frame.
+                    'source': answer,
+                    'source_box': [91, 4, 180, 100],
+                    'major_idx': 1,
+                    'num': 2,
+                }],
+                'answer_img_paths': [answer],
+                'pairs_data': [{
+                    'q_id': 'Q-unit-1',
+                    'a_ids': ['A-unit-1'],
+                    'decision_band': 'auto',
+                    'score': 0.99,
+                }],
+            }
+            project = cutter.write_paperflow_project(root, [unit], 'general')
+
+            self.assertEqual(project['status'], 'complete')
+            self.assertEqual([page['image'] for page in project['ignored_pages']], ['001.jpg'])
+            self.assertEqual(len(project['pages']), 1)
+            self.assertEqual(len(project['answer_pages']), 1)
+            self.assertEqual(project['pages'][0]['match_scope_id'], '')
+            self.assertEqual(len(project['pages'][0]['match_scope_regions']), 2)
+            self.assertEqual(project['answer_pages'][0]['match_scope_id'], '')
+            self.assertEqual(len(project['answer_pages'][0]['match_scope_regions']), 1)
+            question_records = project['pages'][0]['questions']
+            self.assertTrue(question_records[0]['detector_assisted'])
+            self.assertEqual(question_records[0]['detector_confidence'], 0.87)
+            self.assertEqual(question_records[1]['region_role'], 'continuation')
+            self.assertEqual(question_records[1]['continuation_of'], 'Q-unit-1')
+            answer_records = project['answer_pages'][0]['answers']
+            self.assertEqual(len(answer_records), 2)
+            fallback = next(record for record in answer_records if record['number'] == '2')
+            self.assertTrue(fallback['unmatched_answer'])
+            self.assertEqual(fallback['match_scope_id'], '')
+            self.assertEqual(len(project['pairs']), 1)
+            self.assertTrue(cutter.is_completed_book(
+                root, os.path.join(root, 'unused'), output_mode='paperflow',
+            )[0])
+
+    def test_empty_answer_page_gets_a_reviewable_fallback_frame(self):
+        image = np.full((160, 240, 3), 255, dtype=np.uint8)
+        with patch.object(cutter, 'cv2_imread', return_value=image), \
+                patch.object(cutter, 'ocr_image', return_value=[]), \
+                patch.object(cutter, 'detect_answer_blocks_with_model', return_value=[]):
+            records = cutter.process_answer_pages(['answer.jpg'])
+        self.assertEqual(len(records), 1)
+        self.assertTrue(records[0]['fallback_full_page'])
+        self.assertEqual(records[0]['source_box'], [0, 0, 240, 160])
+
+    def test_force_refresh_bypasses_the_current_process_ocr_cache(self):
+        image = np.full((80, 120, 3), 255, dtype=np.uint8)
+        stale = item('旧缓存', 8, 8)
+        fresh = item('本次重识别', 12, 12)
+        with patch.object(cutter, '_ocr_cache_location', return_value=('page-key', None, None)), \
+                patch.object(cutter, 'cv2_imread', return_value=image), \
+                patch.object(cutter, 'get_ocr_engine'), \
+                patch.object(cutter, '_run_ocr', return_value=[fresh]) as run_ocr, \
+                patch.object(cutter, '_ocr_memory_cache', {'page-key': [stale]}):
+            records = cutter.ocr_image('answer.jpg', force_refresh=True)
+
+        run_ocr.assert_called_once()
+        self.assertEqual(records[0]['text'], '本次重识别')
 
 
 class BatchRecoveryTests(unittest.TestCase):
@@ -785,6 +1335,70 @@ class PageClassifierTests(unittest.TestCase):
             'workbook',
         )
 
+    def test_profile_detail_reports_why_a_book_was_classified(self):
+        profile, word = cutter.infer_book_profile_detail('金版卷王名师面对面大试卷数学')
+        self.assertEqual((profile, word), ('exam', '试卷'))
+        profile, word = cutter.infer_book_profile_detail('原教材3')
+        self.assertEqual((profile, word), ('general', ''))
+        profile, reason = cutter.refine_profile_from_text_detail(
+            'general', '时间：60分钟 总分：100分 考试',
+        )
+        self.assertEqual(profile, 'exam')
+        self.assertIn('总分', reason)
+        self.assertEqual(cutter.refine_profile_from_text_detail('exam', '暑假生活'), ('exam', ''))
+
+    def test_detect_book_profile_skips_ocr_when_the_book_name_is_decisive(self):
+        with tempfile.TemporaryDirectory() as temp:
+            book = os.path.join(temp, '口算速算天天练四年级')
+            os.makedirs(book)
+            with patch.object(cutter, 'ocr_page_structure') as ocr:
+                result = cutter.detect_book_profile(book, runtime_root=temp)
+        self.assertEqual(result['profile'], 'drill')
+        self.assertEqual(result['source'], 'name')
+        ocr.assert_not_called()
+
+    def test_detect_book_profile_samples_text_and_reuses_the_cached_verdict(self):
+        with tempfile.TemporaryDirectory() as temp:
+            book = os.path.join(temp, '原教材3')
+            os.makedirs(book)
+            pages = []
+            for index in range(6):
+                page = os.path.join(book, f'{index}.png')
+                with open(page, 'wb') as file:
+                    file.write(b'page')
+                pages.append(page)
+            items = [{'text': '第一单元达标检测卷', 'bbox': [[0, 0], [10, 0], [10, 10], [0, 10]], 'conf': 0.9}]
+            with patch.object(cutter, 'cv2_imread', return_value=np.zeros((20, 20, 3), np.uint8)), \
+                 patch.object(cutter, 'ocr_page_structure', return_value=items) as ocr:
+                first = cutter.detect_book_profile(book, runtime_root=temp)
+                calls_after_first = ocr.call_count
+                second = cutter.detect_book_profile(book, runtime_root=temp)
+                forced = cutter.detect_book_profile(book, runtime_root=temp, force=True)
+
+        self.assertEqual(first['profile'], 'exam')
+        self.assertEqual(first['source'], 'text')
+        self.assertGreaterEqual(calls_after_first, 1)
+        self.assertLessEqual(calls_after_first, cutter.BOOK_PROFILE_SAMPLE_LIMIT)
+        self.assertEqual(second['source'], 'cache')
+        self.assertTrue(second['cached'])
+        # 命中缓存不再跑 OCR；force 才重跑。
+        self.assertEqual(ocr.call_count, calls_after_first * 2)
+        self.assertEqual(forced['source'], 'text')
+
+    def test_detect_book_profile_ignores_a_cache_from_another_revision(self):
+        with tempfile.TemporaryDirectory() as temp:
+            book = os.path.join(temp, '原教材7')
+            os.makedirs(book)
+            page = os.path.join(book, '0.png')
+            with open(page, 'wb') as file:
+                file.write(b'page')
+            payload = {
+                'revision': 'old-revision', 'profile': 'exam', 'reason': '旧结论',
+                'sample': cutter._profile_sample_signature([page]), 'sampled': ['0.png'],
+            }
+            cutter._write_book_profile_cache(book, payload, temp)
+            self.assertIsNone(cutter.read_book_profile_cache(book, temp))
+
     def test_exam_title_in_middle_header_is_a_new_paper_boundary(self):
         page_info = cutter.classify_page(
             self.page,
@@ -931,11 +1545,185 @@ class ExamPartitionTests(unittest.TestCase):
 
 
 class AnswerParserTests(unittest.TestCase):
+    def test_knowledge_point_heading_is_an_answer_context(self):
+        self.assertEqual(
+            cutter._answer_context_title('知识点二 数轴', 20, 20),
+            '知识点二数轴',
+        )
+        self.assertEqual(
+            cutter._answer_context_title('本节知识点二需要掌握数轴的表示方法', 20, 20),
+            '',
+        )
+
     def test_inline_answer_numbers(self):
         self.assertEqual(
             cutter._answer_minor_matches('1. A 2. C 3. 12'),
             [(1, 0), (2, 5), (3, 10)],
         )
+
+    def test_inline_answer_numbers_survive_ocr_compaction(self):
+        self.assertEqual(
+            cutter._answer_minor_matches('1.B2.C3.D'),
+            [(1, 0), (2, 3), (3, 6)],
+        )
+
+    def test_formula_like_numbers_are_not_promoted_to_compact_anchors(self):
+        self.assertEqual(cutter._answer_minor_matches('x2. y3.'), [])
+
+    def test_answer_matrix_is_not_split_into_reading_columns(self):
+        """A four-cell answer grid is one visual answer region, not two columns."""
+        page = np.full((800, 600, 3), 255, dtype=np.uint8)
+        cells = []
+        labels = ('① 35', '② 9', '③ 57', '④ 79')
+        for row_index, y in enumerate((120, 190, 260, 330)):
+            for column_index, x in enumerate((45, 165, 305, 425)):
+                cells.append(item(labels[column_index], x, y, width=55, height=24))
+
+        columns = cutter.split_answer_layout_columns(page, cells)
+
+        self.assertEqual(len(columns), 1)
+        self.assertEqual((columns[0][0], columns[0][1]), (0, 600))
+
+    def test_long_rule_keeps_true_answer_columns_separate_from_matrix(self):
+        """A full-height rule is stronger layout evidence than aligned cells."""
+        page = np.full((800, 600, 3), 255, dtype=np.uint8)
+        cv2.line(page, (300, 100), (300, 760), (0, 0, 0), 2)
+        cells = []
+        labels = ('① 35', '② 9', '③ 57', '④ 79')
+        for y in (120, 190, 260, 330):
+            for column_index, x in enumerate((45, 165, 325, 445)):
+                cells.append(item(labels[column_index], x, y, width=55, height=24))
+
+        columns = cutter.split_answer_layout_columns(page, cells)
+
+        self.assertEqual(len(columns), 2)
+        self.assertTrue(all(
+            max(point[0] for point in cell['bbox']) < columns[0][1]
+            for cell in columns[0][2]
+        ))
+        self.assertTrue(all(
+            min(point[0] for point in cell['bbox']) >= columns[1][0]
+            for cell in columns[1][2]
+        ))
+
+    def test_regular_two_column_answers_still_split(self):
+        """The matrix guard must not disable established prose-column splits."""
+        page = np.full((800, 600, 3), 255, dtype=np.uint8)
+        answers = [
+            item('1. 第一题答案内容较长', 45, 120, width=185),
+            item('2. 第二题答案内容较长', 45, 220, width=185),
+            item('3. 第三题答案内容较长', 45, 320, width=185),
+            item('1. 右栏第一题答案较长', 365, 120, width=185),
+            item('2. 右栏第二题答案较长', 365, 220, width=185),
+            item('3. 右栏第三题答案较长', 365, 320, width=185),
+        ]
+
+        columns = cutter.split_answer_layout_columns(page, answers)
+
+        self.assertEqual(len(columns), 2)
+        self.assertLess(columns[0][1], columns[1][0] + 1)
+
+    def test_answer_crop_stops_before_next_structural_heading(self):
+        anchor = {'column_index': 0, 'y': 100, 'row_y1': 125}
+        rows = [
+            {'column_index': 0, 'y0': 160, 'y1': 185, 'structural': False},
+            {'column_index': 1, 'y0': 170, 'y1': 195, 'structural': True},
+            {'column_index': 0, 'y0': 240, 'y1': 265, 'structural': True},
+        ]
+        self.assertEqual(cutter._next_answer_structure_start(anchor, rows), 240)
+
+    def test_unanchored_circled_answer_column_is_emitted_for_review(self):
+        """A circled-only column must not vanish because another column has anchors."""
+        page = np.full((600, 600, 3), 255, dtype=np.uint8)
+        left_items = []
+        for y in (100, 160, 220):
+            for label, x in zip(('① 11', '② 22', '③ 33', '④ 44'), (25, 95, 165, 235)):
+                left_items.append(item(label, x, y, width=42, height=22))
+        # The same answer column later switches to calculation-style lines
+        # without enough circled labels to constitute another matrix.
+        left_items.append(item('后半段算式结果', 28, 360, width=180, height=24))
+        right_items = [
+            item('一、1. 右栏答案', 340, 100, width=180, height=24),
+            item('2. 右栏下一题', 340, 240, width=180, height=24),
+        ]
+        all_items = left_items + right_items
+        columns = [(0, 300, left_items), (300, 600, right_items)]
+        with patch.object(cutter, 'cv2_imread', return_value=page), \
+             patch.object(cutter, 'ocr_image', return_value=all_items), \
+             patch.object(cutter, 'needs_high_precision_answer_ocr', return_value=False), \
+             patch.object(cutter, 'refine_answer_ocr_with_vlm', return_value=all_items), \
+             patch.object(cutter, 'split_answer_layout_columns', return_value=columns), \
+             patch.object(cutter, 'detect_answer_blocks_with_model', return_value=[]):
+            records = cutter.process_answer_pages(['answer.jpg'])
+
+        fallback = next(record for record in records if record.get('unanchored_matrix_fallback'))
+        self.assertEqual(fallback['num'], '')
+        self.assertEqual(fallback['source_box'][0], 0)
+        self.assertEqual(fallback['source_box'][2], 300)
+        self.assertGreaterEqual(fallback['source_box'][3], 392)
+        self.assertTrue(any(record.get('num') == 1 for record in records))
+
+    def test_matrix_fallback_is_not_disabled_by_an_unrelated_anchor_in_its_column(self):
+        def matrix_row(y):
+            return {
+                'column_index': 0, 'column_x0': 0, 'column_x1': 300,
+                'x0': 20, 'x1': 260, 'y0': y, 'y1': y + 20,
+                'text': '① 1 ② 2 ③ 3', 'structural': False,
+            }
+
+        rows = [matrix_row(y) for y in (100, 140, 180, 340, 380, 420)]
+        sections = cutter._unanchored_answer_matrix_sections(
+            rows,
+            [{'column_index': 0, 'y': 96}],
+            600,
+        )
+
+        self.assertEqual(len(sections), 1)
+        self.assertGreaterEqual(sections[0]['source_box'][1], 330)
+
+    def test_decimal_formula_rows_do_not_create_repeated_question_anchors(self):
+        page = np.full((420, 500, 3), 255, dtype=np.uint8)
+        items = [
+            item('一、1.42 × 10 = 14.2', 20, 70, width=260, height=24),
+            item('1.42 × 100 = 142', 50, 120, width=230, height=24),
+            item('1.42 × 1000 = 1420', 50, 170, width=250, height=24),
+            item('二、2.5 × 10 = 25', 20, 260, width=230, height=24),
+        ]
+        with patch.object(cutter, 'cv2_imread', return_value=page), \
+             patch.object(cutter, 'ocr_image', return_value=items), \
+             patch.object(cutter, 'needs_high_precision_answer_ocr', return_value=False), \
+             patch.object(cutter, 'refine_answer_ocr_with_vlm', return_value=items), \
+             patch.object(cutter, 'split_answer_layout_columns', return_value=[(0, 500, items)]), \
+             patch.object(cutter, 'detect_answer_blocks_with_model', return_value=[]):
+            records = cutter.process_answer_pages(['answer.jpg'])
+
+        self.assertEqual(len(records), 2)
+        self.assertEqual([record['num'] for record in records], [1, 1])
+        self.assertGreaterEqual(records[0]['source_box'][3], 250)
+
+    def test_answer_strip_recovery_fills_a_vertical_number_jump(self):
+        page = np.full((700, 600, 3), 255, dtype=np.uint8)
+        anchors = [
+            {'context': '知识点一', 'major_idx': 0, 'num': 1,
+             'column_index': 0, 'column_x0': 0, 'column_x1': 600,
+             'x': 30, 'y': 80, 'row_y1': 105, 'row_text': '1. A',
+             'ocr_confidence': 0.9, 'char_pos': 0},
+            {'context': '知识点一', 'major_idx': 0, 'num': 3,
+             'column_index': 0, 'column_x0': 0, 'column_x1': 600,
+             'x': 30, 'y': 390, 'row_y1': 415, 'row_text': '3. C',
+             'ocr_confidence': 0.9, 'char_pos': 0},
+        ]
+        page_rows = []
+        with patch.object(cutter, '_run_ocr', return_value=[item('2. B', 30, 80)]):
+            recovered = cutter._recover_missed_answer_anchors(page, anchors, page_rows)
+
+        self.assertEqual(
+            [anchor['num'] for anchor in sorted(recovered, key=lambda anchor: anchor['y'])],
+            [1, 2, 3],
+        )
+        inserted = next(anchor for anchor in recovered if anchor['num'] == 2)
+        self.assertTrue(inserted['recovered_by_strip'])
+        self.assertEqual(len(page_rows), 1)
 
     def test_last_inline_answer_collects_immediate_unnumbered_wrap(self):
         anchors = [
@@ -1214,6 +2002,28 @@ class CropQualityTests(unittest.TestCase):
         self.assertLess(cuts[0]['_source_box'][3], 600)
         self.assertGreater(cuts[0]['_source_box'][3], 440)
 
+    def test_tight_footer_with_margin_speckle_is_still_removed(self):
+        # 1043A 真实布局：页码紧贴在末题正文之下（间距仅 ~28px），裁块左缘还有
+        # 一个扫描杂点把页脚整体宽度/中心测偏。旧规则两处都通不过，页脚被裁进题框。
+        image = np.full((700, 1000, 3), 255, dtype=np.uint8)
+        cv2.putText(image, '1. QUESTION', (100, 130), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 0, 0), 3)
+        cv2.rectangle(image, (130, 200), (880, 380), (0, 0, 0), 3)
+        cv2.rectangle(image, (82, 495), (84, 498), (0, 0, 0), -1)
+        # "- 7 -" sits tight under the content instead of a big detached gap.
+        cv2.line(image, (430, 515), (465, 515), (0, 0, 0), 2)
+        cv2.putText(image, '7', (480, 525), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+        cv2.line(image, (505, 515), (540, 515), (0, 0, 0), 2)
+        cuts = [{
+            '_source_box': [80, 60, 920, 700],
+            'crop_img': image[60:700, 80:920].copy(),
+        }]
+
+        cutter.trim_cuts_to_detached_page_footer(cuts, image)
+
+        self.assertTrue(cuts[0].get('_page_footer_trimmed'))
+        self.assertLess(cuts[0]['_source_box'][3], 480)
+        self.assertGreater(cuts[0]['_source_box'][3], 385)
+
     def test_short_question_marginal_sidebar_is_removed(self):
         image = np.full((180, 1400, 3), 255, dtype=np.uint8)
         for x in (130, 190, 250):
@@ -1265,6 +2075,349 @@ class JsonSerializationTests(unittest.TestCase):
                 stored = json.load(file)
         self.assertEqual(stored['box'][0], 2)
         self.assertEqual(stored['box'][1], 3.5)
+
+
+class StructureOcrProfileTests(unittest.TestCase):
+    """Structure OCR must know the unit profile or exam multi-column pages
+    fall back to strip sampling and their middle column vanishes, which turns
+    a real three-column sheet into one wide column full of cross-gutter cuts."""
+
+    def test_worker_forwards_profile_to_structure_ocr(self):
+        with patch.object(cutter, 'ocr_page_structure', return_value=[]) as ocr:
+            with patch.object(cutter, 'cv2_imread', return_value=np.zeros((8, 8, 3), dtype=np.uint8)):
+                cutter._structure_ocr_worker('fake_page.jpg', profile='exam')
+        ocr.assert_called_once()
+        self.assertEqual(ocr.call_args.kwargs.get('profile'), 'exam')
+
+    def test_prepare_structured_unit_ocr_passes_each_unit_profile(self):
+        image_path = os.path.join(tempfile.gettempdir(), 'paperflow_unit_page.jpg')
+        unit = {
+            'profile': 'exam',
+            'question_imgs': [image_path],
+            'question_ocr': {},
+        }
+        with patch.object(cutter, 'structure_ocr_worker_count', return_value=1):
+            with patch.object(cutter, 'ocr_page_structure', return_value=[]) as ocr:
+                with patch.object(cutter, 'cv2_imread', return_value=np.zeros((8, 8, 3), dtype=np.uint8)):
+                    cutter.prepare_structured_unit_ocr([unit])
+        ocr.assert_called_once()
+        self.assertEqual(ocr.call_args.kwargs.get('profile'), 'exam')
+        self.assertIn(image_path, unit['question_ocr'])
+
+    def test_verified_three_column_layout_accepts_printed_divider_gutters(self):
+        """A page split only by two printed vertical rules is still 3 columns.
+
+        The global three-column check must fall back to divider gutters when
+        the page has no whitespace gutters at all; otherwise greedy recursion
+        divides the already-correct middle column and each question box breaks
+        against the spurious extra gutter.  The printed rules themselves must
+        stay outside every column: the middle column starts at the left rule's
+        right edge and ends at the right rule's left edge."""
+        page = np.full((960, 1800, 3), 255, dtype=np.uint8)
+        cv2.line(page, (600, 80), (600, 880), (0, 0, 0), 2)
+        cv2.line(page, (1200, 80), (1200, 880), (0, 0, 0), 2)
+        items = []
+        for column_index, x in enumerate((40, 640, 1240), start=1):
+            for row_index, y in enumerate((120, 290, 460, 630), start=1):
+                cv2.rectangle(page, (x, y), (x + 520, y + 24), (0, 0, 0), -1)
+                items.append(item(
+                    f'{row_index}. COLUMN {column_index} EXERCISE', x, y,
+                    width=520, height=24,
+                ))
+        divider_candidates = [
+            {'split_x': 600, 'bar_start': 598, 'bar_end': 602,
+             'score': 12.0, 'source': 'divider'},
+            {'split_x': 1200, 'bar_start': 1198, 'bar_end': 1202,
+             'score': 12.0, 'source': 'divider'},
+        ]
+        with patch.object(cutter, '_local_column_split_candidates',
+                          return_value=divider_candidates):
+            regions = cutter._verified_three_column_layout(page, items)
+
+        self.assertIsNotNone(regions)
+        self.assertEqual(len(regions), 3)
+        self.assertEqual([len(region[2]) for region in regions], [4, 4, 4])
+        self.assertEqual(regions[0][1], 598)
+        self.assertEqual(regions[1][0], 602)
+        self.assertEqual(regions[1][1], 1198)
+        self.assertEqual(regions[2][0], 1202)
+
+    def test_verified_three_column_layout_accepts_sparse_middle_column(self):
+        """A real middle column can contain only 1–2 short calculation lines.
+
+        The old ``min(item_counts) < 3`` gate silently merged that column with
+        its right neighbour, so later question boxes crossed the gutter."""
+        page = np.full((1000, 1800, 3), 255, dtype=np.uint8)
+        items = []
+        for column_index, x in enumerate((50, 650, 1250), start=1):
+            for row_index, y in enumerate((120, 290, 460, 630), start=1):
+                cv2.rectangle(page, (x, y), (x + 430, y + 22), (0, 0, 0), -1)
+                items.append(item(
+                    f'{row_index}. COLUMN {column_index} EXERCISE', x, y,
+                    width=430, height=22,
+                ))
+        # Strip most of the middle column so only two short lines remain.
+        items = [it for it in items if not 650 <= min(p[0] for p in it['bbox']) < 1250]
+        items.extend([item('1. 短中栏小题', 700, 150, width=430, height=22),
+                      item('2. 短中栏小题', 700, 400, width=430, height=22)])
+
+        regions = cutter._verified_three_column_layout(page, items)
+
+        self.assertIsNotNone(regions)
+        self.assertEqual(len(regions), 3)
+        self.assertEqual([len(region[2]) for region in regions[1:]], [2, 4])
+
+    def test_verified_three_column_layout_sorts_divider_pairs_spatially(self):
+        """Candidate order is score-ranked, not spatial; the pair loop must not
+        assign the right rule's edges to the left column region.
+
+        A right divider with a higher score would be picked as ``left_gutter``
+        and the min/max ``left_split``/``right_split`` would cross the regions
+        (left column ending at the right rule, middle column inverted).  Real
+        page 1042A produced ``[0,3061][3067,1586][1592,4732]`` from this."""
+        page = np.full((960, 1800, 3), 255, dtype=np.uint8)
+        cv2.line(page, (600, 80), (600, 880), (0, 0, 0), 2)
+        cv2.line(page, (1200, 80), (1200, 880), (0, 0, 0), 2)
+        items = []
+        for column_index, x in enumerate((40, 640, 1240), start=1):
+            for row_index, y in enumerate((120, 290, 460, 630), start=1):
+                cv2.rectangle(page, (x, y), (x + 520, y + 24), (0, 0, 0), -1)
+                items.append(item(
+                    f'{row_index}. COLUMN {column_index} EXERCISE', x, y,
+                    width=520, height=24,
+                ))
+        # The right rule scores higher, so score-rank order is right-first.
+        divider_candidates = [
+            {'split_x': 1200, 'bar_start': 1198, 'bar_end': 1202,
+             'score': 99.0, 'source': 'divider'},
+            {'split_x': 600, 'bar_start': 598, 'bar_end': 602,
+             'score': 12.0, 'source': 'divider'},
+        ]
+        with patch.object(cutter, '_local_column_split_candidates',
+                          return_value=divider_candidates):
+            regions = cutter._verified_three_column_layout(page, items)
+
+        self.assertIsNotNone(regions)
+        self.assertEqual(len(regions), 3)
+        self.assertEqual(regions[0][1], 598)
+        self.assertEqual(regions[1][0], 602)
+        self.assertEqual(regions[1][1], 1198)
+        self.assertEqual(regions[2][0], 1202)
+        self.assertTrue(all(r[0] < r[1] for r in regions))
+
+    def test_verified_three_column_layout_never_pairs_blank_with_divider(self):
+        """A stray wide blank inside a column must not pair with a divider.
+
+        Real page 1045B has a whitespace blank at x=1421 (inside the left
+        column) plus two printed rules.  The old code appended dividers to the
+        whitespace candidates and let that internal blank pair with the right
+        rule, so the middle column started inside the left column and swallowed
+        its text.  Only same-source pairs are allowed."""
+        page = np.full((960, 1800, 3), 255, dtype=np.uint8)
+        cv2.line(page, (600, 80), (600, 880), (0, 0, 0), 2)
+        cv2.line(page, (1200, 80), (1200, 880), (0, 0, 0), 2)
+        items = []
+        for column_index, x in enumerate((40, 640, 1240), start=1):
+            for row_index, y in enumerate((120, 290, 460, 630), start=1):
+                cv2.rectangle(page, (x, y), (x + 520, y + 24), (0, 0, 0), -1)
+                items.append(item(
+                    f'{row_index}. COLUMN {column_index} EXERCISE', x, y,
+                    width=520, height=24,
+                ))
+        # whitespace at x=480 sits inside the left column; two real rules.
+        candidates = [
+            {'split_x': 480, 'score': 99.0, 'source': 'whitespace'},
+            {'split_x': 1200, 'bar_start': 1198, 'bar_end': 1202,
+             'score': 12.0, 'source': 'divider'},
+            {'split_x': 600, 'bar_start': 598, 'bar_end': 602,
+             'score': 12.0, 'source': 'divider'},
+        ]
+        with patch.object(cutter, '_local_column_split_candidates',
+                          return_value=candidates):
+            regions = cutter._verified_three_column_layout(page, items)
+
+        self.assertIsNotNone(regions)
+        self.assertEqual(len(regions), 3)
+        self.assertEqual(regions[0][1], 598)
+        self.assertEqual(regions[1][0], 602)
+        self.assertEqual([len(region[2]) for region in regions], [4, 4, 4])
+
+    def test_verified_three_column_layout_prefers_printed_rules_over_intra_column_blanks(self):
+        """A whitespace pool that verifies must not beat a verified printed
+        divider pair.
+
+        Real pages 1053B/1055B have wide trailing blanks *inside* one column
+        (left-column text ends early and the blank band up to the printed rule
+        scores as an enormous gutter).  The whitespace pair earlier won with
+        score ~1800 against the rules' ~39, so the middle column started/ended
+        at an internal blank and swallowed or clipped its text.  Printed rules
+        are the physical truth; any same-source whitespace pair that passes the
+        same verification must yield to them."""
+        page = np.full((960, 1800, 3), 255, dtype=np.uint8)
+        cv2.line(page, (600, 80), (600, 880), (0, 0, 0), 2)
+        cv2.line(page, (1200, 80), (1200, 880), (0, 0, 0), 2)
+        items = []
+        for column_index, x in enumerate((40, 640, 1240), start=1):
+            for row_index, y in enumerate((120, 290, 460, 630), start=1):
+                cv2.rectangle(page, (x, y), (x + 520, y + 24), (0, 0, 0), -1)
+                items.append(item(
+                    f'{row_index}. COLUMN {column_index} EXERCISE', x, y,
+                    width=520, height=24,
+                ))
+        # Two whitespace blanks inside the left and right columns that also
+        # pass three-column verification, plus the two real printed rules.
+        candidates = [
+            {'split_x': 480, 'score': 900.0, 'source': 'whitespace'},
+            {'split_x': 1000, 'score': 900.0, 'source': 'whitespace'},
+            {'split_x': 1200, 'bar_start': 1198, 'bar_end': 1202,
+             'score': 12.0, 'source': 'divider'},
+            {'split_x': 600, 'bar_start': 598, 'bar_end': 602,
+             'score': 12.0, 'source': 'divider'},
+        ]
+        with patch.object(cutter, '_local_column_split_candidates',
+                          return_value=candidates):
+            regions = cutter._verified_three_column_layout(page, items)
+
+        self.assertIsNotNone(regions)
+        self.assertEqual(len(regions), 3)
+        # The printed rules win: left column ends at the left rule's left edge,
+        # middle column between the two rules' inner edges.
+        self.assertEqual(regions[0][1], 598)
+        self.assertEqual(regions[1][0], 602)
+        self.assertEqual(regions[1][1], 1198)
+        self.assertEqual(regions[2][0], 1202)
+        self.assertEqual([len(region[2]) for region in regions], [4, 4, 4])
+
+    def test_verified_three_column_layout_keeps_whitespace_when_no_rules(self):
+        """Without printed rules the verified whitespace pair is still used."""
+        page = np.full((960, 1800, 3), 255, dtype=np.uint8)
+        items = []
+        for column_index, x in enumerate((50, 650, 1250), start=1):
+            for row_index, y in enumerate((120, 290, 460, 630), start=1):
+                cv2.rectangle(page, (x, y), (x + 430, y + 24), (0, 0, 0), -1)
+                items.append(item(
+                    f'{row_index}. COLUMN {column_index} EXERCISE', x, y,
+                    width=430, height=24,
+                ))
+        candidates = [
+            {'split_x': 565, 'score': 400.0, 'source': 'whitespace'},
+            {'split_x': 1165, 'score': 400.0, 'source': 'whitespace'},
+        ]
+        with patch.object(cutter, '_local_column_split_candidates',
+                          return_value=candidates):
+            regions = cutter._verified_three_column_layout(page, items)
+
+        self.assertIsNotNone(regions)
+        self.assertEqual(len(regions), 3)
+        self.assertEqual(regions[0][1], 565)
+        self.assertEqual(regions[1][0], 565)
+        self.assertEqual([len(region[2]) for region in regions], [4, 4, 4])
+
+    def test_batch_column_trim_skips_shared_context_composition(self):
+        """A shared-context crop is taller than its raw source box; the column
+        guard must not flat re-crop it and strip the attached preamble."""
+        page = np.full((900, 1500, 3), 255, dtype=np.uint8)
+        minor = {
+            '_source_box': [0, 100, 500, 200],
+            'crop_img': page[0:300, 0:500].copy(),  # 3x taller: preamble + own box
+            '_shared_context_attached': True,
+            '_source_segments': [{'question_box': [0, 0, 500, 100]}, {'question_box': [0, 100, 500, 200]}],
+        }
+        cutter.trim_cuts_to_column_bounds([minor], page, [0, 500])
+        self.assertEqual(minor['_source_box'], [0, 100, 500, 200])
+        self.assertEqual(minor['crop_img'].shape, (300, 500, 3))
+        self.assertNotIn('_column_bounds_trimmed', minor)
+
+
+class MissedMinorRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        # 条带重识别有内容寻址缓存。本类用例靠 patch 换掉 OCR 结果，
+        # 用的是同一张合成图，缓存会跨用例命中上一个用例的假结果，
+        # 测出来的行为与生产无关。这里关掉缓存再测。
+        patcher = patch.object(cutter, '_STRIP_OCR_CACHE_ENABLED', False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_missed_minor_number_is_recovered_by_strip_reocr(self):
+        """Structure OCR drops question 2's line; a native-res strip re-OCR
+        restores it, so adjacent questions are not merged into one box."""
+        image = np.full((700, 600, 3), 255, dtype=np.uint8)
+        ocr_items = [
+            item('1. 第一题', 20, 100),
+            item('3. 第三题', 20, 480),
+        ]
+        # 只识别到 1、3（跳号说明中间第 2 题漏读），条带重识别找回第 2 题。
+        with patch.object(cutter, '_run_ocr',
+                          return_value=[item('2. 第二题', 20, 180)]):
+            cuts = cutter.split_major_into_minors(image, ocr_items=ocr_items)
+
+        self.assertEqual([cut['num'] for cut in cuts], [1, 2, 3])
+        self.assertEqual(cuts[1]['_boundary_source'], 'ocr_number')
+
+    def test_strip_reocr_rejects_candidate_not_filling_the_jump(self):
+        """A strip OCR fragment whose number does not fill the jump must not
+        create a false split (e.g. body text misread as a minor number)."""
+        image = np.full((700, 600, 3), 255, dtype=np.uint8)
+        ocr_items = [
+            item('1. 第一题', 20, 100),
+            item('3. 第三题', 20, 480),
+        ]
+        with patch.object(cutter, '_run_ocr',
+                          return_value=[item('88. 乱码噪声', 20, 180)]):
+            cuts = cutter.split_major_into_minors(image, ocr_items=ocr_items)
+
+        self.assertEqual([cut['num'] for cut in cuts], [1, 3])
+
+    def test_strip_reocr_skips_restart_to_one(self):
+        """A numbering restart back to 1 is a new 知识点 section, not a missed
+        number; no strip re-OCR should be triggered for it."""
+        image = np.full((700, 600, 3), 255, dtype=np.uint8)
+        ocr_items = [
+            item('8. 前节末题', 20, 100),
+            item('1. 新节首题', 20, 420),
+        ]
+        with patch.object(cutter, '_run_ocr',
+                          return_value=[item('1. 不应被调用', 20, 180)]) as reocr:
+            cuts = cutter.split_major_into_minors(image, ocr_items=ocr_items)
+
+        reocr.assert_not_called()
+        self.assertEqual([cut['num'] for cut in cuts], [8, 1])
+
+    def test_strip_reocr_skips_contiguous_sequence(self):
+        """A complete contiguous numbering sequence has no jump, so the strip
+        re-OCR must not run at all."""
+        image = np.full((700, 600, 3), 255, dtype=np.uint8)
+        ocr_items = [
+            item('1. 第一题', 20, 100),
+            item('2. 第二题', 20, 300),
+            item('3. 第三题', 20, 500),
+        ]
+        with patch.object(cutter, '_run_ocr',
+                          return_value=[item('9. 不应被调用', 20, 180)]) as reocr:
+            cuts = cutter.split_major_into_minors(image, ocr_items=ocr_items)
+
+        reocr.assert_not_called()
+        self.assertEqual([cut['num'] for cut in cuts], [1, 2, 3])
+
+    def test_multiple_missed_numbers_recover_iteratively(self):
+        """A jump of three (1→4) hides two questions; the recovery iterates so
+        both missing boundaries are restored."""
+        image = np.full((700, 600, 3), 255, dtype=np.uint8)
+        ocr_items = [
+            item('1. 第一题', 20, 100),
+            item('4. 第四题', 20, 560),
+        ]
+        strip_results = [
+            [item('2. 第二题', 20, 180)],
+            [item('3. 第三题', 20, 180)],
+        ]
+        with patch.object(cutter, '_run_ocr',
+                          side_effect=strip_results):
+            cuts = cutter.split_major_into_minors(image, ocr_items=ocr_items)
+
+        self.assertEqual([cut['num'] for cut in cuts], [1, 2, 3, 4])
+        self.assertEqual(cuts[1]['num'], 2)
+        self.assertEqual(cuts[2]['num'], 3)
 
 
 if __name__ == '__main__':

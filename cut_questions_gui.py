@@ -19,11 +19,6 @@ from tkinter import filedialog, messagebox, ttk
 
 APP_DIR = Path(__file__).resolve().parent
 CORE_SCRIPT = APP_DIR / "cut_questions_v4.py"
-ANNOTATOR_SCRIPT = APP_DIR / "review_tools" / "annotate_cuts.py"
-MANUAL_ANNOTATION_SCRIPT = APP_DIR / "review_tools" / "manual_annotation_workspace.py"
-PAIR_REVIEW_SCRIPT = APP_DIR / "review_tools" / "review_pairs.py"
-TRAIN_EXPORT_SCRIPT = APP_DIR / "review_tools" / "export_training_data.py"
-ANSWER_TRAIN_PREP_SCRIPT = APP_DIR / "training" / "prepare_reviewed_answers.py"
 TRAINING_DASHBOARD_SCRIPT = APP_DIR / "training_tools" / "training_dashboard.py"
 SETTINGS_FILE = APP_DIR / "runtime" / "gui_settings.json"
 LEGACY_SETTINGS_FILE = APP_DIR / ".cut_questions_gui.json"
@@ -204,10 +199,6 @@ class CutterGui:
         self.stop_button.pack(side="left", padx=(8, 0))
         self.open_button = ttk.Button(controls, text="打开结果目录", command=self.open_result)
         self.open_button.pack(side="left", padx=(8, 0))
-        ttk.Button(controls, text="人工标注（题目 / 答案匹配）", command=self.open_manual_annotation).pack(side="left", padx=(8, 0))
-        ttk.Button(controls, text="精度标注", command=self.open_annotator).pack(side="left", padx=(8, 0))
-        ttk.Button(controls, text="结果审核", command=self.open_pair_reviewer).pack(side="left", padx=(8, 0))
-        ttk.Button(controls, text="导出训练集", command=self.export_training_data).pack(side="left", padx=(8, 0))
         ttk.Label(controls, textvariable=self.status_var, style="Status.TLabel").pack(side="right")
 
         training_box = ttk.LabelFrame(container, text="可训练切题模型（CPU）", padding=(12, 8))
@@ -226,9 +217,6 @@ class CutterGui:
         )
         ttk.Button(training_box, text="训练说明", command=self.show_training_info).grid(
             row=0, column=2, sticky="e"
-        )
-        ttk.Button(training_box, text="生成答案训练集", command=self.prepare_answer_training_data).grid(
-            row=1, column=1, columnspan=2, pady=(8, 0), sticky="e"
         )
 
         progress_box = ttk.Frame(container)
@@ -314,7 +302,7 @@ class CutterGui:
 
 HiLEx 训练用于学习通用试卷版面结构，通常能改善题框贴合度、选项完整性和单双栏页面的稳定性。当前正在训练的版本只使用英文试卷 HiLEx，属于“版面预训练模型”：它的验证指标只代表 HiLEx 测试集，不等于中文教辅的最终准确率。
 
-要获得中文教辅上的最终效果，需要在“精度标注”中标注中文原始页，再按书本划分训练/验证/测试集进行微调。届时应以中文独立测试集的召回率、误切率、题框 IoU、漏内容率作为验收标准，而不是只看训练集指标。
+要获得中文教辅上的最终效果，需要用带标注的中文原始页做进一步微调，并按书本划分训练/验证/测试集。届时应以中文独立测试集的召回率、误切率、题框 IoU、漏内容率作为验收标准，而不是只看训练集指标。
 
 使用建议：
 
@@ -324,42 +312,6 @@ HiLEx 训练用于学习通用试卷版面结构，通常能改善题框贴合�
 """)
         text.configure(state="disabled")
         ttk.Button(window, text="关闭", command=window.destroy).pack(pady=(0, 12))
-
-    def prepare_answer_training_data(self) -> None:
-        """Turn accepted review pairs into a trainable answer-entry dataset."""
-        if not ANSWER_TRAIN_PREP_SCRIPT.is_file():
-            messagebox.showerror(WINDOW_TITLE, f"缺少答案训练集转换工具：\n{ANSWER_TRAIN_PREP_SCRIPT}")
-            return
-        manifest = filedialog.askopenfilename(
-            title="选择已导出的 training_manifest.jsonl",
-            initialdir=str(self._actual_output() if self._actual_output().exists() else APP_DIR),
-            filetypes=[("训练清单", "training_manifest.jsonl"), ("JSON Lines", "*.jsonl"), ("所有文件", "*.*")],
-        )
-        if not manifest:
-            return
-        output = filedialog.askdirectory(title="选择答案训练集输出目录")
-        if not output:
-            return
-        command = [sys.executable, str(ANSWER_TRAIN_PREP_SCRIPT), manifest, "--output", output]
-        if Path(output).exists() and any(Path(output).iterdir()):
-            if not messagebox.askyesno(WINDOW_TITLE, "目标目录不是空目录。是否替换其中已有的答案训练集？"):
-                return
-            command.append("--overwrite")
-        self.status_var.set("正在生成审核答案训练集…")
-
-        def worker() -> None:
-            result = subprocess.run(command, cwd=str(APP_DIR), capture_output=True, text=True, encoding="utf-8", errors="replace")
-            if result.returncode:
-                message = result.stderr.strip() or result.stdout.strip() or "未知错误"
-                self.root.after(0, lambda: messagebox.showerror(WINDOW_TITLE, f"生成答案训练集失败：\n{message}"))
-            else:
-                self.root.after(0, lambda: messagebox.showinfo(
-                    WINDOW_TITLE,
-                    "答案训练集已生成。请在“训练与进度”中选择 answer 后启动训练。\n\n" + result.stdout,
-                ))
-            self.root.after(0, lambda: self.status_var.set("答案训练集生成结束。"))
-
-        threading.Thread(target=worker, daemon=True).start()
 
     def _update_mode_hint(self) -> None:
         is_year = self.mode_var.get() == "year"
@@ -1024,103 +976,6 @@ HiLEx 训练用于学习通用试卷版面结构，通常能改善题框贴合�
             messagebox.showinfo(WINDOW_TITLE, f"结果目录尚不存在：\n{target}")
             return
         os.startfile(str(target))
-
-    def open_manual_annotation(self) -> None:
-        """Open the employee-facing page annotation and answer matching desk."""
-        if not MANUAL_ANNOTATION_SCRIPT.is_file():
-            messagebox.showerror(WINDOW_TITLE, f"缺少人工标注工具：\n{MANUAL_ANNOTATION_SCRIPT}")
-            return
-        try:
-            subprocess.Popen(
-                [sys.executable, str(MANUAL_ANNOTATION_SCRIPT)],
-                cwd=str(APP_DIR),
-            )
-            self.status_var.set("已打开人工标注：按页生成预标注框、人工调整并匹配答案。")
-        except OSError as error:
-            messagebox.showerror(WINDOW_TITLE, f"无法启动人工标注工具：\n{error}")
-
-    def open_annotator(self) -> None:
-        """在独立窗口打开原页题框标注，不阻塞正在运行的切题任务。"""
-        if not ANNOTATOR_SCRIPT.is_file():
-            messagebox.showerror(WINDOW_TITLE, f"缺少标注工具：\n{ANNOTATOR_SCRIPT}")
-            return
-        try:
-            subprocess.Popen(
-                [sys.executable, str(ANNOTATOR_SCRIPT)],
-                cwd=str(APP_DIR),
-            )
-        except OSError as error:
-            messagebox.showerror(WINDOW_TITLE, f"无法启动精度标注工具：\n{error}")
-
-    def open_pair_reviewer(self) -> None:
-        """打开题目—答案结果审核；人工和在线智能体共用相同审核文件。"""
-        if not PAIR_REVIEW_SCRIPT.is_file():
-            messagebox.showerror(WINDOW_TITLE, f"缺少结果审核工具：\n{PAIR_REVIEW_SCRIPT}")
-            return
-        try:
-            subprocess.Popen(
-                [sys.executable, str(PAIR_REVIEW_SCRIPT)],
-                cwd=str(APP_DIR),
-            )
-        except OSError as error:
-            messagebox.showerror(WINDOW_TITLE, f"无法启动结果审核工具：\n{error}")
-
-    def export_training_data(self) -> None:
-        """把已审核记录导成按教材隔离的数据集，可选复制成便携包。"""
-        if not TRAIN_EXPORT_SCRIPT.is_file():
-            messagebox.showerror(WINDOW_TITLE, f"缺少训练集导出工具：\n{TRAIN_EXPORT_SCRIPT}")
-            return
-        default_root = self._actual_output()
-        source = filedialog.askdirectory(
-            title="选择包含审核结果的教材或年份目录",
-            initialdir=str(default_root if default_root.exists() else APP_DIR),
-        )
-        if not source:
-            return
-        output = filedialog.askdirectory(title="选择训练数据输出目录")
-        if not output:
-            return
-        portable = messagebox.askyesno(
-            WINDOW_TITLE, "是否复制题图、答案图和来源原页，生成可迁移训练包？\n\n"
-            "选择“否”只生成引用现有文件的轻量清单。",
-        )
-        include_auto = messagebox.askyesno(
-            WINDOW_TITLE, "是否纳入未经人工复核的高置信自动样本？\n\n"
-            "首次训练建议选择“否”，只使用已核对数据。",
-        )
-        command = [
-            sys.executable, str(TRAIN_EXPORT_SCRIPT), source, '--output', output,
-        ]
-        if portable:
-            command.append('--portable')
-        if include_auto:
-            command.append('--include-auto')
-        self.status_var.set("正在导出训练数据…")
-
-        def worker() -> None:
-            try:
-                result = subprocess.run(
-                    command, cwd=str(APP_DIR), capture_output=True, text=True,
-                    encoding='utf-8', errors='replace', check=False,
-                )
-                if result.returncode:
-                    message = result.stderr.strip() or result.stdout.strip() or '未知错误'
-                    self.root.after(0, lambda: messagebox.showerror(
-                        WINDOW_TITLE, f"训练集导出失败：\n{message}",
-                    ))
-                else:
-                    self.root.after(0, lambda: messagebox.showinfo(
-                        WINDOW_TITLE, f"训练数据已导出到：\n{output}",
-                    ))
-            except OSError as error:
-                error_message = str(error)
-                self.root.after(0, lambda value=error_message: messagebox.showerror(
-                    WINDOW_TITLE, f"无法启动训练集导出：\n{value}",
-                ))
-            finally:
-                self.root.after(0, lambda: self.status_var.set("训练数据导出结束。"))
-
-        threading.Thread(target=worker, daemon=True).start()
 
     def _append_log(self, text: str) -> None:
         self.log.configure(state="normal")

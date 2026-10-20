@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,7 +11,28 @@ from review_tools.export_manual_annotations import _stack_segments, export_proje
 
 
 class ManualAnnotationDataTests(unittest.TestCase):
-    def test_stacked_delivery_segments_touch_without_a_white_separator(self):
+    def test_unmatched_accepted_question_is_exported_as_pending_generation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            question_root = root / "questions"
+            question_root.mkdir()
+            image = np.full((80, 120, 3), 255, dtype=np.uint8)
+            cv2.imencode(".jpg", image)[1].tofile(str(question_root / "1.jpg"))
+            project = data.create_project(str(question_root))
+            question = data.new_record([0, 0, 120, 80], number="1")
+            project["pages"][0].update(status="accepted", questions=[question])
+            project_path = root / "project.json"
+            data.save_project(project, project_path)
+
+            report = export_project(str(project_path), str(root / "export"))
+
+            self.assertEqual(report["exported"], 1)
+            self.assertEqual(report["samples"][0]["answer_status"], "pending_generation")
+            sample = root / "export" / report["samples"][0]["path"]
+            metadata = json.loads((sample / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["answer_status"], "pending_generation")
+            self.assertFalse((sample / "answer_1.jpg").exists())
+
         top = np.full((3, 5, 3), 40, dtype=np.uint8)
         bottom = np.full((2, 5, 3), 180, dtype=np.uint8)
         composed = _stack_segments(top, bottom)
@@ -40,6 +62,30 @@ class ManualAnnotationDataTests(unittest.TestCase):
             loaded = data.load_project(path)
             self.assertEqual(loaded["pages"][0]["match_scope_id"], "")
             self.assertEqual(loaded["pages"][0]["match_scope_regions"], [])
+
+    def test_batch_preannotation_migrates_page_scope_to_existing_frames(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "1.jpg").write_bytes(b"")
+            project = data.create_book_project(str(root))
+            project["preannotation_mode"] = "paperflow"
+            project["match_scopes"] = [{"id": "scope-1", "name": "第一单元"}]
+            project["pages"][0].update({
+                "match_scope_id": "scope-1",
+                "questions": [{"id": "q-1", "bbox": [2, 3, 40, 50], "match_scope_id": "scope-1"}],
+            })
+            path = root / "PaperFlow标注项目.json"
+            data.save_project(project, path)
+
+            loaded = data.load_project(path)
+
+            page = loaded["pages"][0]
+            self.assertEqual(page["match_scope_id"], "")
+            self.assertEqual(page["questions"][0]["match_scope_id"], "scope-1")
+            self.assertEqual(page["match_scope_regions"], [{
+                "id": "region-prelabel-q-1", "scope_id": "scope-1", "bbox": [2, 3, 40, 50],
+            }])
+            self.assertTrue(loaded["_paperflow_scope_migration_pending"])
 
     def test_new_book_keeps_all_pages_browsable_until_staff_marks_answers(self):
         with tempfile.TemporaryDirectory() as directory:

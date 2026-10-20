@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import copy
+import os
 import shutil
 import tempfile
 import unittest
@@ -13,6 +14,8 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# 打开教材会在后台抽样正文判定版式；单元测试不加载 OCR 模型。
+os.environ["PAPERFLOW_DISABLE_PROFILE_DETECT"] = "1"
 API_PATH = ROOT / "desktop_annotation" / "paperflow_annotation_api.py"
 SPEC = importlib.util.spec_from_file_location("paperflow_annotation_api", API_PATH)
 api = importlib.util.module_from_spec(SPEC)
@@ -41,10 +44,24 @@ class AnnotationApiTests(unittest.TestCase):
         })
         self.export_root = ROOT / "runtime" / "manual_annotation_exports" / self.project_path.stem
         opened_project = api.annotation_data.load_project(self.project_path)
-        self.delivery_root = ROOT / "runtime" / "delivery_packages" / opened_project["delivery_book_id"]
+        self.delivery_root = self.book / opened_project["delivery_book_id"]
 
     def test_complete_project_cache_request_limit_is_not_64kb(self) -> None:
         self.assertGreaterEqual(api.MAX_REQUEST_BODY_BYTES, 64 * 1024 * 1024)
+
+    def test_removed_local_formula_ocr_route_is_not_exposed(self) -> None:
+        self.assertNotIn("/api/mixed-ocr", api.ROUTES)
+
+    def test_auto_page_ocr_setting_defaults_to_enabled_and_is_persisted_per_book(self) -> None:
+        opened = api._open_book({"book_root": str(self.book)})
+        self.assertTrue(opened["project"]["ocr_settings"]["auto_page_ocr_on_confirm"])
+        result = api._set_ocr_settings({
+            "project_path": str(self.project_path),
+            "auto_page_ocr_on_confirm": False,
+        })
+        self.assertFalse(result["ocr_settings"]["auto_page_ocr_on_confirm"])
+        saved = api.annotation_data.load_project(self.project_path)
+        self.assertFalse(saved["ocr_settings"]["auto_page_ocr_on_confirm"])
 
     def test_prelabel_rejects_an_image_that_is_not_the_requested_project_page(self) -> None:
         outside = self.book / "outside.png"
@@ -55,11 +72,34 @@ class AnnotationApiTests(unittest.TestCase):
                 "page_index": 0, "image_path": str(outside), "profile": "auto",
             })
 
-    def test_prelabel_auto_profile_uses_the_textbook_directory(self) -> None:
+    def test_prelabel_auto_profile_uses_the_persisted_book_profile(self) -> None:
         project = api.annotation_data.load_project(self.project_path)
+        project["profile"] = "exam"
+        project["profile_locked"] = True
+        api.annotation_data.save_project(project, self.project_path)
+        expected_image = api.annotation_data.source_path(project, project["pages"][0])
+        with (
+            mock.patch.object(api, "infer_book_profile", return_value="workbook") as infer,
+            mock.patch.object(api, "_question_suggestions", return_value=[]) as suggest,
+        ):
+            result = api._prelabel({
+                "project_path": str(self.project_path), "kind": "question",
+                "page_index": 0, "image_path": expected_image, "profile": "auto",
+            })
+        # 版式已经在打开教材时落盘，预标注不再每次按目录名重猜。
+        infer.assert_not_called()
+        self.assertEqual(result["profile"], "exam")
+        self.assertEqual(suggest.call_args.args[1], "exam")
+
+    def test_prelabel_falls_back_to_directory_inference_without_a_stored_profile(self) -> None:
+        project = api.annotation_data.load_project(self.project_path)
+        project.pop("profile", None)
+        project.pop("profile_locked", None)
+        api.annotation_data.save_project(project, self.project_path)
         expected_image = api.annotation_data.source_path(project, project["pages"][0])
         with (
             mock.patch.object(api, "infer_book_profile", return_value="exam") as infer,
+            mock.patch.object(api, "read_book_profile_cache", return_value=None),
             mock.patch.object(api, "_question_suggestions", return_value=[]) as suggest,
         ):
             api._prelabel({
@@ -68,6 +108,71 @@ class AnnotationApiTests(unittest.TestCase):
             })
         infer.assert_called_once_with(str(self.book.resolve()))
         self.assertEqual(suggest.call_args.args[1], "exam")
+
+    def test_open_book_persists_the_profile_and_syncs_page_profiles(self) -> None:
+        book = Path(self.temp.name) / "第一单元达标检测卷"
+        book.mkdir()
+        # cv2.imwrite 在中文路径上会静默失败，这里直接写编码后的字节。
+        image = np.full((200, 300, 3), 255, dtype=np.uint8)
+        (book / "p1.png").write_bytes(cv2.imencode(".png", image)[1].tobytes())
+        opened = api._open_book({"book_root": str(book)})
+        project = opened["project"]
+        self.assertEqual(project["profile"], "exam")
+        self.assertEqual(project["profile_source"], "auto_name")
+        self.assertIn("书名含", project["profile_reason"])
+        self.assertEqual([page["profile"] for page in project["pages"]], ["exam"])
+        self.assertIn("exam", {item["value"] for item in opened["book_profiles"]})
+        # 界面选版式时要能看到该版式启用了哪些特殊处理。
+        notes = opened["book_profile_notes"]
+        self.assertEqual(set(notes), set(api.BOOK_PROFILE_CHOICES))
+        self.assertTrue(any("28%" in note for note in notes["exam"]))
+        self.assertEqual(notes["general"], [])
+        # 重新打开时沿用落盘值，不会因为目录名判不出而退回 general。
+        self.assertEqual(api._open_book({"book_root": str(book)})["project"]["profile"], "exam")
+
+    def test_book_metadata_can_pin_and_release_the_layout_profile(self) -> None:
+        metadata = {
+            "language": "zh", "stage": "小学", "grade": "四年级",
+            "subject": "数学", "answer_mode": "textbook", "profile": "drill",
+        }
+        result = api._set_book_metadata({
+            "project_path": str(self.project_path), "metadata": metadata,
+        })
+        self.assertEqual(result["project"]["profile"], "drill")
+        self.assertTrue(result["project"]["profile_locked"])
+        self.assertEqual(
+            {page["profile"] for page in result["project"]["pages"]}, {"drill"},
+        )
+        with self.assertRaisesRegex(ValueError, "版式"):
+            api._set_book_metadata({
+                "project_path": str(self.project_path),
+                "metadata": {**metadata, "profile": "nonsense"},
+            })
+        released = api._set_book_metadata({
+            "project_path": str(self.project_path),
+            "metadata": {**metadata, "profile": "auto"},
+        })
+        self.assertNotIn("profile_locked", released["project"])
+        self.assertEqual(released["project"]["profile"], "general")
+        self.assertEqual(
+            {page["profile"] for page in released["project"]["pages"]}, {"general"},
+        )
+
+    def test_background_profile_detection_saves_without_bumping_the_revision(self) -> None:
+        before = api.annotation_data.load_project(self.project_path)["project_revision"]
+        detected = {"profile": "exam", "source": "text", "reason": "正文含单元测试卷名"}
+        with (
+            mock.patch.object(api, "PROFILE_DETECT_DELAY_SECONDS", 0),
+            mock.patch.object(api, "detect_book_profile", return_value=detected),
+        ):
+            api._profile_detect_job(self.book)
+        saved = api.annotation_data.load_project(self.project_path)
+        self.assertEqual(saved["profile"], "exam")
+        self.assertEqual(saved["profile_source"], "auto_text")
+        # 后台推断不能推进修订号，否则前端下一次整本缓存保存会被判成冲突。
+        self.assertEqual(saved["project_revision"], before)
+        self.assertEqual({page["profile"] for page in saved["pages"]}, {"exam"})
+
 
     def test_save_page_preserves_detector_provenance(self) -> None:
         api._save_page({
@@ -110,6 +215,21 @@ class AnnotationApiTests(unittest.TestCase):
             })
         infer.assert_not_called()
         self.assertEqual(suggest.call_args.args[1], "general")
+
+    def test_force_refresh_prelabel_forwards_the_request_to_answer_ocr(self) -> None:
+        project = api.annotation_data.load_project(self.project_path)
+        answer_page = project["answer_pages"][0]
+        expected_image = api.annotation_data.source_path(project, answer_page, True)
+        with mock.patch.object(api, "_answer_suggestions", return_value=[]) as suggest:
+            result = api._prelabel({
+                "project_path": str(self.project_path), "kind": "answer",
+                "page_index": 0, "image_path": expected_image, "profile": "auto",
+                "force_refresh": True, "refresh_token": "manual-refresh-1",
+            })
+
+        self.assertTrue(result["force_refresh"])
+        self.assertEqual(result["bridge_revision"], api.PAPERFLOW_BRIDGE_REVISION)
+        self.assertTrue(suggest.call_args.kwargs["force_refresh"])
 
     def test_empty_page_rotation_is_persistent_and_returns_to_original(self) -> None:
         project = api.annotation_data.load_project(self.project_path)
@@ -419,8 +539,16 @@ class AnnotationApiTests(unittest.TestCase):
         expected = output_root / result["delivery"]["book_id"]
         self.assertEqual(Path(result["output_path"]), expected)
         self.assertFalse((expected / "manifest.json").is_file(), "changing location must not eagerly export pages")
+        self.assertTrue((expected / "PaperFlow标注项目.json").is_file(), "shared progress snapshot should be published on save")
         saved = api.annotation_data.load_project(self.project_path)
         self.assertEqual(Path(saved["delivery_output_root"]), output_root.resolve())
+
+    def test_company_public_share_cannot_be_used_for_final_delivery(self) -> None:
+        with self.assertRaisesRegex(ValueError, "不再用于最终交付"):
+            api._set_delivery_output({
+                "project_path": str(self.project_path),
+                "output_root": r"\\192.168.1.204\PaperFlowTest\Projects",
+            })
 
     def test_page_reclassification_and_confirmed_answer_matching(self) -> None:
         result = api._reclassify_pages({
@@ -498,6 +626,97 @@ class AnnotationApiTests(unittest.TestCase):
         })
         saved = api.annotation_data.load_project(self.project_path)
         self.assertEqual(saved["pages"][0]["questions"][0]["match_scope_id"], scope["id"])
+
+    def test_region_assignment_replaces_an_earlier_whole_page_scope(self) -> None:
+        api._save_page({
+            "project_path": str(self.project_path), "kind": "answer", "page_index": 0,
+            "records": [
+                {"id": "a-inside", "bbox": [10, 10, 80, 80]},
+                {"id": "a-outside", "bbox": [150, 10, 240, 80]},
+            ],
+        })
+        scope = api._upsert_match_scope({
+            "project_path": str(self.project_path), "name": "框选优先",
+        })["scope"]
+        api._assign_match_scope({
+            "project_path": str(self.project_path), "kind": "answer",
+            "scope_id": scope["id"], "page_indices": [0], "set_page_default": True,
+        })
+        result = api._assign_match_scope({
+            "project_path": str(self.project_path), "kind": "answer",
+            "scope_id": scope["id"], "page_indices": [0],
+            "region_bbox": [0, 0, 100, 100],
+        })
+        page = result["project"]["answer_pages"][0]
+        self.assertEqual(page["match_scope_id"], "")
+        self.assertEqual(len(page["match_scope_regions"]), 1)
+        self.assertEqual(page["answers"][0]["match_scope_id"], scope["id"])
+        self.assertEqual(page["answers"][1]["match_scope_id"], "")
+
+    def test_confirming_selected_answer_regions_only_exposes_those_answers_to_matching(self) -> None:
+        first_scope = api._upsert_match_scope({
+            "project_path": str(self.project_path), "name": "第一部分",
+        })["scope"]
+        second_scope = api._upsert_match_scope({
+            "project_path": str(self.project_path), "name": "第二部分",
+        })["scope"]
+        project = api.annotation_data.load_project(self.project_path)
+        question = api.annotation_data.new_record(
+            [10, 10, 90, 90], number_path=["一", "1"], match_scope_id=first_scope["id"],
+        )
+        first_answer = api.annotation_data.new_record(
+            [10, 10, 90, 90], answer=True, number_path=["一", "1"], match_scope_id=first_scope["id"],
+        )
+        second_answer = api.annotation_data.new_record(
+            [150, 10, 230, 90], answer=True, number_path=["一", "1"], match_scope_id=second_scope["id"],
+        )
+        ungrouped_answer = api.annotation_data.new_record(
+            [265, 10, 295, 90], answer=True, number_path=["一", "1"],
+        )
+        project["pages"][0].update(status="accepted", questions=[question])
+        project["answer_pages"][0].update(
+            status="draft", answers=[first_answer, second_answer, ungrouped_answer],
+            match_scope_regions=[
+                {"id": "answer-region-1", "scope_id": first_scope["id"], "bbox": [0, 0, 100, 100]},
+                {"id": "answer-region-2", "scope_id": second_scope["id"], "bbox": [120, 0, 260, 100]},
+            ],
+        )
+        api.annotation_data.save_project(project, self.project_path)
+
+        result = api._save_page({
+            "project_path": str(self.project_path), "kind": "answer", "page_index": 0,
+            "accepted": True, "confirmed_match_scope_region_ids": ["answer-region-1"],
+            "records": [
+                {"id": first_answer["id"], "bbox": [10, 10, 90, 90], "number_path": ["一", "1"]},
+                {"id": second_answer["id"], "bbox": [150, 10, 230, 90], "number_path": ["一", "1"]},
+                {"id": ungrouped_answer["id"], "bbox": [265, 10, 295, 90], "number_path": ["一", "1"]},
+            ],
+        })
+        self.assertEqual(result["confirmed_match_scope_region_ids"], ["answer-region-1"])
+        candidates = api._match_candidates({
+            "project_path": str(self.project_path), "question_id": question["id"],
+        })["candidates"]
+        self.assertEqual([item["answer"]["id"] for item in candidates], [first_answer["id"]])
+        with self.assertRaisesRegex(ValueError, "确认"):
+            api._set_pair({
+                "project_path": str(self.project_path), "question_id": question["id"],
+                "answer_ids": [second_answer["id"]],
+            })
+
+        api._save_page({
+            "project_path": str(self.project_path), "kind": "answer", "page_index": 0,
+            "accepted": True, "confirmed_match_scope_region_ids": ["answer-region-1"],
+            "confirm_all_answer_records": True,
+            "records": [
+                {"id": first_answer["id"], "bbox": [10, 10, 90, 90], "number_path": ["一", "1"]},
+                {"id": second_answer["id"], "bbox": [150, 10, 230, 90], "number_path": ["一", "1"]},
+                {"id": ungrouped_answer["id"], "bbox": [265, 10, 295, 90], "number_path": ["一", "1"]},
+            ],
+        })
+        saved_page = api.annotation_data.load_project(self.project_path)["answer_pages"][0]
+        self.assertEqual(set(saved_page["confirmed_match_record_ids"]), {
+            first_answer["id"], second_answer["id"], ungrouped_answer["id"],
+        })
 
     def test_scope_auto_match_accepts_only_unique_confirmed_canonical_numbers(self) -> None:
         scope = api._upsert_match_scope({
@@ -577,6 +796,349 @@ class AnnotationApiTests(unittest.TestCase):
         self.assertEqual(result["project"]["pages"][0]["questions"][0]["match_scope_id"], "")
         self.assertEqual(result["project"]["answer_pages"][0]["answers"][0]["match_scope_id"], "")
         self.assertEqual(result["project"]["answer_pages"][0]["match_scope_regions"], [])
+
+
+class EnrichBridgeTests(unittest.TestCase):
+    """T03：快照冻结 / 单页分级 / pair 字典 / 书级锁 / 总开关。
+
+    与 ``AnnotationApiTests`` 用同一套临时教材，但**只新增**断言，
+    不改既有用例（既有的 41 项必须原样通过）。
+    """
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.book = Path(self.temp.name)
+        (self.book / "answers").mkdir()
+        image = np.full((200, 300, 3), 255, dtype=np.uint8)
+        cv2.rectangle(image, (20, 20), (280, 180), (0, 0, 0), 2)
+        cv2.imwrite(str(self.book / "question.png"), image)
+        cv2.imwrite(str(self.book / "answers" / "answer.png"), image)
+        opened = api._open_book({"book_root": str(self.book)})
+        self.project_path = Path(opened["project_path"])
+        answer_index = next(
+            index for index, page in enumerate(opened["project"]["pages"])
+            if page["image"].replace("\\", "/") == "answers/answer.png"
+        )
+        api._reclassify_pages({
+            "project_path": str(self.project_path), "source_kind": "question",
+            "page_indices": [answer_index], "target_kind": "answer",
+        })
+        opened_project = api.annotation_data.load_project(self.project_path)
+        self.delivery_root = self.book / opened_project["delivery_book_id"]
+        self._saved_enrich_flag = os.environ.get("PAPERFLOW_ENRICH")
+        os.environ.pop("PAPERFLOW_ENRICH", None)
+
+    def tearDown(self) -> None:
+        if self._saved_enrich_flag is None:
+            os.environ.pop("PAPERFLOW_ENRICH", None)
+        else:
+            os.environ["PAPERFLOW_ENRICH"] = self._saved_enrich_flag
+        if self.project_path.is_file():
+            self.project_path.unlink()
+        workspace_db = api.database_path(self.project_path, ROOT / "runtime")
+        if workspace_db.is_file():
+            workspace_db.unlink()
+        if self.delivery_root.is_dir():
+            shutil.rmtree(self.delivery_root)
+        self.temp.cleanup()
+
+    def _confirm_question_page(self, records=None) -> dict:
+        records = records if records is not None else [
+            {"id": "q-enrich", "bbox": [10, 10, 290, 190],
+             "number_path": ["一", "1"], "text": "1. 计算 12×4"},
+        ]
+        return api._save_page({
+            "project_path": str(self.project_path), "kind": "question",
+            "page_index": 0, "accepted": True, "records": records,
+        })
+
+    def _question(self, index: int = 0) -> dict:
+        project = api.annotation_data.load_project(self.project_path)
+        return project["pages"][0]["questions"][index]
+
+    def test_save_page_freezes_a_snapshot_and_writes_a_review_level(self) -> None:
+        result = self._confirm_question_page()
+        self.assertTrue(result["enrich"]["enabled"])
+        self.assertEqual(result["enrich"]["frozen"], 1)
+        record = self._question()
+        self.assertIsInstance(record["snapshot"], dict)
+        self.assertTrue(record["snapshot"]["hash"])
+        self.assertEqual(record["snapshot_id"], record["snapshot"]["hash"][:16])
+        self.assertIn(record["review_level"], {"L0", "L1", "L2"})
+        self.assertEqual(record["enrich_status"], "pending")
+        project = api.annotation_data.load_project(self.project_path)
+        self.assertEqual(project["pages"][0]["review_summary"],
+                         {"L0": 0, "L1": 0, "L2": 1})
+
+    def test_editing_one_box_marks_only_that_record_stale(self) -> None:
+        self._confirm_question_page([
+            {"id": "q-a", "bbox": [10, 10, 290, 90], "number_path": ["一", "1"]},
+            {"id": "q-b", "bbox": [10, 100, 290, 190], "number_path": ["一", "2"]},
+        ])
+        untouched = copy.deepcopy(self._question(1))
+        self._confirm_question_page([
+            {"id": "q-a", "bbox": [20, 20, 290, 100], "number_path": ["一", "1"]},
+            {"id": "q-b", "bbox": [10, 100, 290, 190], "number_path": ["一", "2"]},
+        ])
+        changed = self._question(0)
+        kept = self._question(1)
+        self.assertEqual(changed["enrich_status"], "stale")
+        self.assertEqual(changed["review_level"], "L2")
+        self.assertEqual(kept["enrich_status"], untouched["enrich_status"])
+        self.assertEqual(kept["snapshot"]["hash"], untouched["snapshot"]["hash"])
+        self.assertEqual(kept["review_level"], untouched["review_level"])
+
+    def test_whole_project_cache_save_keeps_enrich_fields(self) -> None:
+        """R2 回归：旧版渲染层整工程 autosave 不能抹掉 AI 补全结果。"""
+        self._confirm_question_page()
+        project = api.annotation_data.load_project(self.project_path)
+        record = project["pages"][0]["questions"][0]
+        record["field_confidence"] = {"difficulty": 0.91}
+        record["enrich_status"] = "done"
+        record["kp_codes"] = ["M-001"]
+        record["analysis_check"] = {"status": "pass"}
+        project["pages"][0]["illustration_ready"] = True
+        project["enrichment"] = {"taxonomy_version": "math-2026.10",
+                                 "prompt_version": "enrich-v1"}
+        api.annotation_data.save_project(project, self.project_path, increment_revision=False)
+        authoritative = api.annotation_data.load_project(self.project_path)
+        expected_snapshot = authoritative["pages"][0]["questions"][0]["snapshot"]
+
+        stale = copy.deepcopy(authoritative)
+        stale_record = stale["pages"][0]["questions"][0]
+        for key in api.annotation_data.ENRICH_PERSISTENT_KEYS:
+            stale_record.pop(key, None)
+        stale["pages"][0].pop("review_summary", None)
+        stale["pages"][0].pop("illustration_ready", None)
+        stale.pop("enrichment", None)
+        api._save_project_cache({
+            "project_path": str(self.project_path), "project": stale,
+            "base_revision": authoritative["project_revision"],
+        })
+
+        saved = api.annotation_data.load_project(self.project_path)
+        saved_record = saved["pages"][0]["questions"][0]
+        self.assertEqual(saved_record["snapshot"], expected_snapshot)
+        self.assertEqual(saved_record["enrich_status"], "done")
+        self.assertEqual(saved_record["field_confidence"], {"difficulty": 0.91})
+        self.assertEqual(saved_record["kp_codes"], ["M-001"])
+        self.assertEqual(saved_record["analysis_check"], {"status": "pass"})
+        self.assertEqual(saved_record["review_level"], authoritative["pages"][0]["questions"][0]["review_level"])
+        self.assertIn("review_summary", saved["pages"][0])
+        self.assertTrue(saved["pages"][0]["illustration_ready"])
+        self.assertEqual(saved["enrichment"]["taxonomy_version"], "math-2026.10")
+
+    def test_enrich_switch_off_restores_the_previous_behaviour(self) -> None:
+        with mock.patch.dict(os.environ, {"PAPERFLOW_ENRICH": "0"}):
+            result = self._confirm_question_page()
+            self.assertEqual(result["enrich"], {"enabled": False})
+            record = self._question()
+            self.assertIsNone(record.get("snapshot"))
+            self.assertNotIn("review_level", record)
+            self.assertNotIn("review_summary", api.annotation_data.load_project(
+                self.project_path)["pages"][0])
+            for route in ("enrich-prepare", "enrich-status", "book-meta-suggest"):
+                payload = api.ROUTES[f"/api/project/{route}"]({
+                    "project_path": str(self.project_path), "page_index": 0,
+                })
+                self.assertFalse(payload["ok"])
+                self.assertTrue(payload["disabled"])
+
+    def test_set_pair_writes_a_pair_dictionary_with_five_keys(self) -> None:
+        self._confirm_question_page()
+        api._save_page({
+            "project_path": str(self.project_path), "kind": "answer",
+            "page_index": 0, "accepted": True,
+            "records": [{"id": "a-enrich", "bbox": [10, 10, 290, 190],
+                         "number_path": ["一", "1"], "answer": "48"}],
+        })
+        result = api._set_pair({
+            "project_path": str(self.project_path),
+            "question_id": "q-enrich", "answer_ids": ["a-enrich"],
+        })
+        pair = result["pair_metrics"]
+        self.assertEqual(set(pair), {"score", "margin", "path_match", "ok", "display_confidence"})
+        self.assertTrue(pair["path_match"])
+        self.assertTrue(pair["ok"])
+        self.assertGreaterEqual(pair["score"], 180)
+        self.assertGreaterEqual(pair["margin"], 80)
+        self.assertAlmostEqual(pair["display_confidence"], min(1.0, pair["score"] / 300.0), places=4)
+        record = self._question()
+        self.assertEqual(record["pair"], pair)
+        self.assertNotIn("pair_confidence", record)
+        # 答案后到：快照里的 answer 段必须补上（§3.4）
+        self.assertEqual(record["snapshot"]["answer"], "48")
+        self.assertEqual(record["snapshot"]["answer_source"], "paired")
+
+    def test_locked_book_metadata_requires_an_unlock_reason(self) -> None:
+        metadata = {"language": "zh", "stage": "小学", "grade": "四年级",
+                    "subject": "数学", "answer_mode": "textbook"}
+        api._set_book_metadata({
+            "project_path": str(self.project_path), "metadata": metadata,
+        })
+        saved = api.annotation_data.load_project(self.project_path)
+        self.assertTrue(saved["book_meta_locked"])
+        self.assertEqual(saved["book_meta_rev"], api.book_meta.book_meta_rev(saved))
+        with self.assertRaisesRegex(ValueError, "unlock_reason"):
+            api._set_book_metadata({
+                "project_path": str(self.project_path),
+                "metadata": {**metadata, "grade": "五年级"},
+            })
+        self.assertEqual(
+            api.annotation_data.load_project(self.project_path)["grade"], "四年级",
+        )
+        unlocked = api._set_book_metadata({
+            "project_path": str(self.project_path),
+            "metadata": {**metadata, "grade": "五年级"},
+            "unlock_reason": "教材实际为五年级上册",
+        })
+        self.assertEqual(unlocked["project"]["grade"], "五年级")
+        self.assertTrue(unlocked["book_meta_locked"])
+        self.assertNotEqual(
+            api.annotation_data.load_project(self.project_path)["book_meta_rev"],
+            saved["book_meta_rev"],
+        )
+
+    def test_page_ocr_keeps_the_old_text_when_recognition_matches(self) -> None:
+        self._confirm_question_page()
+        project = api.annotation_data.load_project(self.project_path)
+        ocr_items = [{"bbox": [30, 30, 200, 60], "text": "1. 计算 12×4", "conf": 0.9}]
+        with mock.patch.object(api, "ocr_image", return_value=ocr_items):
+            result = api._page_ocr({
+                "project_path": str(self.project_path), "kind": "question", "page_index": 0,
+            })
+        payload = result["results"]["q-enrich"]
+        self.assertFalse(payload["changed"])
+        self.assertEqual(payload["text"], "1. 计算 12×4")
+        self.assertEqual(result["unchanged"], ["q-enrich"])
+
+        with mock.patch.object(api, "ocr_image",
+                               return_value=[{"bbox": [30, 30, 200, 60],
+                                              "text": "1. 计算 12×5", "conf": 0.9}]):
+            changed = api._page_ocr({
+                "project_path": str(self.project_path), "kind": "question", "page_index": 0,
+            })
+        self.assertTrue(changed["results"]["q-enrich"]["changed"])
+        # _normalize_ocr_text 会去掉中文与数字之间的空格
+        self.assertEqual(changed["results"]["q-enrich"]["text"], "1. 计算12×5")
+        self.assertEqual(changed["unchanged"], [])
+
+    def test_enrich_prepare_publishes_candidates_without_confirming_them(self) -> None:
+        self._confirm_question_page()
+        candidate = {
+            "id": "ic-0-1", "bbox": [20, 20, 120, 120], "label": "image",
+            "owner_id": "q-enrich", "owner_method": "contain", "owner_confidence": 0.95,
+            "reject_reason": "", "confirmed": False,
+        }
+        with mock.patch("review_tools.illustration_candidates.collect",
+                        return_value=[candidate]), \
+                mock.patch.dict(os.environ, {"PAPERFLOW_LAYOUT_ARBITER": "0"}):
+            result = api._enrich_prepare({
+                "project_path": str(self.project_path), "page_index": 0,
+            })
+        self.assertEqual(result["candidates"], 1)
+        saved = api.annotation_data.load_project(self.project_path)
+        record = saved["pages"][0]["questions"][0]
+        self.assertEqual([item["id"] for item in record["illustration_candidates"]],
+                         ["ic-0-1"])
+        self.assertEqual(record["illustrations"], [],
+                         "候选永远不能自动变成正式题图")
+        # 版面裁判不可用 = "没算"，不是"没图"：illustration_ready 必须保持 False，
+        # 否则 no_image_candidate 会把整页题目误判 L2。
+        self.assertFalse(saved["pages"][0]["illustration_ready"])
+        self.assertIn("review_summary", saved["pages"][0])
+
+    def test_enrich_status_reports_levels_and_todo_items(self) -> None:
+        self._confirm_question_page()
+        status = api._enrich_status({"project_path": str(self.project_path)})
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["level_stats"]["total"], 1)
+        self.assertEqual(status["review_summary"]["L2"], 1)
+        self.assertEqual(status["todo_count"], 1)
+        self.assertEqual(status["todo"][0]["question_id"], "q-enrich")
+        self.assertIn("pair_fail", status["todo"][0]["review_reasons"])
+        self.assertEqual(status["enrich_summary"], {"pending": 1})
+
+    def test_book_meta_suggest_never_writes_the_project(self) -> None:
+        before = self.project_path.read_bytes()
+        suggestion = api._book_meta_suggest({
+            "project_path": str(self.project_path), "title": "人教版四年级上册数学",
+        })
+        self.assertTrue(suggestion["ok"])
+        self.assertEqual(suggestion["candidates"]["subject"], "数学")
+        self.assertEqual(suggestion["candidates"]["grade"], "四年级")
+        self.assertTrue(suggestion["validation"]["ok"])
+        self.assertEqual(self.project_path.read_bytes(), before)
+
+
+class PrewarmTests(unittest.TestCase):
+    """启动预热是纯性能优化：必须后台完成，且失败也不能影响点「自动框题」。"""
+
+    def setUp(self) -> None:
+        self._saved_state = dict(api.PREWARM_STATE)
+
+    def tearDown(self) -> None:
+        with api.PREWARM_STATE_LOCK:
+            api.PREWARM_STATE.clear()
+            api.PREWARM_STATE.update(self._saved_state)
+
+    def test_prewarm_loads_both_engines_while_holding_the_inference_lock(self) -> None:
+        observed: list[tuple[str, bool]] = []
+
+        def record(name: str):
+            def side_effect(*_args, **_kwargs):
+                observed.append((name, api.PRELABEL_INFERENCE_LOCK.locked()))
+                return None
+            return side_effect
+
+        import cut_questions_v4 as cutter
+
+        with mock.patch.object(cutter, "get_fast_ocr_engine", side_effect=record("fast")), \
+                mock.patch.object(cutter, "get_ocr_engine", side_effect=record("medium")), \
+                mock.patch.object(cutter, "_run_fast_ocr", lambda image: ([], True)), \
+                mock.patch.object(cutter, "_run_ocr", lambda image: []):
+            api._prewarm_ocr_models()
+
+        self.assertEqual([name for name, _ in observed], ["fast", "medium"])
+        self.assertTrue(
+            all(locked for _, locked in observed),
+            "预热必须与真实预标注共用同一把推理锁，否则 Paddle predictor 会被两线程同时使用",
+        )
+        self.assertEqual(api.prewarm_state()["status"], "ready")
+
+    def test_prewarm_failure_degrades_instead_of_raising(self) -> None:
+        import cut_questions_v4 as cutter
+
+        with mock.patch.object(cutter, "get_fast_ocr_engine", return_value=None), \
+                mock.patch.object(cutter, "get_ocr_engine", side_effect=RuntimeError("模型缺失")), \
+                mock.patch.object(api.traceback, "print_exc", lambda: None):
+            api._prewarm_ocr_models()  # 不允许抛异常：预热失败仍要能正常服务
+
+        state = api.prewarm_state()
+        self.assertEqual(state["status"], "failed")
+        self.assertIn("模型缺失", state["detail"])
+
+    def test_prewarm_can_be_disabled_by_environment(self) -> None:
+        with mock.patch.dict("os.environ", {"PAPERFLOW_DISABLE_PREWARM": "1"}):
+            api._start_prewarm_thread()
+        self.assertEqual(api.prewarm_state()["status"], "disabled")
+
+    def test_health_endpoint_exposes_prewarm_progress(self) -> None:
+        api._set_prewarm_state("loading")
+        handler = api.PaperFlowHandler.__new__(api.PaperFlowHandler)
+        handler.path = "/api/health"
+        with mock.patch.object(api.PaperFlowHandler, "_respond") as respond:
+            handler.do_GET()
+
+        payload = respond.call_args.args[1]
+        self.assertEqual(payload["bridge_revision"], api.PAPERFLOW_BRIDGE_REVISION)
+        self.assertEqual(payload["prewarm"]["status"], "loading")
+
+    def test_server_start_launches_prewarm_on_a_daemon_thread(self) -> None:
+        source = API_PATH.read_text(encoding="utf-8")
+        main_body = source.split("def main() -> None:", 1)[1]
+        self.assertIn("_start_prewarm_thread()", main_body)
+        self.assertIn("daemon=True", source)
 
 
 if __name__ == "__main__":

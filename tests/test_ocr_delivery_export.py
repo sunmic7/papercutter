@@ -76,13 +76,81 @@ class OCRDeliveryExportTests(unittest.TestCase):
             lines = [json.loads(line) for line in (delivery / "k12_dataset" / "dataset.jsonl").read_text(encoding="utf-8").splitlines()]
             self.assertEqual([item["data"]["question"] for item in lines], ["第一题", "第二题"])
             self.assertEqual(lines[0]["id"], "0000001")
-            self.assertEqual(lines[0]["data"]["question_images"], ["pages/P0001/images/Q001_img_01.jpg"])
+            self.assertEqual(lines[0]["data"]["question_images"], ["images/0000001_img_01.jpg"])
             self.assertEqual(lines[0]["data"]["answer"], "A")
             self.assertEqual(lines[0]["data"]["analysis"], "第一题解析")
-            self.assertTrue((delivery / "k12_dataset" / "pages" / "P0001" / "images" / "Q001_img_01.jpg").is_file())
+            self.assertTrue((delivery / "k12_dataset" / "images" / "0000001_img_01.jpg").is_file())
             self.assertTrue((delivery / "k12_dataset" / "pages" / "P0001" / "dataset.jsonl").is_file())
             self.assertFalse((delivery / "k12_dataset" / "pages" / "P0001" / "images" / "answer_1.jpg").exists())
             self.assertEqual(result["k12"]["eligible_count"], 2)
+
+    def test_k12_jsonl_exports_final_unicode_math_not_latex_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            question_root, answer_root = root / "questions", root / "answers"
+            question_root.mkdir(); answer_root.mkdir()
+            image = np.full((300, 300, 3), 255, dtype=np.uint8)
+            cv2.imencode(".jpg", image)[1].tofile(str(question_root / "1.jpg"))
+            cv2.imencode(".jpg", image)[1].tofile(str(answer_root / "1.jpg"))
+            project = data.create_project(str(question_root), str(answer_root))
+            project.update(language="zh", stage="小学", grade="六年级", subject="数学")
+            question = data.new_record(
+                [0, 0, 300, 260], major_number="一", text="求 $\\frac{1}{x}$ 与 $\\sqrt{y}$",
+                question_type="填空题", difficulty="基础", knowledge_points=["分式"],
+                illustrations=[{"bbox": [20, 20, 220, 220], "image_kind": "question_image"}],
+            )
+            answer = data.new_record([0, 0, 300, 260], answer=True, major_number="一", analysis="$x^2$")
+            answer["answer"] = "$\\frac{1}{2}$"
+            project["pages"][0].update(status="accepted", questions=[question])
+            project["answer_pages"][0].update(status="accepted", answers=[answer])
+            data.set_pair(project, question["id"], [answer["id"]])
+            project_path = root / "project.json"
+            data.save_project(project, project_path)
+
+            result = sync_delivery_workspace(project_path, root / "runtime", materialize_all=True)
+            line = (Path(result["output_path"]) / "k12_dataset" / "dataset.jsonl").read_text(encoding="utf-8").strip()
+            payload = json.loads(line)
+            self.assertEqual(payload["data"]["question"], "求 1⁄x 与 √(y)")
+            self.assertEqual(payload["data"]["answer"], "1⁄2")
+            self.assertEqual(payload["data"]["analysis"], "x²")
+            self.assertNotIn("\\frac", line)
+            self.assertNotIn("$", line)
+            # Per-frame delivery JSON must use the same current editable result
+            # as K12 JSONL, never the local LaTeX source kept for rendering.
+            document_path = next((Path(result["output_path"]) / "json" / "questions" / "P0001").glob("*.json"))
+            document = json.loads(document_path.read_text(encoding="utf-8"))
+            self.assertEqual(document["text"], "求 1⁄x 与 √(y)")
+            self.assertNotIn("\\frac", document["text"])
+
+    def test_k12_derives_choices_from_unchanged_ocr_text_only_at_export(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            question_root, answer_root = root / "questions", root / "answers"
+            question_root.mkdir(); answer_root.mkdir()
+            image = np.full((300, 300, 3), 255, dtype=np.uint8)
+            cv2.imencode(".jpg", image)[1].tofile(str(question_root / "1.jpg"))
+            cv2.imencode(".jpg", image)[1].tofile(str(answer_root / "1.jpg"))
+            project = data.create_project(str(question_root), str(answer_root))
+            project.update(language="zh", stage="小学", grade="六年级", subject="数学")
+            question = data.new_record(
+                [0, 0, 300, 260], major_number="一",
+                text="下列说法正确的是（）。\nA. 第一项\nB．第二项\nC、第三项\nD: 第四项",
+                question_type="填空题", difficulty="基础", knowledge_points=["测试"],
+                illustrations=[{"bbox": [20, 20, 220, 220], "image_kind": "question_image"}],
+            )
+            answer = data.new_record([0, 0, 300, 260], answer=True, major_number="一", analysis="详细解析")
+            answer["answer"] = "A"
+            project["pages"][0].update(status="accepted", questions=[question])
+            project["answer_pages"][0].update(status="accepted", answers=[answer])
+            data.set_pair(project, question["id"], [answer["id"]])
+            project_path = root / "project.json"
+            data.save_project(project, project_path)
+
+            result = sync_delivery_workspace(project_path, root / "runtime", materialize_all=True)
+            payload = json.loads((Path(result["output_path"]) / "k12_dataset" / "dataset.jsonl").read_text(encoding="utf-8"))
+            self.assertEqual(payload["metainfo"]["question_type"], "选择")
+            self.assertEqual(payload["data"]["question"], "下列说法正确的是（）。")
+            self.assertEqual(payload["data"]["options"], ["A. 第一项", "B. 第二项", "C. 第三项", "D. 第四项"])
 
     def test_k12_rejects_incomplete_samples_without_leaving_formal_images(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -160,7 +228,7 @@ class OCRDeliveryExportTests(unittest.TestCase):
             self.assertEqual(saved_again["pairs"][0]["delivery_id"], first_relation_id)
             self.assertEqual(len(calls), 2, "second export should reuse cached OCR for unchanged crops")
 
-    def test_incremental_workspace_uses_same_ids_and_only_ready_pairs_enter_database(self):
+    def test_incremental_workspace_keeps_unanswered_questions_in_database(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             question_root, answer_root = root / "questions", root / "answers"
@@ -187,7 +255,9 @@ class OCRDeliveryExportTests(unittest.TestCase):
             self.assertFalse((delivery / "images" / "answers" / "P0001" / f"{aid}.jpg").is_file())
 
             database = json.loads((delivery / "database_import.json").read_text(encoding="utf-8"))
-            self.assertEqual(database["questions"], [])
+            self.assertEqual(len(database["questions"]), 1)
+            self.assertEqual(database["questions"][0]["answer_status"], "pending_generation")
+            self.assertEqual(database["questions"][0]["answer_ids"], [])
 
             saved["answer_pages"][0]["status"] = "accepted"
             data.save_project(saved, project_path)
@@ -219,7 +289,9 @@ class OCRDeliveryExportTests(unittest.TestCase):
             )
             self.assertEqual(answer_json["question_ids"], [])
             database = json.loads((delivery / "database_import.json").read_text(encoding="utf-8"))
-            self.assertEqual(database["questions"], [])
+            self.assertEqual(len(database["questions"]), 1)
+            self.assertEqual(database["questions"][0]["answer_status"], "pending_generation")
+            self.assertEqual(database["questions"][0]["answer_ids"], [])
 
     def test_incremental_confirmation_only_creates_the_selected_page_folders(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -307,7 +379,7 @@ class OCRDeliveryExportTests(unittest.TestCase):
                 project_path, root / "runtime", changed_kind="question", changed_page_index=0,
             )
             delivery = Path(first["output_path"])
-            first_image = delivery / "k12_dataset" / "pages" / "P0001" / "images" / "Q001_img_01.jpg"
+            first_image = delivery / "k12_dataset" / "images" / "0000001_img_01.jpg"
             self.assertTrue(first_image.is_file())
 
             project = data.load_project(project_path)
@@ -319,7 +391,7 @@ class OCRDeliveryExportTests(unittest.TestCase):
                 project_path, root / "runtime", changed_kind="question", changed_page_index=1,
             )
 
-            second_image = delivery / "k12_dataset" / "pages" / "P0002" / "images" / "Q001_img_01.jpg"
+            second_image = delivery / "k12_dataset" / "images" / "0000002_img_01.jpg"
             self.assertEqual(second["k12"]["eligible_count"], 2)
             self.assertTrue(first_image.is_file())
             self.assertTrue(second_image.is_file())
@@ -333,7 +405,7 @@ class OCRDeliveryExportTests(unittest.TestCase):
             project_path = root / "project.json"
             data.save_project(project, project_path)
             saved = data.load_project(project_path)
-            delivery = root / "runtime" / "delivery_packages" / saved["delivery_book_id"]
+            delivery = question_root / saved["delivery_book_id"]
             legitimate = delivery / "json" / "questions" / "P0001" / "QSTALE.json"
             legitimate.parent.mkdir(parents=True)
             legitimate.write_text("{}", encoding="utf-8")

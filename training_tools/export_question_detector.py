@@ -33,7 +33,7 @@ def export_detector(weights: str | Path, output: str | Path = DEFAULT_OUTPUT, im
     ))
     target = output_dir / "question_detector.onnx"
     shutil.copy2(exported, target)
-    manifest_path = write_manifest(target, str(weights_path))
+    manifest_path = write_manifest(target, str(weights_path), imgsz=imgsz)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     return {"model": str(target), "manifest": str(manifest_path), **manifest}
 

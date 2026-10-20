@@ -17,10 +17,12 @@ from datetime import datetime
 from pathlib import Path
 
 import cv2
-from PySide6.QtCore import QProcess, Signal, Qt
-from PySide6.QtGui import QAction, QPixmap
+from PySide6.QtCore import QProcess, QRectF, QTimer, Signal, Qt
+from PySide6.QtGui import QAction, QColor, QCursor, QImageReader, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout,
+    QApplication, QComboBox, QFileDialog, QFormLayout, QFrame,
+    QGraphicsItem, QGraphicsPixmapItem, QGraphicsRectItem, QGraphicsScene,
+    QGraphicsSimpleTextItem, QGraphicsView, QHBoxLayout,
     QInputDialog, QLabel, QListWidget, QListWidgetItem, QMainWindow,
     QMessageBox, QPushButton, QLineEdit, QSplitter, QStatusBar, QTabWidget, QToolBar,
     QVBoxLayout, QWidget,
@@ -30,12 +32,261 @@ APP_DIR = Path(__file__).resolve().parents[1]
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
-from cut_questions_gui_qt import APP_STYLE, ReviewBox, ReviewCanvas, configure_cjk_font  # noqa: E402
+from cut_questions_gui_qt import APP_STYLE, configure_cjk_font  # noqa: E402
 from review_tools import manual_annotation_data as data  # noqa: E402
 from review_tools.export_manual_annotations import export_project  # noqa: E402
+import cut_questions_v4 as core  # noqa: E402
 
 
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+
+STATE_FILE = APP_DIR / "runtime" / "annotation_workspace_state.json"
+
+
+def _load_workspace_state() -> dict:
+    try:
+        if STATE_FILE.is_file():
+            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        pass
+    return {}
+
+
+def _save_workspace_state(**values) -> None:
+    try:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        state = _load_workspace_state()
+        state.update(values)
+        STATE_FILE.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+class ReviewBox(QGraphicsRectItem):
+    """A movable detection box in original image coordinates."""
+    def __init__(self, record: dict, color: QColor) -> None:
+        # Stored boxes use xyxy: [left, top, right, bottom].  QRectF expects
+        # xywh, so passing the four values through made every newly drawn box
+        # expand by its own right/bottom coordinates after mouse release.
+        x0, y0, x1, y1 = (float(value) for value in record["box"])
+        super().__init__(QRectF(x0, y0, max(1.0, x1 - x0), max(1.0, y1 - y0)))
+        self.record = record
+        self.setPen(QPen(color, 3))
+        self.setBrush(QColor(color.red(), color.green(), color.blue(), 24))
+        self.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
+        self.setFlag(QGraphicsRectItem.GraphicsItemFlag.ItemIsSelectable, True)
+        self.setFlag(QGraphicsRectItem.GraphicsItemFlag.ItemIsMovable, True)
+        self.setZValue(3)
+        self.label = QGraphicsSimpleTextItem(str(record.get("number") or "?"), self)
+        self.label.setBrush(QColor("#8f3a00"))
+        # The label is a child item: use coordinates relative to this box.
+        # Keeping absolute coordinates doubled the transform work on large scans.
+        self.label.setPos(5, 3)
+        self.label.setZValue(4)
+
+    def current_box(self) -> list[int]:
+        # sceneBoundingRect includes the 3px pen.  Persist the geometry of the
+        # actual rectangle instead, otherwise each save/reopen grows a box.
+        rect = self.mapRectToScene(self.rect())
+        return [round(rect.left()), round(rect.top()), round(rect.right()), round(rect.bottom())]
+
+
+class ReviewCanvas(QGraphicsView):
+    box_drawn = Signal(object)
+    boxes_delete_requested = Signal(object)
+    selection_changed = Signal(object)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.scene_ref = QGraphicsScene(self)
+        self.setScene(self.scene_ref)
+        self.setRenderHints(self.renderHints())
+        self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        self.setBackgroundBrush(QColor("#eef2f6"))
+        self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.BoundingRectViewportUpdate)
+        self.setOptimizationFlag(QGraphicsView.OptimizationFlag.DontAdjustForAntialiasing, True)
+        self.setCacheMode(QGraphicsView.CacheModeFlag.CacheBackground)
+        self.pixmap_item: QGraphicsPixmapItem | None = None
+        self.draw_enabled = False
+        self.delete_enabled = False
+        self.draw_start = None
+        self.draft: QGraphicsRectItem | None = None
+        self.delete_start = None
+        self.delete_draft: QGraphicsRectItem | None = None
+        self.pan_last = None
+        self.pen_cursor = self._create_pen_cursor()
+        self.delete_cursor = self._create_delete_cursor()
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.scene_ref.selectionChanged.connect(self._emit_selection)
+
+    @staticmethod
+    def _create_pen_cursor() -> QCursor:
+        """A compact pen cursor whose hotspot is the nib, not its centre."""
+        pixmap = QPixmap(32, 32)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # The nib is deliberately at upper-left: it is the coordinate used
+        # when the reviewer starts a new rectangle.
+        painter.setPen(QPen(QColor("#19304d"), 6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawLine(24, 25, 8, 9)
+        painter.setPen(QPen(QColor("#00a99d"), 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawLine(23, 24, 10, 11)
+        painter.setPen(QPen(QColor("#1f2933"), 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawLine(9, 10, 4, 5)
+        painter.end()
+        return QCursor(pixmap, 4, 5)
+
+    @staticmethod
+    def _create_delete_cursor() -> QCursor:
+        pixmap = QPixmap(28, 28)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor("#c92a2a"), 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawLine(6, 6, 22, 22)
+        painter.drawLine(22, 6, 6, 22)
+        painter.end()
+        return QCursor(pixmap, 14, 14)
+
+    def set_draw_enabled(self, enabled: bool) -> None:
+        self.draw_enabled = enabled
+        if enabled:
+            self.delete_enabled = False
+        self.setCursor(self.pen_cursor if enabled else (self.delete_cursor if self.delete_enabled else Qt.CursorShape.ArrowCursor))
+
+    def set_delete_enabled(self, enabled: bool) -> None:
+        self.delete_enabled = enabled
+        if enabled:
+            self.draw_enabled = False
+        self.setCursor(self.delete_cursor if enabled else (self.pen_cursor if self.draw_enabled else Qt.CursorShape.ArrowCursor))
+
+    @staticmethod
+    def _review_box_at(item) -> ReviewBox | None:
+        while item is not None:
+            if isinstance(item, ReviewBox):
+                return item
+            item = item.parentItem()
+        return None
+
+    def load_page(self, image_path: str) -> bool:
+        reader = QImageReader(image_path)
+        reader.setAutoTransform(True)
+        image = reader.read()
+        if image.isNull():
+            return False
+        pixmap = QPixmap.fromImage(image)
+        self.scene_ref.clear()
+        self.pixmap_item = self.scene_ref.addPixmap(pixmap)
+        self.pixmap_item.setZValue(0)
+        self.scene_ref.setSceneRect(QRectF(pixmap.rect()))
+        self.resetTransform()
+        self.fitInView(self.scene_ref.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        return True
+
+    def add_box(self, record: dict, color: QColor | None = None) -> ReviewBox:
+        item = ReviewBox(record, color or QColor("#ff7a00"))
+        self.scene_ref.addItem(item)
+        return item
+
+    def boxes(self) -> list[ReviewBox]:
+        return [item for item in self.scene_ref.items() if isinstance(item, ReviewBox)]
+
+    def wheelEvent(self, event):  # noqa: N802
+        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        self.scale(factor, factor)
+
+    def mousePressEvent(self, event):  # noqa: N802
+        if event.button() == Qt.MouseButton.RightButton:
+            self.pan_last = event.position().toPoint()
+            self.setCursor(Qt.CursorShape.SizeAllCursor)
+            event.accept()
+            return
+        if self.delete_enabled and event.button() == Qt.MouseButton.LeftButton:
+            existing = self._review_box_at(self.itemAt(event.position().toPoint()))
+            if existing is not None:
+                self.boxes_delete_requested.emit([existing])
+                event.accept()
+                return
+            self.delete_start = self.mapToScene(event.position().toPoint())
+            self.delete_draft = QGraphicsRectItem(QRectF(self.delete_start, self.delete_start))
+            self.delete_draft.setPen(QPen(QColor("#d63939"), 2, Qt.PenStyle.DashLine))
+            self.delete_draft.setBrush(QColor(214, 57, 57, 35))
+            self.delete_draft.setZValue(7)
+            self.scene_ref.addItem(self.delete_draft)
+            event.accept()
+            return
+        if self.draw_enabled and event.button() == Qt.MouseButton.LeftButton:
+            self.draw_start = self.mapToScene(event.position().toPoint())
+            self.draft = QGraphicsRectItem(QRectF(self.draw_start, self.draw_start))
+            self.draft.setPen(QColor("#00a99d"))
+            self.draft.setBrush(QColor(0, 169, 157, 28))
+            self.draft.setZValue(5)
+            self.scene_ref.addItem(self.draft)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):  # noqa: N802
+        if self.pan_last is not None:
+            point = event.position().toPoint()
+            delta = point - self.pan_last
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+            self.pan_last = point
+            event.accept()
+            return
+        if self.delete_draft is not None and self.delete_start is not None:
+            current = self.mapToScene(event.position().toPoint())
+            self.delete_draft.setRect(QRectF(self.delete_start, current).normalized())
+            event.accept()
+            return
+        if self.draft is not None and self.draw_start is not None:
+            current = self.mapToScene(event.position().toPoint())
+            self.draft.setRect(QRectF(self.draw_start, current).normalized())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):  # noqa: N802
+        if event.button() == Qt.MouseButton.RightButton and self.pan_last is not None:
+            self.pan_last = None
+            self.setCursor(self.pen_cursor if self.draw_enabled else (self.delete_cursor if self.delete_enabled else Qt.CursorShape.ArrowCursor))
+            event.accept()
+            return
+        if self.delete_draft is not None and self.delete_start is not None:
+            rect = self.delete_draft.rect().normalized()
+            self.scene_ref.removeItem(self.delete_draft)
+            self.delete_draft = None
+            self.delete_start = None
+            if rect.width() >= 4 and rect.height() >= 4:
+                # Do this from the actual review boxes instead of relying on
+                # scene item-shape containment (labels are child items, and
+                # that query can miss their parent box after a zoom).
+                selected = [
+                    box for box in self.boxes()
+                    if rect.intersects(box.mapRectToScene(box.rect()))
+                ]
+                if selected:
+                    self.boxes_delete_requested.emit(selected)
+            event.accept()
+            return
+        if self.draft is not None and self.draw_start is not None:
+            rect = self.draft.rect().normalized()
+            self.scene_ref.removeItem(self.draft)
+            self.draft = None
+            self.draw_start = None
+            if rect.width() >= 8 and rect.height() >= 8:
+                self.box_drawn.emit([round(rect.left()), round(rect.top()), round(rect.right()), round(rect.bottom())])
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def _emit_selection(self) -> None:
+        selected = [item for item in self.scene_ref.selectedItems() if isinstance(item, ReviewBox)]
+        self.selection_changed.emit(selected[0] if selected else None)
 
 
 def _manual_prelabel_detector_enabled() -> bool:
@@ -75,7 +326,11 @@ def _shared_instruction_box(block: dict, minors: list[dict]) -> list[int]:
         return [int(value) for value in existing]
     if len(minors) < 2 or block.get("title") == "整页":
         return []
-    ordered = sorted(minors, key=lambda item: item.get("_source_box", [0, 0, 0, 0])[1])
+    # 横排小问的 _source_box 顶边相同，必须再按 x 排，否则"第一题"是随机的。
+    ordered = sorted(minors, key=lambda item: (
+        item.get("_source_box", [0, 0, 0, 0])[1],
+        item.get("_source_box", [0, 0, 0, 0])[0],
+    ))
     first = ordered[0]
     major_box = first.get("_major_box", [])
     anchor_y = int(first.get("_anchor_y", 0) or 0)
@@ -86,8 +341,66 @@ def _shared_instruction_box(block: dict, minors: list[dict]) -> list[int]:
     return [x0, y0, x1, context_y1] if context_y1 > y0 else []
 
 
+_EXPLANATORY_PREAMBLE_KEYWORDS = (
+    "知识点", "概念", "定义", "性质", "公式", "法则", "运算律",
+    "交换律", "结合律", "分配律", "例题", "解法", "方法", "规律",
+)
+
+
+def _trim_explanatory_preamble_from_first_minor(minors: list[dict], ocr_items: list[dict], block_img) -> bool:
+    """Exclude a textbook explanation above the first real exercise number.
+
+    A lesson page can place a full-column knowledge card before a normal
+    numbered exercise.  That card is reference material, not part of question
+    1.  Only trim it when it is both unusually tall and contains multiple
+    explanatory signals; reading passages and short shared instructions remain
+    attached to their first question as before.
+    """
+    if block_img is None or getattr(block_img, "size", 0) == 0 or not minors:
+        return False
+    height = int(block_img.shape[0])
+    numbered = sorted(
+        (minor for minor in minors if minor.get("number_detected", False)),
+        key=lambda minor: int(minor.get("_y_start", 0)),
+    )
+    if not numbered:
+        return False
+    first = numbered[0]
+    old_y0 = max(0, int(first.get("_y_start", 0)))
+    anchor_y = max(0, int(first.get("_anchor_y", 0)))
+    prefix_height = anchor_y - old_y0
+    if old_y0 > 8 or prefix_height < max(220, int(height * 0.32)):
+        return False
+
+    texts = []
+    for item in ocr_items or []:
+        bbox = item.get("bbox") or []
+        if not bbox:
+            continue
+        center_y = (min(point[1] for point in bbox) + max(point[1] for point in bbox)) / 2
+        if center_y < anchor_y - 4:
+            texts.append(re.sub(r"\s+", "", str(item.get("text", ""))))
+    preamble_text = "\n".join(texts)
+    signals = {keyword for keyword in _EXPLANATORY_PREAMBLE_KEYWORDS if keyword in preamble_text}
+    if len(signals) < 2:
+        return False
+
+    new_y0 = min(max(old_y0, anchor_y - 8), max(old_y0, height - 1))
+    old_y1 = min(height, int(first.get("_y_end", height)))
+    if old_y1 <= new_y0:
+        return False
+    first["_y_start"] = new_y0
+    first["crop_img"] = block_img[new_y0:old_y1].copy()
+    first["_explanatory_preamble_removed"] = True
+    first["_boundary_source"] = "ocr_number_after_explanation"
+    return True
+
+
 _SUBSECTION_HEADING = re.compile(
     r"^[（(]([一二三四五六七八九十百千〇零两0-9—–－-]+)([）)]?)(.{1,40})$"
+)
+_KNOWLEDGE_POINT_HEADING = re.compile(
+    r"^知识点([一二三四五六七八九十百千〇零两0-9]+)[、:：．.]?(.*)$"
 )
 
 _SUBSECTION_KEYWORDS = (
@@ -106,6 +419,11 @@ def _normalise_subsection_number(token: str, trailing_text: str) -> str:
     """
     compact = re.sub(r"\s+", "", token)
     heading_like = any(keyword in trailing_text for keyword in _SUBSECTION_KEYWORDS)
+    # ``(-5)表示`` and similar formula fragments are common in mathematics
+    # OCR.  They are never printed group headings, even when OCR retains both
+    # parentheses, and must not become a negative major number.
+    if compact[:1] in "—–－-" and any(character.isdigit() for character in compact[1:]):
+        return ""
     if compact and all(char in "—–－-" for char in compact):
         return "一" if heading_like else ""
     if compact.isdigit():
@@ -121,21 +439,28 @@ def _ocr_item_xy(item: dict) -> tuple[int, int]:
 
 
 def _subsection_boundaries(ocr_items: list[dict], crop_width: int) -> list[dict]:
-    """Find printed Chinese group headings such as （一）课内阅读."""
+    """Find printed group headings, including ``知识点一/二`` textbook sections."""
     result = []
     for item in ocr_items:
         text = re.sub(r"\s+", "", str(item.get("text", "")))
         match = _SUBSECTION_HEADING.match(text)
-        if not match:
-            continue
-        trailing_text = match.group(3)
-        number = _normalise_subsection_number(match.group(1), trailing_text)
-        if not number:
-            continue
-        # Missing closing parentheses are accepted only for recognisable group
-        # headings.  This handles damaged scans without treating (1) subparts
-        # as peer exercise groups.
-        if not match.group(2) and not any(keyword in trailing_text for keyword in _SUBSECTION_KEYWORDS):
+        knowledge_match = _KNOWLEDGE_POINT_HEADING.match(text) if not match else None
+        starts_segment = False
+        if match:
+            trailing_text = match.group(3)
+            number = _normalise_subsection_number(match.group(1), trailing_text)
+            if not number:
+                continue
+            # Missing closing parentheses are accepted only for recognisable group
+            # headings.  This handles damaged scans without treating (1) subparts
+            # as peer exercise groups.
+            if not match.group(2) and not any(keyword in trailing_text for keyword in _SUBSECTION_KEYWORDS):
+                continue
+        elif knowledge_match:
+            number = data.int_to_chinese(knowledge_match.group(1))
+            trailing_text = knowledge_match.group(2)
+            starts_segment = True
+        else:
             continue
         x, y = _ocr_item_xy(item)
         if x > max(120, int(crop_width * 0.35)):
@@ -144,7 +469,8 @@ def _subsection_boundaries(ocr_items: list[dict], crop_width: int) -> list[dict]
             "y": y,
             "number": number,
             "title": text,
-            "number_repaired": number != match.group(1),
+            "number_repaired": bool(match and number != match.group(1)),
+            "starts_segment": starts_segment,
         })
     result.sort(key=lambda value: value["y"])
     return result
@@ -182,6 +508,16 @@ def _subsection_segments(
     recover_first_group = bool(
         first_value == 2 and prefix_anchors and int(prefix_anchors[0].get("num", 0)) == 1
     )
+    # A later knowledge-point heading begins a new group.  Preserve a genuine
+    # numbered prefix as the prior active group, but do not turn unnumbered
+    # lesson explanation above the first ``知识点一`` into a question.
+    if first.get("starts_segment") and int(first["y"]) > 0 and active_number and not recover_first_group:
+        segments.append({
+            "y0": 0, "y1": int(first["y"]),
+            "subsection_title": active_title,
+            "subsection_number": active_number,
+            "subsection_number_inferred": False,
+        })
     if recover_first_group:
         segments.append({
             "y0": 0, "y1": int(first["y"]),
@@ -192,7 +528,9 @@ def _subsection_segments(
 
     for index, mark in enumerate(marks):
         segments.append({
-            "y0": int(mark["y"]) if (index > 0 or recover_first_group) else 0,
+            "y0": int(mark["y"]) if (
+                index > 0 or recover_first_group or mark.get("starts_segment")
+            ) else 0,
             "y1": int(marks[index + 1]["y"]) if index + 1 < len(marks) else crop_height,
             "subsection_title": mark["title"],
             "subsection_number": mark["number"],
@@ -276,6 +614,16 @@ def _record_from_minor(
     )
 
 
+def _knowledge_point_group(title: str) -> dict | None:
+    match = _KNOWLEDGE_POINT_HEADING.match(re.sub(r"\s+", "", str(title or "")))
+    if not match:
+        return None
+    return {
+        "title": str(title or "").strip(),
+        "number": data.int_to_chinese(match.group(1)),
+    }
+
+
 def _previous_question_context(previous_question: dict | None) -> dict:
     if not isinstance(previous_question, dict):
         return {}
@@ -294,7 +642,7 @@ def _previous_question_context(previous_question: dict | None) -> dict:
 
 def _question_suggestions(
     image_path: str, profile: str, *, page_index: int = -1,
-    previous_question: dict | None = None,
+    previous_question: dict | None = None, force_refresh: bool = False,
 ) -> list[dict]:
     """Reuse the existing rule cutter for one page only (no book-level scan)."""
     import cut_questions_v4 as cutter
@@ -303,7 +651,9 @@ def _question_suggestions(
     if image is None:
         raise ValueError("无法读取图片")
     detector_boxes = _optional_question_detections(cutter, image)
-    ocr_items = cutter.ocr_page_structure(image_path, image, profile=profile)
+    ocr_items = cutter.ocr_page_structure(
+        image_path, image, profile=profile, force_refresh=force_refresh,
+    )
     blocks = cutter.split_page_into_majors(image, ocr_items, profile=profile)
     sidebar_exclusions = cutter.detect_page_sidebar_exclusions(
         image, blocks, ocr_items=ocr_items,
@@ -322,6 +672,30 @@ def _question_suggestions(
         printed_major = data.extract_major_number(
             title, block_index if isinstance(block_index, int) and 0 < block_index < 100 else "",
         ) if title != "整页" else ""
+        # ``知识点一/二`` is an explicit fresh grouping printed on this page.
+        # It must win over the previous-page state: otherwise an untitled
+        # first column silently keeps the prior major (for example ``14``),
+        # producing misleading paths such as ``14-1-1``.  It is also never a
+        # continuation even if OCR fails to recover the first question number.
+        # Once this page has emitted a question, a later knowledge-point mark
+        # belongs *inside* the same reading flow: retain the prefix above it
+        # (for example questions 16/17 in the right column) and let the mark
+        # start the next group below.
+        starts_new_knowledge_point = bool(
+            title == "整页" and not printed_major and not records and any(
+                mark.get("starts_segment")
+                for mark in _subsection_boundaries(
+                    local_items, block["crop_img"].shape[1],
+                )
+            )
+        )
+        if starts_new_knowledge_point:
+            active = {
+                "major_title": "", "major_number": "",
+                "subsection_title": "", "subsection_number": "", "minor_number": "",
+            }
+            pending_shared_segments = []
+            pending_parent_id = ""
 
         # A leading untitled block belongs to the previous page until the first
         # strong printed question number.  Preserve the prefix as a linked
@@ -332,6 +706,11 @@ def _question_suggestions(
             leading_anchors = _primary_number_boundaries(cutter, local_items, width, height)
         if (
             title == "整页" and not printed_major and block.get("_col") != "right" and previous
+            and not starts_new_knowledge_point
+            # A page may be split into several visual columns.  Only its first
+            # emitted block can possibly continue the previous page; treating
+            # column two as a new page was what turned ``1-5`` into ``14-5``.
+            and not records
             and (not leading_anchors or leading_anchors[0]["num"] > 1)
         ):
             height, width = block["crop_img"].shape[:2]
@@ -387,9 +766,10 @@ def _question_suggestions(
             }
             pending_shared_segments = []
             pending_parent_id = ""
-        elif title == "整页" and active and (
-            block.get("_col") != "right" or pending_shared_segments
-        ):
+        elif title == "整页" and active:
+            # Keep the current page's heading/group state across its verified
+            # columns.  A right-hand column is often the final questions of
+            # ``知识点一`` immediately followed by a ``知识点二`` heading.
             title = active.get("major_title", "")
             printed_major = active.get("major_number", "")
         elif title == "整页":
@@ -409,8 +789,15 @@ def _question_suggestions(
             subsection_title = segment["subsection_title"]
             subsection_number = segment["subsection_number"]
             if subsection_number:
-                active["subsection_title"] = subsection_title
-                active["subsection_number"] = subsection_number
+                knowledge_group = _knowledge_point_group(subsection_title)
+                if knowledge_group:
+                    active["major_title"] = knowledge_group["title"]
+                    active["major_number"] = knowledge_group["number"]
+                    active["subsection_title"] = ""
+                    active["subsection_number"] = ""
+                else:
+                    active["subsection_title"] = subsection_title
+                    active["subsection_number"] = subsection_number
                 active["minor_number"] = ""
             segment_block = dict(block)
             segment_block["title"] = title
@@ -420,12 +807,20 @@ def _question_suggestions(
             minors = cutter.split_major_into_minors(
                 segment_block["crop_img"], segment_items or None, profile=profile,
             )
+            _trim_explanatory_preamble_from_first_minor(
+                minors, segment_items, segment_block["crop_img"],
+            )
             cutter.attach_question_source_metadata(
                 minors, segment_block, image_path, (image.shape[1], image.shape[0]),
             )
             cutter.trim_cuts_to_page_sidebar_exclusions(minors, image, sidebar_exclusions)
             cutter.trim_cuts_to_detached_page_footer(minors, image)
             minors = _refine_manual_prelabel_minors(cutter, minors, image, detector_boxes)
+            # Model-assisted refinement is optional, but when enabled it must
+            # never enlarge a question over a verified three/four-column gutter.
+            cutter.trim_cuts_to_column_bounds(
+                minors, image, segment_block.get("_column_bounds"),
+            )
 
             has_later_right_continuation = bool(
                 block.get("_col") == "left" and segment_position == len(segments) - 1 and
@@ -486,10 +881,12 @@ def _question_suggestions(
     return records
 
 
-def _answer_suggestions(image_path: str, profile: str) -> list[dict]:
+def _answer_suggestions(image_path: str, profile: str, *, force_refresh: bool = False) -> list[dict]:
     import cut_questions_v4 as cutter
 
-    records = cutter.process_answer_pages([image_path], profile=profile)
+    records = cutter.process_answer_pages(
+        [image_path], profile=profile, force_refresh=force_refresh,
+    )
     answers = []
     for record in records:
         box = record.get("source_box", [])
@@ -822,17 +1219,47 @@ class ManualAnnotationWindow(QMainWindow):
 
     def page_list(self, answer: bool) -> list[dict]: return self.project.get("answer_pages" if answer else "pages", []) if self.project else []
     def project_changed(self) -> None: self.status.showMessage("本页标注已变更，点击“确认本页标注”或“保存”写入项目文件。")
-    def open_book(self) -> None:
-        book_root = QFileDialog.getExistingDirectory(self, "选择一本教材的根目录")
+    def _seed_book_profile(self, book_root: str) -> bool:
+        """给还没有版式的项目补一个初值，和界面（桥服务）保持同一口径。
+
+        只读书名和已落盘的抽样结论，不触发 OCR；工作台第一次打开一本书时
+        就把版式写进去，后续切题不再每页重猜。
+        """
+        if str(self.project.get("profile") or "") in core.BOOK_PROFILE_CHOICES:
+            return False
+        profile, source, reason = core.auto_book_profile(book_root)
+        self.project["profile"] = profile
+        self.project["profile_source"] = source
+        self.project["profile_reason"] = reason
+        data.sync_page_profiles(self.project, profile)
+        return True
+    def open_book(self, book_root: str | None = None) -> None:
+        if not book_root:
+            book_root = QFileDialog.getExistingDirectory(self, "选择一本教材的根目录")
         if not book_root: return
         project_path = data.default_book_project_path(book_root, APP_DIR / "runtime")
         try:
             self.project = data.load_project(project_path) if project_path.is_file() else data.create_book_project(book_root)
             self.project_path = str(project_path)
-            if not project_path.is_file(): self.save()
+            if self._seed_book_profile(book_root) or not project_path.is_file(): self.save()
+            _save_workspace_state(last_book_root=str(book_root))
             self.refresh_all()
         except Exception as exc:
             QMessageBox.critical(self, "无法打开教材", str(exc))
+    def auto_restore_last_book(self) -> None:
+        """Reopen the previously used book after a restart, without dialogs."""
+        book_root = str(_load_workspace_state().get("last_book_root", "") or "")
+        if not book_root or not Path(book_root).is_dir():
+            return
+        project_path = data.default_book_project_path(book_root, APP_DIR / "runtime")
+        try:
+            self.project = data.load_project(project_path) if project_path.is_file() else data.create_book_project(book_root)
+            self.project_path = str(project_path)
+            if self._seed_book_profile(book_root) or not project_path.is_file(): self.save()
+            self.refresh_all()
+            self.status.showMessage(f"已自动打开上次教材：{book_root}")
+        except Exception:
+            pass
     def new_project(self) -> None:
         question_root = QFileDialog.getExistingDirectory(self, "选择题目图片目录")
         if not question_root: return
@@ -905,7 +1332,9 @@ class ManualAnnotationWindow(QMainWindow):
 
 def main() -> int:
     app = QApplication(sys.argv); configure_cjk_font(app); app.setStyleSheet(APP_STYLE)
-    window = ManualAnnotationWindow(); window.show(); return app.exec()
+    window = ManualAnnotationWindow(); window.show()
+    QTimer.singleShot(0, window.auto_restore_last_book)
+    return app.exec()
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 from pathlib import Path
+import subprocess
 import unittest
 
 
@@ -40,6 +41,27 @@ class EmployeeWorkbenchInteractionTests(unittest.TestCase):
         self.assertIn("attributes.paperflowContinuationOf = clipboard.sourceId;", paste)
         self.assertIn("this.resetCopiedPaperFlowContent(attributes);", paste)
         self.assertIn("this.createAnnotation(clipboard.type", paste)
+
+    def test_right_button_pan_does_not_open_the_annotation_copy_menu(self):
+        source = (APP_JS / "annotation-manager.js").read_text(encoding="utf-8")
+        image_manager = (APP_JS / "image-manager.js").read_text(encoding="utf-8")
+        context_start = source.index("    onContextMenu(event) {")
+        context_end = source.index("    openAnnotationContextMenu", context_start)
+        context = source[context_start:context_end]
+        mouse_down_start = source.index("    onMouseDown(e) {")
+        mouse_down_end = source.index("    onMouseMove(e) {", mouse_down_start)
+        mouse_down = source[mouse_down_start:mouse_down_end]
+        self.assertIn("this.rightPointerGesture", source)
+        self.assertIn("const wasRightDrag = Boolean(this.rightPointerGesture?.moved);", context)
+        self.assertIn("if (wasRightDrag)", context)
+        self.assertIn("e.button === 2", mouse_down)
+        self.assertIn("Math.hypot(deltaX, deltaY) >= 50", source)
+        self.assertIn("this.rightPanGesture", image_manager)
+        self.assertIn("this.rightPanThreshold = 50", image_manager)
+        self.assertIn("distance >= this.rightPanThreshold", image_manager)
+        self.assertIn("this.rightPanGesture.active = true;", image_manager)
+        self.assertNotIn("document.addEventListener('scroll', () => this.closeAnnotationContextMenu(), true);", source)
+        self.assertIn("event.button === 0", source)
 
     def test_canvas_copy_can_paste_the_next_hierarchy_number_without_parentheses(self):
         annotation_manager = (APP_JS / "annotation-manager.js").read_text(encoding="utf-8")
@@ -111,15 +133,18 @@ class EmployeeWorkbenchInteractionTests(unittest.TestCase):
         self.assertIn("container.scrollTo({ left: targetLeft, top: targetTop, behavior: 'smooth' });", image_manager)
         self.assertIn("this.employeeWorkbench?.updateSelection(annotation);", main)
 
-    def test_deleting_the_selected_frame_requires_the_requested_confirmation(self):
+    def test_top_bar_delete_skips_confirmation_but_other_delete_paths_keep_it(self):
         source = (APP_JS / "ui-manager.js").read_text(encoding="utf-8")
-        start = source.index("    deleteAnnotation() {")
+        start = source.index("    deleteAnnotation(requireConfirmation = true) {")
         end = source.index("    /**", start + 5)
         method = source[start:end]
+        workbench = (APP_JS / "employee-workbench.js").read_text(encoding="utf-8")
 
+        self.assertIn("if (requireConfirmation)", method)
         self.assertIn("Utils.showConfirm(", method)
         self.assertIn("'确定要删除这个框吗？'", method)
         self.assertIn("annotationDelete", method)
+        self.assertIn("this.tool.uiManager.deleteAnnotation(false);", workbench)
 
     def test_workspace_has_a_non_broken_empty_image_state(self):
         html = (APP_JS.parent / "index.html").read_text(encoding="utf-8")
@@ -210,12 +235,16 @@ class EmployeeWorkbenchInteractionTests(unittest.TestCase):
         self.assertIn("async editPaperFlowBookMetadata()", main_source)
 
     def test_book_metadata_button_is_next_to_open_book(self):
+        # 「教材信息」现在收在「教材设置」下拉里，与「打开教材」同属教材组，
+        # 但仍在第一个操作组内，不会跑到页面工具或交付组里去。
         html = (APP_JS.parent / "index.html").read_text(encoding="utf-8")
         open_button = html.index('id="openWorkspace"')
         metadata_button = html.index('id="editBookMetadata"')
-        draw_tools = html.index('class="employee-draw-tools"')
+        draw_button = html.index('id="generatePrelabels"')
         self.assertLess(open_button, metadata_button)
-        self.assertLess(metadata_button, draw_tools)
+        self.assertLess(metadata_button, draw_button)
+        book_group = html.index('class="pf-action-group" aria-label="教材"')
+        self.assertLess(book_group, metadata_button)
 
     def test_help_menu_opens_the_complete_operation_guide(self):
         html = (APP_JS.parent / "index.html").read_text(encoding="utf-8")
@@ -223,7 +252,7 @@ class EmployeeWorkbenchInteractionTests(unittest.TestCase):
         electron = (APP_JS.parent / "electron" / "main.js").read_text(encoding="utf-8")
         preload = (APP_JS.parent / "electron" / "preload.js").read_text(encoding="utf-8")
 
-        self.assertIn("设置教材信息", html)
+        self.assertIn("教材信息", html)
         self.assertIn("label: '操作说明'", electron)
         self.assertIn("menu-show-operation-help", electron)
         self.assertIn("onMenuShowOperationHelp", preload)
@@ -231,12 +260,15 @@ class EmployeeWorkbenchInteractionTests(unittest.TestCase):
         for section in ["题目页切分与复核", "答案页切分", "续框、旋转与页面分类", "保存、匹配和生成"]:
             self.assertIn(section, main)
 
-    def test_question_options_are_only_visible_for_multiple_choice(self):
+    def test_question_options_are_derived_only_during_formal_export(self):
         source = (APP_JS / "ui-manager.js").read_text(encoding="utf-8")
-        self.assertIn('id="questionOptionsField"', source)
-        self.assertIn("questionType === '选择题' ? '' : 'display:none'", source)
-        self.assertIn("this.updateQuestionTypeFields(input.value);", source)
-        self.assertIn("questionType === '选择题' ? '' : 'none'", source)
+        main = (APP_JS / "main.js").read_text(encoding="utf-8")
+        delivery = (ROOT / "review_tools" / "delivery_workspace.py").read_text(encoding="utf-8")
+        self.assertNotIn('id="questionOptionsField"', source)
+        self.assertNotIn('id="editOptionsText"', source)
+        self.assertNotIn("extractPaperFlowOptions", main)
+        self.assertIn("options: []", main)
+        self.assertIn("def _split_ocr_choices", delivery)
 
     def test_print_handwriting_attribute_is_removed_globally(self):
         targets = [
@@ -308,8 +340,25 @@ class EmployeeWorkbenchInteractionTests(unittest.TestCase):
     def test_file_menu_can_show_current_delivery_location(self):
         electron = (APP_JS.parent / "electron" / "main.js").read_text(encoding="utf-8")
         source = (APP_JS / "main.js").read_text(encoding="utf-8")
-        self.assertIn("查看当前交付输出位置", electron)
+        self.assertIn("查看当前输出位置", electron)
         self.assertIn("/api/project/delivery-location", source)
+
+    def test_native_menus_only_keep_staff_workflow_actions(self):
+        electron = (APP_JS.parent / "electron" / "main.js").read_text(encoding="utf-8")
+        preload = (APP_JS.parent / "electron" / "preload.js").read_text(encoding="utf-8")
+        main = (APP_JS / "main.js").read_text(encoding="utf-8")
+        self.assertIn("label: '打开教材…'", electron)
+        self.assertIn("label: '生成交付文件'", electron)
+        self.assertIn("label: '页面'", electron)
+        self.assertIn("还原当前页大小和位置", electron)
+        self.assertNotIn("label: '编辑'", electron)
+        self.assertNotIn("label: '工具'", electron)
+        for role in ("role: 'undo'", "role: 'redo'", "role: 'cut'", "role: 'copy'", "role: 'paste'", "role: 'selectall'", "role: 'zoomIn'", "role: 'zoomOut'", "role: 'resetZoom'"):
+            self.assertNotIn(role, electron)
+        self.assertNotIn("打开题库管理", electron)
+        self.assertIn("onMenuResetPageZoom", preload)
+        self.assertIn("onMenuResetPageZoom?.(() =>", main)
+        self.assertIn("this.imageManager.resetZoom();", main)
 
     def test_answer_workflow_has_page_classification_and_dedicated_fields(self):
         html = (APP_JS.parent / "index.html").read_text(encoding="utf-8")
@@ -326,7 +375,7 @@ class EmployeeWorkbenchInteractionTests(unittest.TestCase):
         end = ui.index("setupAutoSaveListeners(annotation)", start)
         method = ui[start:end]
 
-        self.assertIn("${isPaperFlow && !isPaperFlowAnswer ?", method)
+        self.assertNotIn("<label>栏目标题：</label>", method)
         self.assertIn("${isPaperFlowAnswer ? `\n                    <div class=\"form-group\">", method)
         self.assertIn("${!isPaperFlowAnswer && currentMaterialType === 'answer' ?", method)
         self.assertLess(method.index("'答案页 OCR 原文'"), method.index("${!isPaperFlowAnswer ? `<div class=\"form-group\">"))
@@ -355,6 +404,15 @@ class EmployeeWorkbenchInteractionTests(unittest.TestCase):
         self.assertIn("this.setRestorePageZoomButtonVisible(true);", main)
         self.assertIn("this.imageManager.resetZoom();", main)
         self.assertIn("setRestorePageZoomButtonVisible(visible)", main)
+
+    def test_simple_middle_click_restores_zoom_while_middle_drag_keeps_panning(self):
+        image_manager = (APP_JS / "image-manager.js").read_text(encoding="utf-8")
+        self.assertIn("this.middlePointerGesture", image_manager)
+        self.assertIn("e.button === 1", image_manager)
+        self.assertIn("Math.hypot(", image_manager)
+        self.assertIn("if (distance >= 6) this.middlePointerGesture.moved = true;", image_manager)
+        self.assertIn("if (middleClick && this.zoomLevel !== 1) this.resetZoom();", image_manager)
+        self.assertIn("this.canvasElement.addEventListener('auxclick'", image_manager)
 
     def test_reset_zoom_applies_final_view_before_annotation_redraw(self):
         image_manager = (APP_JS / "image-manager.js").read_text(encoding="utf-8")
@@ -394,6 +452,13 @@ class EmployeeWorkbenchInteractionTests(unittest.TestCase):
         self.assertIn("async loadImageObjects(imageObjects, initialIndex = 0)", image_manager)
         self.assertIn("[hidden] { display: none !important; }", workbench_css)
 
+    def test_page_category_apply_runs_without_a_second_confirmation(self):
+        source = (APP_JS / "main.js").read_text(encoding="utf-8")
+        start = source.index("body.querySelector('#pfMovePages')?.addEventListener")
+        apply_handler = source[start:start + 2200]
+        self.assertNotIn("window.confirm", apply_handler)
+        self.assertIn("/api/project/reclassify-pages", apply_handler)
+
     def test_matching_modal_has_reliable_exit_controls(self):
         source = (APP_JS / "main.js").read_text(encoding="utf-8")
         self.assertIn('id="pfCloseMatching"', source)
@@ -429,14 +494,293 @@ class EmployeeWorkbenchInteractionTests(unittest.TestCase):
     def test_answer_ocr_is_conservatively_split_without_overwriting_reviewed_text(self):
         source = (APP_JS / "main.js").read_text(encoding="utf-8")
         self.assertIn("splitPaperFlowAnswerText(value)", source)
-        self.assertIn("parts.status", source)
-        self.assertIn("if (!String(annotation.attributes.answerText || '').trim()", source)
-        self.assertIn("paperflowAnswerSplitStatus", source)
+        self.assertIn("parts.answer", source)
+        self.assertIn("parts.answer", source)
+        self.assertIn("paperflowText", source)
+
+    def test_ocr_migration_clears_legacy_local_default_but_preserves_new_user_choices(self):
+        workbench = (APP_JS / "employee-workbench.js").read_text(encoding="utf-8")
+        self.assertIn("cloud-fast-v4", workbench)
+        self.assertIn("paperflowOcrModelUserSelected", workbench)
+        self.assertIn("? saved\n            : 'qwen3-vl-plus'", workbench)
+
+    def test_ocr_model_selectors_only_offer_cloud_models_and_one_local_emergency_fallback(self):
+        service = (APP_JS / "ocr-service.js").read_text(encoding="utf-8")
+        settings = (APP_JS / "ui-manager.js").read_text(encoding="utf-8")
+        for source in (service, settings):
+            self.assertIn("qwen3-vl-plus", source)
+            self.assertIn("local-rapidocr", source)
+            self.assertNotIn("local-pix2text", source)
+            self.assertNotIn("doubao-seed", source)
+            # 2026-10-19：qwen3-vl-flash 在当前账号已下线，调用返回 404
+            # model_not_found。默认模型改为已验证可用的 qwen3-vl-plus，
+            # 不再把失效模型名放进选择器。
+            self.assertNotIn("qwen3-vl-flash", source)
+
+    def test_preview_uses_the_offline_wysiwyg_formula_renderer(self):
+        renderer = (APP_JS / "latex-renderer.js").read_text(encoding="utf-8")
+        css = (APP_JS.parent / "css" / "components.css").read_text(encoding="utf-8")
+        main = (APP_JS / "main.js").read_text(encoding="utf-8")
+        workbench = (APP_JS / "employee-workbench.js").read_text(encoding="utf-8")
+        self.assertIn("this.renderWysiwyg(safeContent, container);", renderer)
+        self.assertIn("command === 'frac'", renderer)
+        self.assertIn("command === 'sqrt'", renderer)
+        self.assertIn("paperflow-fraction", css)
+        self.assertIn("paperflow-radicand", css)
+        self.assertIn("this.showRenderedOcrPreview();", main)
+        self.assertNotIn('data-ocr-summary=', workbench)
+        self.assertNotIn("window.latexRenderer.render(text, summary)", workbench)
+        preview_start = main.index("showRenderedOcrPreview() {")
+        preview_end = main.index("    /**", preview_start + 20)
+        preview_method = main[preview_start:preview_end]
+        self.assertIn("header.textContent = '识别结果（可直接修改）'", preview_method)
+        self.assertNotIn("editor-buttons')?.replaceChildren", preview_method)
+        self.assertIn("this.uiManager.enableRenderedOcrEditing(preview, textarea);", preview_method)
+        self.assertIn("textarea.style.display = 'none'", preview_method)
+        self.assertNotIn("编辑源码", preview_method)
+
+    def test_formula_conversion_failure_is_visible_and_ocr_source_remains_editable(self):
+        renderer = (APP_JS / "latex-renderer.js").read_text(encoding="utf-8")
+        ui = (APP_JS / "ui-manager.js").read_text(encoding="utf-8")
+        css = (APP_JS.parent / "css" / "components.css").read_text(encoding="utf-8")
+        self.assertIn("validateFormula(source)", renderer)
+        self.assertIn("appendFailure(parent, rawSource, reason)", renderer)
+        self.assertIn("paperflow-math-conversion-failed", renderer)
+        self.assertIn("ocr-formula-conversion-notice", ui)
+        self.assertIn("原字符已标红", ui)
+        self.assertIn(".paperflow-math-conversion-failed", css)
+
+    def test_converted_ocr_result_is_editable_and_raw_source_is_explicitly_toggled(self):
+        ui = (APP_JS / "ui-manager.js").read_text(encoding="utf-8")
+        renderer = (APP_JS / "latex-renderer.js").read_text(encoding="utf-8")
+        self.assertIn("toggleOcrRawSource(event)", ui)
+        self.assertIn("查看原文", ui)
+        self.assertIn("serializeRenderedOcrPreview(previewContent)", ui)
+        self.assertIn("previewContent.contentEditable = 'true'", ui)
+        self.assertIn("formula.dataset.rawSource", renderer)
+        self.assertIn("formula.dataset.renderedText", renderer)
+
+    def test_rendered_ocr_keeps_toolbar_tools_and_switches_to_source_safely(self):
+        main = (APP_JS / "main.js").read_text(encoding="utf-8")
+        ui = (APP_JS / "ui-manager.js").read_text(encoding="utf-8")
+        css = (APP_JS.parent / "css" / "employee-workbench.css").read_text(encoding="utf-8")
+        self.assertNotIn("ocr-final-result-toolbar .editor-buttons { display: none; }", css)
+        self.assertIn("white-space: nowrap", css)
+        self.assertNotIn("toolbar.querySelector('.editor-buttons')?.replaceChildren()", main)
+        self.assertIn("prepareOcrSourceForToolbar(textareaId)", ui)
+        self.assertIn("已切换到 OCR 原文编辑", ui)
+        self.assertIn("if (this.prepareOcrSourceForToolbar(textareaId)) return;", ui)
+
+    def test_ocr_toolbar_tools_are_left_aligned_and_collapsed_until_requested(self):
+        ui = (APP_JS / "ui-manager.js").read_text(encoding="utf-8")
+        css = (APP_JS.parent / "css" / "employee-workbench.css").read_text(encoding="utf-8")
+        self.assertIn('class="editor-inline-tools"', ui)
+        self.assertIn("toggleOcrToolbarTools(event)", ui)
+        self.assertIn("编辑工具", ui)
+        self.assertIn("ocr-editor-toolbar .editor-buttons { display: none", css)
+        self.assertIn("ocr-editor-toolbar.show-editor-tools .editor-buttons { display: flex", css)
+        self.assertIn("ocr-editor-toolbar { justify-content: flex-start", css)
+
+    def test_page_ocr_button_sits_beside_the_model_and_not_in_the_top_toolbar(self):
+        html = (APP_JS.parent / "index.html").read_text(encoding="utf-8")
+        css = (APP_JS.parent / "css" / "employee-workbench.css").read_text(encoding="utf-8")
+        electron = (APP_JS.parent / "electron" / "main.js").read_text(encoding="utf-8")
+        preload = (APP_JS.parent / "electron" / "preload.js").read_text(encoding="utf-8")
+        main = (APP_JS / "main.js").read_text(encoding="utf-8")
+        ocr_button = html.index('id="pageOcr"')
+        model_control = html.index('class="employee-ocr-control"')
+        top_toolbar_end = html.index('<div class="toolbar-center">')
+        self.assertGreater(ocr_button, model_control)
+        self.assertGreater(ocr_button, top_toolbar_end)
+        self.assertIn("grid-template-columns: auto auto minmax(96px,1fr)", css)
+        self.assertIn(".employee-page-ocr { grid-row: 1;", css)
+        self.assertNotIn('id="showSettings"', html)
+        self.assertIn("label: '通用设置'", electron)
+        self.assertIn("onMenuShowOcrSettings", preload)
+        self.assertIn("onMenuShowOcrSettings?.(() => this.uiManager?.showSettings())", main)
+
+    def test_auto_page_ocr_setting_is_visible_by_default_and_runs_after_confirmation(self):
+        html = (APP_JS.parent / "index.html").read_text(encoding="utf-8")
+        main = (APP_JS / "main.js").read_text(encoding="utf-8")
+        self.assertIn('id="settingsAutoPageOcrOnConfirm" checked', html)
+        self.assertIn("autoPageOcrOnConfirm: autoPageOcrOnConfirm", html)
+        self.assertIn("paperFlowAutoPageOcrOnConfirm()", main)
+        self.assertIn("await this.recognizeCurrentPage({autoAfterConfirm: true});", main)
+        self.assertIn("/api/project/set-ocr-settings", main)
+
+    def test_page_ocr_uses_bounded_cloud_parallelism_and_smaller_jpeg_uploads(self):
+        main = (APP_JS / "main.js").read_text(encoding="utf-8")
+        service = (APP_JS / "ocr-service.js").read_text(encoding="utf-8")
+        self.assertIn("const concurrency = provider === 'qwen' ? 2 : 1;", main)
+        self.assertIn("Promise.all(Array.from({ length: Math.min(concurrency, targets.length) }, worker))", main)
+        self.assertIn("toDataURL('image/jpeg', this.imageConfig.jpegQuality)", service)
+        self.assertIn("toImageDataUrl(base64Image)", service)
+
+    def test_question_image_marking_is_contextual_and_option_images_are_not_manual(self):
+        html = (APP_JS.parent / "index.html").read_text(encoding="utf-8")
+        workbench = (APP_JS / "employee-workbench.js").read_text(encoding="utf-8")
+        manager = (APP_JS / "annotation-manager.js").read_text(encoding="utf-8")
+        main = (APP_JS / "main.js").read_text(encoding="utf-8")
+        ui = (APP_JS / "ui-manager.js").read_text(encoding="utf-8")
+        self.assertNotIn('id="employeeDrawQuestionImage"', html)
+        self.assertNotIn('id="employeeDrawOptionImage"', html)
+        self.assertIn('id="drawPaperFlowQuestionImage"', ui)
+        self.assertIn("setupPaperFlowQuestionImageControl(annotation)", ui)
+        self.assertIn("startQuestionImageDrawing(annotation.id)", ui)
+        self.assertIn("if (checkbox.checked) workbench?.startQuestionImageDrawing(annotation.id);", ui)
+        self.assertIn("employeeWorkbench?.toggleQuestionImageDrawing(annotation.id);", ui)
+        self.assertIn("startQuestionImageDrawing(questionId)", workbench)
+        self.assertIn("toggleQuestionImageDrawing(questionId)", workbench)
+        self.assertIn("stopQuestionImageDrawing(questionId = '')", workbench)
+        self.assertIn("button.textContent = active ? '标注题图中' : '标注题图';", workbench)
+        self.assertIn("finishQuestionImageDrawing(annotation.parentId)", main)
+        self.assertNotIn("toggleImageDrawing(", workbench)
+        self.assertIn("this.selectedAnnotation?.type === 'main-question'", manager)
+        self.assertIn("annotation.attributes.imageKind = 'question_image';", main)
+
+    def test_marked_question_images_are_shown_between_image_switch_and_continuation(self):
+        ui = (APP_JS / "ui-manager.js").read_text(encoding="utf-8")
+        css = (APP_JS.parent / "css" / "employee-workbench.css").read_text(encoding="utf-8")
+        image_switch = ui.index('id="editHasImage"')
+        preview = ui.index('${questionImagePreview}', image_switch)
+        continuation = ui.index('id="editPaperflowContinuationOf"')
+        self.assertGreater(preview, image_switch)
+        self.assertLess(preview, continuation)
+        self.assertIn('data-question-image-preview=', ui)
+        self.assertIn('data-question-image-delete=', ui)
+        self.assertIn("renderPaperFlowCrop?.(canvas, sourcePath", ui)
+        self.assertIn("deletePaperFlowQuestionImage(questionId, imageId)", ui)
+        self.assertIn("manager.deleteAnnotation(image.id);", ui)
+        self.assertIn(".paperflow-question-image-list", css)
+        self.assertIn(".btn-compact.is-drawing", css)
+
+    def test_column_title_is_not_a_staff_editable_or_customer_delivery_field(self):
+        ui = (APP_JS / "ui-manager.js").read_text(encoding="utf-8")
+        delivery = (ROOT / "review_tools" / "delivery_workspace.py").read_text(encoding="utf-8")
+        editor = ui[ui.index("updateSelectedAnnotationInfo(annotation)"):ui.index("setupAutoSaveListeners(annotation)")]
+        self.assertNotIn('<label>栏目标题：</label>', editor)
+        self.assertNotIn('id="editPaperflowMajor"', editor)
+        self.assertNotIn('"major_title"', delivery[delivery.index('"metainfo": {'):delivery.index('"source": {')])
+
+    def test_clicking_a_figure_opens_its_parent_question_card(self):
+        main = (APP_JS / "main.js").read_text(encoding="utf-8")
+        start = main.index("    onAnnotationSelect(annotation) {")
+        end = main.index("    /**", start + 20)
+        method = main[start:end]
+        self.assertIn("annotation?.type === 'image-area'", method)
+        self.assertIn("this.annotationManager.getAnnotationById(annotation.parentId)", method)
+        self.assertIn("this.uiManager.updateSelectedAnnotationInfo(cardAnnotation || annotation)", method)
+        self.assertIn("this.employeeWorkbench?.updateSelection(cardAnnotation || annotation)", method)
+
+    def test_ocr_splits_multiple_choice_options_and_masks_marked_figures(self):
+        main = (APP_JS / "main.js").read_text(encoding="utf-8")
+        service = (APP_JS / "ocr-service.js").read_text(encoding="utf-8")
+        delivery = (ROOT / "review_tools" / "delivery_workspace.py").read_text(encoding="utf-8")
+        self.assertNotIn("extractPaperFlowOptions", main)
+        self.assertIn("updates.content = normalizedText;", main)
+        self.assertIn("def _split_ocr_choices", delivery)
+        self.assertIn("paperflowRawText", main)
+        self.assertIn("excludedCoordinates", main)
+        self.assertIn("cropImageFromElement(imageElement, coordinates, excludedCoordinates = [])", service)
+        self.assertIn("tempCtx.fillStyle = '#ffffff';", service)
+        self.assertIn("配图区域作为导出图片保留，明确不加入 OCR 队列", service)
+
+    def test_ocr_json_wrapper_and_escaped_newlines_are_unwrapped_before_display(self):
+        main = (APP_JS / "main.js").read_text(encoding="utf-8")
+        service = (APP_JS / "ocr-service.js").read_text(encoding="utf-8")
+        self.assertIn("unwrapPaperFlowOcrText(value)", main)
+        self.assertIn("const transcription = parsed.transcription ?? parsed.text;", main)
+        self.assertIn(".replace(/\\\\n(?=$|[^A-Za-z]|[A-D](?:[.．、]|$))/g, '\\n')", main)
+        self.assertIn("extractStructuredOcrText(content)", service)
+        self.assertIn("for (let attempt = 0; attempt < 2 && raw; attempt += 1)", service)
+        self.assertIn('直接输出转写正文，不要 JSON、字段名、代码块或任何说明。', service)
+        self.assertNotIn("response_format: { type: 'json_object' }", service)
+        self.assertIn('const legacyPrefix = raw.match(/^\\s*\\{\\s*"transcription"', main)
+        self.assertIn('const legacyPrefix = raw.match(/^\\s*\\{\\s*"transcription"', service)
+
+    def test_ocr_service_unwraps_valid_and_malformed_legacy_transcription_envelopes(self):
+        script = r'''
+const fs = require('fs');
+const vm = require('vm');
+const source = fs.readFileSync(process.argv[1], 'utf8')
+    + '\nglobalThis.TestOCRService = OCRService;';
+const context = {};
+vm.runInNewContext(source, context);
+const extract = context.TestOCRService.prototype.extractStructuredOcrText;
+const cases = [
+  ['{"transcription":"甲\\n乙"}', '甲\n乙'],
+  [`{"transcription":"甲（用"<"连接）
+乙"}`, '甲\n乙'.replace('甲', '甲（用"<"连接）')],
+  [`{"transcription":"甲（用"<"连接）
+乙`, '甲\n乙'.replace('甲', '甲（用"<"连接）')]
+];
+for (const [input, expected] of cases) {
+  const actual = extract.call({}, input);
+  if (actual !== expected) throw new Error(JSON.stringify({input, expected, actual}));
+}
+'''
+        subprocess.run(
+            ["node", "-e", script, str(APP_JS / "ocr-service.js")],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_ocr_text_normalisation_never_breaks_latex_n_commands(self):
+        script = r'''
+const fs = require('fs');
+const vm = require('vm');
+let source = fs.readFileSync(process.argv[1], 'utf8');
+source = source.replace(
+  "document.addEventListener('DOMContentLoaded', () => {\n    window.ocrTool = new OCRAnnotationTool();\n});",
+  ''
+) + '\nglobalThis.TestOCRAnnotationTool = OCRAnnotationTool;';
+const context = { window: {}, document: { addEventListener() {} } };
+vm.runInNewContext(source, context);
+const normalize = context.TestOCRAnnotationTool.prototype.normalizePaperFlowOcrText;
+const run = (value) => normalize.call({ unwrapPaperFlowOcrText: (text) => text }, value);
+const formula = String.raw`若 $a \ne 0$，则 $\frac{|a|}{a}$ 的值是（ ）。`;
+const commands = String.raw`$\neq$，$\notin$，$\nabla$，$\nu$`;
+const legacyBreak = String.raw`第一行\n第二行`;
+if (run(formula) !== formula) throw new Error('LaTex \\ne was modified');
+if (run(commands) !== commands) throw new Error('LaTex n-command was modified');
+if (run(legacyBreak) !== '第一行\n第二行') throw new Error('literal legacy newline was not decoded');
+'''
+        subprocess.run(
+            ["node", "-e", script, str(APP_JS / "main.js")],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_saved_illustrations_restore_the_question_image_checkbox(self):
+        main = (APP_JS / "main.js").read_text(encoding="utf-8")
+        self.assertIn("hasImage: Array.isArray(record.illustrations) && record.illustrations.length > 0", main)
+
+    def test_thin_duplicate_frame_is_removed_only_when_it_abuts_the_same_numbered_question(self):
+        main = (APP_JS / "main.js").read_text(encoding="utf-8")
+        self.assertIn("pruneAccidentalDuplicatePaperFlowFrames(records)", main)
+        self.assertIn("height > 44 || width < height * 10", main)
+        self.assertIn("this.paperFlowRecordNumberKey(full) !== number", main)
+        self.assertIn("verticalGap >= -8 && verticalGap <= 30", main)
+
+    def test_visible_generation_flow_reports_the_customer_k12_delivery_path(self):
+        main = (APP_JS / "main.js").read_text(encoding="utf-8")
+        api = (ROOT / "desktop_annotation" / "paperflow_annotation_api.py").read_text(encoding="utf-8")
+        self.assertIn("result.k12_output_path", main)
+        self.assertIn('result["k12_output_path"]', api)
+        self.assertIn("sync_delivery_workspace(project_path", api)
+
+    def test_ocr_result_records_engine_and_elapsed_time_without_logging_text(self):
+        source = (APP_JS / "main.js").read_text(encoding="utf-8")
+        self.assertIn("duration_ms", source)
+        self.assertIn("[paperflow-ocr] finish model=", source)
+        self.assertIn("chars=${characterCount}", source)
 
     def test_answer_mode_uses_answer_specific_labels(self):
         source = (APP_JS / "employee-workbench.js").read_text(encoding="utf-8")
         self.assertIn("'绘制答案框'", source)
-        self.assertIn("'生成答案框'", source)
+        self.assertIn("'自动框答案'", source)
         self.assertIn("'个答案'", source)
 
     def test_draw_button_is_a_real_start_stop_toggle_and_clears_partial_draw_state(self):
@@ -466,13 +810,13 @@ class EmployeeWorkbenchInteractionTests(unittest.TestCase):
 
         self.assertIn("if (this.paperFlowProject && annotation.type === 'main-question')", method)
         self.assertIn("this.employeeWorkbench?.render();", method)
-        self.assertIn("this.employeeWorkbench?.updateSelection(annotation);", method)
+        self.assertIn("this.employeeWorkbench?.updateSelection(cardAnnotation || annotation);", method)
         self.assertLess(method.index("this.employeeWorkbench?.render();"),
-                        method.index("this.employeeWorkbench?.updateSelection(annotation);"))
+                        method.index("this.employeeWorkbench?.updateSelection(cardAnnotation || annotation);"))
 
     def test_switching_books_persists_the_current_project_before_replacement(self):
         source = (APP_JS / "main.js").read_text(encoding="utf-8")
-        start = source.index("async openPaperFlowBook()")
+        start = source.index("async openPaperFlowBook(")
         end = source.index("async choosePaperFlowDeliveryOutput()", start)
         method = source[start:end]
 
@@ -480,12 +824,28 @@ class EmployeeWorkbenchInteractionTests(unittest.TestCase):
         self.assertIn("flushPendingPaperFlowPrelabelsToProject()", source)
         self.assertIn("await this.persistCurrentPaperFlowCache();", method)
         self.assertIn("paperFlowOpenInProgress", method)
+        self.assertIn("localStorage.setItem('paperflowLastBookRoot'", method)
+        self.assertIn("openPaperFlowBook(lastBookRoot)", source)
         self.assertIn("const mainContent = document.querySelector('.main-content');", source)
         self.assertIn("mainContent.style.pointerEvents = 'none';", source)
         self.assertLess(
             method.index("await this.persistCurrentPaperFlowCache();"),
             method.index("this.paperFlowProject = result.project")
         )
+
+    def test_first_open_remeasures_and_redraws_the_restored_first_page(self):
+        source = (APP_JS / "main.js").read_text(encoding="utf-8")
+        start = source.index("async openPaperFlowBook(")
+        refresh_start = source.index("    redrawCurrentPaperFlowPageAfterLayout() {")
+        open_method = source[start:refresh_start]
+        refresh_end = source.index("async choosePaperFlowDeliveryOutput()", refresh_start)
+        refresh = source[refresh_start:refresh_end]
+
+        self.assertIn("this.employeeWorkbench?.render();", open_method)
+        self.assertIn("this.redrawCurrentPaperFlowPageAfterLayout();", open_method)
+        self.assertIn("requestAnimationFrame(() => requestAnimationFrame", refresh)
+        self.assertIn("updateImageInfo", refresh)
+        self.assertIn("this.annotationManager?.redraw?.();", refresh)
 
     def test_image_loading_awaits_the_requested_generation_and_handles_errors(self):
         source = (APP_JS / "image-manager.js").read_text(encoding="utf-8")
@@ -533,7 +893,38 @@ class EmployeeWorkbenchInteractionTests(unittest.TestCase):
         self.assertIn("setTimeout(() => controller.abort()", method)
         self.assertIn("taskIdentity.projectPath !== this.paperFlowProjectPath", method)
         self.assertIn("this.paperFlowPrelabelControllers.add(controller);", method)
-        self.assertIn("controller.abort();", source[source.index("async openPaperFlowBook()"):source.index("async choosePaperFlowDeliveryOutput()")])
+        self.assertIn("controller.abort();", source[source.index("async openPaperFlowBook("):source.index("async choosePaperFlowDeliveryOutput()")])
+        # 首次生成必须复用 OCR 缓存，只有本页已有框（用户确认"重新生成"）才强制重跑，
+        # 否则每点一次都要重新识别整页（实测 40~110 秒）。
+        self.assertIn("const hasExistingBoxes = existing.length > 0;", method)
+        self.assertIn("force_refresh: hasExistingBoxes", method)
+        self.assertIn("refresh_token: hasExistingBoxes ?", method)
+        # 首次识别实测可达 110 秒以上，超时不得低于 5 分钟，否则会掐断已算到一半的任务。
+        self.assertIn("const PRELABEL_TIMEOUT_MS = 300000;", method)
+        self.assertIn("setTimeout(() => controller.abort(), PRELABEL_TIMEOUT_MS)", method)
+
+    def test_desktop_replaces_only_an_outdated_paperflow_bridge(self):
+        electron = (APP_JS.parent / "electron" / "main.js").read_text(encoding="utf-8")
+        self.assertIn("PAPERFLOW_BRIDGE_REVISION", electron)
+        self.assertIn("paperFlowBridgeHealth()", electron)
+        self.assertIn("async stopOutdatedPaperFlowBridge()", electron)
+        self.assertIn("health?.service !== 'paperflow-local'", electron)
+        self.assertIn("health.bridge_revision === PAPERFLOW_BRIDGE_REVISION", electron)
+
+    def test_final_delivery_uses_the_authenticated_private_upload_flow(self):
+        source = (APP_JS / "main.js").read_text(encoding="utf-8")
+        page = (APP_JS.parent / "index.html").read_text(encoding="utf-8")
+        self.assertIn('id="uploadPaperFlowDelivery"', page)
+        self.assertIn("openPaperFlowOnlineReview('delivery')", source)
+        self.assertIn("'/api/review/upload-delivery'", source)
+        self.assertIn("delivery_path: this.paperFlowLastDeliveryPath", source)
+        self.assertIn("result.delivery_output_path || result.output_path", source)
+
+    def test_review_centre_lists_and_replaces_private_deliveries_for_superiors(self):
+        source = (ROOT / "online_review_beta" / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("/api/deliveries/${encodeURIComponent(bookId)}", source)
+        self.assertIn("id=\"deliveryReplacement\"", source)
+        self.assertIn("'/api/deliveries/files'", source)
 
     def test_failed_confirmation_restores_the_status_from_before_commit(self):
         source = (APP_JS / "main.js").read_text(encoding="utf-8")
@@ -586,7 +977,7 @@ class EmployeeWorkbenchInteractionTests(unittest.TestCase):
         end = source.index("flushPendingPaperFlowPrelabelsToProject()", start)
         method = source[start:end]
 
-        self.assertIn("label: '保存教材信息和标注框'", electron)
+        self.assertIn("label: '保存'", electron)
         self.assertIn("accelerator: 'CmdOrCtrl+S'", electron)
         self.assertIn("menu-save-current", electron)
         self.assertIn("onMenuSaveCurrent", preload)
@@ -601,7 +992,7 @@ class EmployeeWorkbenchInteractionTests(unittest.TestCase):
         html = (APP_JS.parent / "index.html").read_text(encoding="utf-8")
         electron = (APP_JS.parent / "electron" / "main.js").read_text(encoding="utf-8")
         preload = (APP_JS.parent / "electron" / "preload.js").read_text(encoding="utf-8")
-        self.assertIn("label: '生成裁剪图片和 JSON…'", electron)
+        self.assertIn("label: '生成交付文件'", electron)
         self.assertIn("menu-generate-group-delivery", electron)
         self.assertIn("onMenuGenerateGroupDelivery", preload)
         self.assertIn("'/api/project/group-export-preflight'", source)
@@ -611,14 +1002,28 @@ class EmployeeWorkbenchInteractionTests(unittest.TestCase):
         self.assertIn("sync_delivery: false", source[save_start:save_end])
         self.assertIn("paperflowPageAccepted", source)
         self.assertNotIn('id="paperFlowPageKind"', html)
-        self.assertIn('<span>生成裁剪图片和 JSON</span>', html)
-        ordered_ids = [
-            'id="managePaperFlowPages"', 'id="manageMatchScopes"',
-            'id="exportPaperFlowProject"', 'id="employeeDrawQuestion"',
-            'id="employeeDeleteSelected"',
+        self.assertIn('<span>生成交付文件</span>', html)
+        # 顶部工具栏改成「教材 / 当前页 / 交付」三段分组后，跨组顺序不再固定；
+        # 但仍需锁定每一组内部的先后，防止组内的操作步骤被打乱。
+        groups = [
+            ['id="managePaperFlowPages"', 'id="manageMatchScopes"'],
+            ['id="generatePrelabels"', 'id="employeeDrawQuestion"',
+             'id="employeeDeleteSelected"', 'id="confirmPaperFlowPage"'],
+            ['id="exportPaperFlowProject"', 'id="submitPaperFlowReview"'],
         ]
-        positions = [html.index(value) for value in ordered_ids]
-        self.assertEqual(positions, sorted(positions))
+        for group in groups:
+            positions = [html.index(value) for value in group]
+            self.assertEqual(positions, sorted(positions), group)
+        # 一本书只设一次的配置和三个远端审核动作必须收在下拉菜单里，不再平铺。
+        self.assertIn('class="pf-menu" id="pfMenuBook"', html)
+        self.assertIn('class="pf-menu" id="pfMenuReview"', html)
+        self.assertIn('data-pf-menu-target="pfMenuBook"', html)
+        self.assertIn('data-pf-menu-target="pfMenuReview"', html)
+
+    def test_scope_auto_match_button_uses_the_requested_wording(self):
+        source = (APP_JS / "main.js").read_text(encoding="utf-8")
+        self.assertIn("执行一次自动的题目和答案分组匹配", source)
+        self.assertNotIn(">执行安全自动匹配<", source)
 
     def test_confirmed_match_keeps_the_stable_pair_identity_from_backend(self):
         source = (APP_JS / "main.js").read_text(encoding="utf-8")
@@ -698,6 +1103,17 @@ class EmployeeWorkbenchInteractionTests(unittest.TestCase):
         self.assertIn("答案页", source)
         self.assertIn("data-scope-remove-page", source)
         self.assertIn("'/api/project/remove-match-scope-pages'", source)
+        self.assertIn("data-scope-preview-page", source)
+        self.assertIn("previewPaperFlowMatchScopePage(kind, pageIndex, scopeId)", source)
+        self.assertIn("confirmCurrentPaperFlowPage()", source)
+        self.assertIn("pfConfirmAllScopeRegions", source)
+        self.assertIn("pfConfirmAllAnswerFrames", source)
+        self.assertIn("data-confirm-scope-region", source)
+        self.assertIn("confirmed_match_scope_region_ids", source)
+        self.assertIn("confirmed_match_record_ids", source)
+        self.assertIn("clearScopeReviewOverlays", annotations)
+        self.assertIn("setScopeReviewOverlays", annotations)
+        self.assertIn("drawScopeReviewOverlays", annotations)
         self.assertIn("只移除分组关系，不删除教材页或框", source)
         self.assertIn("renderPageSelectionSection('question', '题目页'", source)
         self.assertIn("renderPageSelectionSection('answer', '答案页'", source)

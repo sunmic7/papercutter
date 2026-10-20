@@ -88,6 +88,115 @@ def _string_list(value: object) -> list[str]:
     return [_clean_text(item) for item in re.split(r"[\n,，;；]+", str(value or "")) if _clean_text(item)]
 
 
+_CHOICE_MARKER = re.compile(r"(^|[\n\s])([A-DＡ-Ｄ])\s*[\.．、:：]\s*")
+
+
+def _split_ocr_choices(value: object) -> tuple[str, list[str]]:
+    """Extract A-D choices only when OCR text contains at least two markers."""
+    source = _clean_text(value)
+    matches = list(_CHOICE_MARKER.finditer(source))
+    if len(matches) < 2:
+        return source, []
+    first = matches[0]
+    marker_offset = next((index for index, char in enumerate(first.group(0))
+                          if char in "ABCDＡＢＣＤ"), 0)
+    question = source[:first.start() + marker_offset].strip()
+    options: list[str] = []
+    for index, match in enumerate(matches):
+        body_end = matches[index + 1].start() if index + 1 < len(matches) else len(source)
+        body = source[match.end():body_end].strip()
+        label = match.group(2)
+        if "Ａ" <= label <= "Ｄ":
+            label = chr(ord(label) - 0xFEE0)
+        if body:
+            options.append(f"{label}. {body}")
+    return (question, options) if len(options) >= 2 else (source, [])
+
+
+_LATEX_SYMBOLS = {
+    "times": "×", "div": "÷", "cdot": "·", "le": "≤", "leq": "≤",
+    "ge": "≥", "geq": "≥", "neq": "≠", "pm": "±", "mp": "∓",
+    "infty": "∞", "approx": "≈", "sim": "∼", "angle": "∠",
+    "alpha": "α", "beta": "β", "gamma": "γ", "delta": "δ", "theta": "θ",
+    "lambda": "λ", "mu": "μ", "pi": "π", "sigma": "σ", "omega": "ω",
+    "Delta": "Δ", "Theta": "Θ", "Lambda": "Λ", "Sigma": "Σ", "Omega": "Ω",
+}
+_SUPERSCRIPTS = str.maketrans("0123456789+-=()n", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿ")
+_SUBSCRIPTS = str.maketrans("0123456789+-=()aehijklmnoprstuvx", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₕᵢⱼₖₗₘₙₒₚᵣₛₜᵤᵥₓ")
+
+def _latex_group(source: str, start: int) -> tuple[str, int]:
+    """Read one braced LaTeX group; malformed input is kept visible."""
+    if start >= len(source) or source[start] != "{":
+        return "", start
+    depth = 0
+    for index in range(start, len(source)):
+        char = source[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start + 1:index], index + 1
+    return source[start + 1:], len(source)
+
+
+def _unicode_math_text(value: object) -> str:
+    """Turn OCR LaTeX into customer-facing text without leaking source syntax.
+
+    The UI keeps its richer, vertically typeset DOM preview. JSON is text-only,
+    so fractions use U+2044 and unsupported scripts stay readable in brackets.
+    """
+    source = _clean_text(value).replace("\\[", "").replace("\\]", "").replace("\\(", "").replace("\\)", "")
+
+    def convert(text: str) -> str:
+        output: list[str] = []
+        index = 0
+        while index < len(text):
+            char = text[index]
+            if char == "$":
+                index += 1
+                continue
+            if char == "\\":
+                match = re.match(r"\\([A-Za-z]+|.)", text[index:])
+                if not match:
+                    index += 1
+                    continue
+                command = match.group(1)
+                index += len(match.group(0))
+                if command == "frac":
+                    numerator, index = _latex_group(text, index)
+                    denominator, index = _latex_group(text, index)
+                    output.append(f"{convert(numerator)}⁄{convert(denominator)}")
+                elif command == "sqrt":
+                    if index < len(text) and text[index] == "[":
+                        close = text.find("]", index + 1)
+                        index = len(text) if close < 0 else close + 1
+                    radicand, index = _latex_group(text, index)
+                    output.append(f"√({convert(radicand)})")
+                elif command in {"left", "right", "displaystyle", "mathrm", "text", "quad", "qquad", ",", "!", " "}:
+                    if command in {"mathrm", "text"}:
+                        group, index = _latex_group(text, index)
+                        output.append(convert(group))
+                else:
+                    output.append(_LATEX_SYMBOLS.get(command, command))
+                continue
+            if char in {"^", "_"}:
+                script, next_index = _latex_group(text, index + 1)
+                if not script and index + 1 < len(text):
+                    script, next_index = text[index + 1], index + 2
+                converted = convert(script)
+                table = _SUPERSCRIPTS if char == "^" else _SUBSCRIPTS
+                styled = converted.translate(table)
+                output.append(styled if styled != converted else f"{'⁽' if char == '^' else '₍'}{converted}{'⁾' if char == '^' else '₎'}")
+                index = next_index
+                continue
+            output.append(char)
+            index += 1
+        return "".join(output)
+
+    return _clean_text(convert(source)).replace("{", "(").replace("}", ")")
+
+
 def _k12_validation(sample: dict, image_sizes: list[tuple[int, int]]) -> list[str]:
     meta, body = sample["metainfo"], sample["data"]
     errors = []
@@ -122,7 +231,9 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
     """
     k12_root = root / "k12_dataset"
     pages_root = k12_root / "pages"
+    images_root = k12_root / "images"
     pages_root.mkdir(parents=True, exist_ok=True)
+    images_root.mkdir(parents=True, exist_ok=True)
     answers_by_internal = {record["id"]: (index, page, record)
                            for index, page, record in answer_rows}
     continuations_by_parent: dict[str, list[tuple]] = {}
@@ -151,7 +262,7 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
         page_folder = f"P{page_number:04d}"
         page_orders[page_index] = page_orders.get(page_index, 0) + 1
         page_order = page_orders[page_index]
-        image_root = pages_root / page_folder / "images"
+        image_root = images_root
         materialize_page = materialize_all or page_index == changed_page_index
         relation = question_relations.get(str(question.get("id", "")), {})
         primary_answer_infos = [answers_by_internal.get(str(value)) for value in relation.get("answer_ids", [])]
@@ -165,6 +276,7 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
             key=lambda item: (int(item.get("bbox", [0, 0, 0, 0])[1]), int(item.get("bbox", [0, 0, 0, 0])[0])),
         )
         q_index = 0
+        option_index = 0
         for illustration in illustrations:
             kind = str(illustration.get("image_kind", "question_image"))
             if kind == "ignore":
@@ -175,15 +287,20 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
             image_sizes.append((width, height))
             if kind == "option_image":
                 label = re.sub(r"[^A-Za-z0-9]", "", str(illustration.get("option_label", ""))).upper() or "X"
-                filename = f"Q{page_order:03d}_option_{label}.jpg"
-                option_images.append(f"pages/{page_folder}/images/{filename}")
+                option_index += 1
+                filename = f"{sample_id}_option_{label}_{option_index:02d}.jpg"
+                option_images.append(f"images/{filename}")
             else:
                 q_index += 1
-                filename = f"Q{page_order:03d}_img_{q_index:02d}.jpg"
-                question_images.append(f"pages/{page_folder}/images/{filename}")
+                filename = f"{sample_id}_img_{q_index:02d}.jpg"
+                question_images.append(f"images/{filename}")
             target_image = (image_root / filename).resolve()
             image_targets.append((target_image, box))
+        ocr_question, inferred_options = _split_ocr_choices(question.get("text", ""))
+        explicit_options = _string_list(question.get("options", []))
+        options = explicit_options or inferred_options
         raw_type = _clean_text(question.get("question_type", ""))
+        effective_type = "选择题" if inferred_options else raw_type
         sample = {
             "id": sample_id,
             "metainfo": {
@@ -191,18 +308,18 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
                 "stage": _clean_text(project.get("stage")),
                 "grade": _clean_text(project.get("grade")),
                 "subject": _clean_text(project.get("subject")),
-                "question_type": K12_QUESTION_TYPES.get(raw_type, raw_type),
+                "question_type": K12_QUESTION_TYPES.get(effective_type, effective_type),
                 "difficulty": _clean_text(question.get("difficulty", "")),
                 "knowledge_points": _string_list(question.get("knowledge_points", [])),
             },
             "data": {
                 "question_images": question_images,
                 "option_images": option_images,
-                "question": _clean_text(question.get("text", "")),
-                "options": (_string_list(question.get("options", []))
-                            if K12_QUESTION_TYPES.get(raw_type, raw_type) == "选择" else []),
-                "answer": "\n".join(value for value in answers if value),
-                "analysis": "\n".join(value for value in analyses if value),
+                "question": _unicode_math_text(ocr_question),
+                "options": ([_unicode_math_text(value) for value in options]
+                            if K12_QUESTION_TYPES.get(effective_type, effective_type) == "选择" else []),
+                "answer": _unicode_math_text("\n".join(value for value in answers if value)),
+                "analysis": _unicode_math_text("\n".join(value for value in analyses if value)),
             },
             "source": {
                 "book_id": project["delivery_book_id"], "question_page": page_number,
@@ -239,6 +356,10 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
             for target, _box in image_targets:
                 if target.is_file():
                     target.unlink()
+    for stale in images_root.glob("*.jpg"):
+        if stale.resolve() not in active_images:
+            stale.unlink()
+    # Remove images emitted by the pre-contract page-folder layout as well.
     for stale in pages_root.glob("P*/images/*.jpg"):
         if stale.resolve() not in active_images:
             stale.unlink()
@@ -280,6 +401,13 @@ def delivery_root(project: dict, runtime_root: str | Path) -> Path:
             # Keep each book self-contained even when staff choose one shared
             # output folder for multiple textbooks.
             return candidate.resolve() / project["delivery_book_id"]
+    # Batch preannotation projects live beside their original textbook pages.
+    # Keep the default generated images/JSON there as well, while still using
+    # a dedicated book-ID folder so source scans never confuse delivery crops
+    # with new textbook pages.
+    book_root = Path(str(project.get("book_root") or project.get("image_root") or "")).expanduser()
+    if book_root.is_absolute() and book_root.is_dir():
+        return book_root.resolve() / project["delivery_book_id"]
     return Path(runtime_root).resolve() / "delivery_packages" / project["delivery_book_id"]
 
 
@@ -355,17 +483,25 @@ def _record_document(project: dict, page_index: int, page: dict, record: dict,
         "review_status": str(page.get("status", "unlabeled")),
         "number_path": data.number_path(record),
         "display_number": data.display_number(record),
-        "text": str(record.get("text", "")),
+        # The editable OCR field is the authoritative delivery text. Keep the
+        # local project source (including LaTeX where useful for re-rendering),
+        # but never leak that source representation into a generated JSON.
+        "text": _unicode_math_text(record.get("text", "")),
         "question_type": str(record.get("question_type", "")),
         "ocr": _ocr(record),
         "image_file": f"images/{kind}s/{page_folder}/{public_id}.jpg",
         "source": _source(page_index, page, record),
     }
     if kind == "question":
+        matched = (
+            str(relation.get("status", "")) == "accepted"
+            and bool(relation.get("public_answer_ids", []))
+        )
         document.update({
-            "relation_id": str(relation.get("delivery_id", "")),
-            "relation_status": str(relation.get("status", "unmatched")),
-            "answer_ids": list(relation.get("public_answer_ids", [])),
+            "relation_id": str(relation.get("delivery_id", "")) if matched else "",
+            "relation_status": "accepted" if matched else "pending_generation",
+            "answer_status": "matched" if matched else "pending_generation",
+            "answer_ids": list(relation.get("public_answer_ids", [])) if matched else [],
         })
     else:
         document["question_ids"] = list(relation.get("public_question_ids", []))
@@ -410,14 +546,22 @@ def sync_delivery_workspace(project_path: str | Path, runtime_root: str | Path,
     question_relations: dict[str, dict] = {}
     answer_relations: dict[str, dict] = {}
     for pair in project.get("pairs", []):
+        if str(pair.get("status", "")) != "accepted" or not pair.get("answer_ids"):
+            continue
         question = questions_by_internal.get(str(pair.get("question_id", "")))
         answers = [answers_by_internal.get(str(value)) for value in pair.get("answer_ids", [])]
+        if (
+            not question
+            or str(question[1].get("status", "")) != "accepted"
+            or not answers
+            or any(row is None or str(row[1].get("status", "")) != "accepted" for row in answers)
+        ):
+            continue
         public_answers = [row[2]["delivery_id"] for row in answers if row]
-        if question:
-            question_relations[question[2]["id"]] = {**pair, "public_answer_ids": public_answers}
-            for answer in (row for row in answers if row):
-                relation = answer_relations.setdefault(answer[2]["id"], {"public_question_ids": []})
-                relation["public_question_ids"].append(question[2]["delivery_id"])
+        question_relations[question[2]["id"]] = {**pair, "public_answer_ids": public_answers}
+        for answer in (row for row in answers if row):
+            relation = answer_relations.setdefault(answer[2]["id"], {"public_question_ids": []})
+            relation["public_question_ids"].append(question[2]["delivery_id"])
 
     selected_kind = "answer" if changed_kind == "answer" else "question"
     changed_ids: set[str] = set()
@@ -499,17 +643,21 @@ def sync_delivery_workspace(project_path: str | Path, runtime_root: str | Path,
 
     ready_questions = []
     ready_answer_ids: set[str] = set()
-    for internal_id, relation in question_relations.items():
-        question_row = questions_by_internal.get(internal_id)
-        if not question_row or relation.get("status") != "accepted" or not relation.get("answer_ids"):
-            continue
-        question_document = documents[question_row[2]["delivery_id"]]
-        answer_rows_for_pair = [answers_by_internal.get(str(value)) for value in relation.get("answer_ids", [])]
-        if question_document["review_status"] != "accepted" or any(
-            row is None or str(row[1].get("status", "")) != "accepted" for row in answer_rows_for_pair
-        ):
+    for _page_index, page, question in question_rows:
+        question_document = documents[question["delivery_id"]]
+        if question_document["review_status"] != "accepted":
             continue
         ready_questions.append(question_document)
+        if question_document["answer_status"] != "matched":
+            continue
+        relation = question_relations.get(question["id"], {})
+        answer_rows_for_pair = [answers_by_internal.get(str(value)) for value in relation.get("answer_ids", [])]
+        if any(row is None or str(row[1].get("status", "")) != "accepted" for row in answer_rows_for_pair):
+            question_document.update({
+                "relation_id": "", "relation_status": "pending_generation",
+                "answer_status": "pending_generation", "answer_ids": [],
+            })
+            continue
         ready_answer_ids.update(question_document["answer_ids"])
     ready_answers = [documents[value] for value in sorted(ready_answer_ids) if value in documents]
     database = {

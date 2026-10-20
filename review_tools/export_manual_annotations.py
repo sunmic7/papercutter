@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export accepted manual question/answer pairs as local training samples."""
+"""Export accepted question boxes, including unanswered items, as local samples."""
 
 from __future__ import annotations
 
@@ -109,23 +109,32 @@ def export_project(project_path: str, output_dir: str) -> dict:
     questions = {
         record["id"]: (page, record) for _, page, record in data.all_questions(project)
         if record.get("region_role", "question") == "question"
+        and str(page.get("status", "")) == "accepted"
     }
     answers = {
         record["id"]: (page, record) for _, page, record in data.all_answers(project)
         if record.get("region_role", "question") == "question"
+        and str(page.get("status", "")) == "accepted"
     }
-    root = Path(output_dir); root.mkdir(parents=True, exist_ok=True)
-    exported, skipped, index = 0, 0, []
+    valid_pairs = {}
+    skipped = 0
     for pair in project.get("pairs", []):
         if pair.get("status") != "accepted" or not pair.get("answer_ids"):
             continue
         question_info = questions.get(pair.get("question_id"))
         answer_infos = [answers.get(answer_id) for answer_id in pair.get("answer_ids", [])]
-        if not question_info or any(info is None for info in answer_infos):
-            skipped += 1; continue
-        sample_id = f"{exported + 1:06d}_{re.sub(r'[^A-Za-z0-9_-]', '', pair['id'])[-12:]}"
+        if not question_info or not answer_infos or any(info is None for info in answer_infos):
+            skipped += 1
+            continue
+        valid_pairs[str(pair.get("question_id", ""))] = (pair, answer_infos)
+
+    root = Path(output_dir); root.mkdir(parents=True, exist_ok=True)
+    exported, index = 0, []
+    for question_id, (q_page, question) in questions.items():
+        pair, answer_infos = valid_pairs.get(question_id, ({}, []))
+        matched = bool(pair and answer_infos)
+        sample_id = f"{exported + 1:06d}_{re.sub(r'[^A-Za-z0-9_-]', '', str(pair.get('id') or question_id))[-12:]}"
         sample = root / sample_id; sample.mkdir(exist_ok=False)
-        q_page, question = question_info
         try:
             _write_image(sample / "question.jpg", _question_crop(project, q_page, question))
             answer_files = []
@@ -136,13 +145,20 @@ def export_project(project_path: str, output_dir: str) -> dict:
             skipped += 1
             (sample / "export_error.txt").write_text(str(exc), encoding="utf-8")
             continue
-        metadata = {"pair": pair, "question": question, "answers": [info[1] for info in answer_infos], "answer_files": answer_files}
+        metadata = {
+            "pair": pair if matched else None,
+            "question": question,
+            "answers": [info[1] for info in answer_infos],
+            "answer_files": answer_files,
+            "answer_status": "matched" if matched else "pending_generation",
+        }
         (sample / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
         index.append({
             "id": sample_id,
             "path": sample_id,
             "question_id": question["id"],
-            "answer_ids": pair["answer_ids"],
+            "answer_ids": pair.get("answer_ids", []) if matched else [],
+            "answer_status": "matched" if matched else "pending_generation",
             "display_number": data.display_number(question),
             "major_title": question.get("major_title", question.get("major", "")),
         })
@@ -158,7 +174,7 @@ def main() -> int:
     parser.add_argument("--output", required=True, help="输出目录")
     args = parser.parse_args()
     report = export_project(args.project, args.output)
-    print(f"已导出 {report['exported']} 对，跳过 {report['skipped']} 对：{Path(args.output) / 'manual_annotation_index.json'}")
+    print(f"已导出 {report['exported']} 道题，跳过 {report['skipped']} 项：{Path(args.output) / 'manual_annotation_index.json'}")
     return 0
 
 

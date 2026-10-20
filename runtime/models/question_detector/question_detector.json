@@ -11,8 +11,8 @@
     "shape": [
       1,
       3,
-      640,
-      640
+      1600,
+      1600
     ],
     "dtype": "float32",
     "color": "RGB",
@@ -62,12 +62,12 @@
     "torch_version": "2.13.0+cpu",
     "onnx_version": "1.22.0",
     "onnxruntime_version": "1.28.0",
-    "command": "model.export(format=\"onnx\", imgsz=640, batch=1, dynamic=False, simplify=True, half=False, nms=True, conf=0.0, iou=0.7, max_det=300, device=\"cpu\")"
+    "command": "model.export(format=\"onnx\", imgsz=1600, batch=1, dynamic=False, simplify=True, half=False, nms=True, conf=0.0, iou=0.7, max_det=300, device=\"cpu\")"
   },
   "artifact": {
     "filename": "question_detector.onnx",
-    "sha256": "c051ae065edbfd9b5078f3ba34aa35699aed588b9caedbc81550341d1f3bd54c"
+    "sha256": "9fd5eaa8813bea09e5daef63e98f085d51007e9423cb3ac7396dfc3925693b83"
   },
-  "source_weights": "runtime\\training_runs\\hilex_cpu_formal_20260805\\weights\\best.pt",
-  "generated_at": "2026-08-07T00:58:03.149875+00:00"
+  "source_weights": "F:\\papercutter\\runtime\\training_runs\\exam_question_finetune_20260822\\weights\\best.pt",
+  "generated_at": "2026-08-22T09:24:30.329565+00:00"
 }

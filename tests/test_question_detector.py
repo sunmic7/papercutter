@@ -8,6 +8,7 @@ import numpy as np
 
 import question_detector
 from training.prepare_hilex import prepare_hilex
+from training.prepare_exam_questions import prepare_exam_questions
 
 
 class HiLExPreparationTests(unittest.TestCase):
@@ -32,6 +33,29 @@ class HiLExPreparationTests(unittest.TestCase):
             self.assertEqual(label, "0 0.5 0.5 0.8 0.3\n")
             self.assertEqual(summary["splits"]["train"]["question_boxes"], 1)
             self.assertIn("0: question", (root / "output" / "data.yaml").read_text(encoding="utf-8"))
+
+
+class ExamQuestionPreparationTests(unittest.TestCase):
+    def test_both_exam_question_variants_become_one_question_class(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source"
+            for split in ("train", "valid", "test"):
+                images = source / split / "images"
+                labels = source / split / "labels"
+                images.mkdir(parents=True)
+                labels.mkdir(parents=True)
+                (images / "page.jpg").write_bytes(b"not-a-real-image")
+                (labels / "page.txt").write_text(
+                    "0 0.2 0.2 0.3 0.2\n"
+                    "1 0.7 0.7 0.3 0.2\n"
+                    "9 0.5 0.5 1.0 1.0\n",
+                    encoding="utf-8",
+                )
+            summary = prepare_exam_questions(source, root / "output")
+            label = (root / "output" / "train" / "labels" / "page.txt").read_text(encoding="utf-8")
+            self.assertEqual(label, "0 0.2 0.2 0.3 0.2\n0 0.7 0.7 0.3 0.2\n")
+            self.assertEqual(summary["splits"]["train"]["question_boxes"], 2)
 
 
 class DetectorFusionTests(unittest.TestCase):

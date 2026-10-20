@@ -4,8 +4,8 @@ cd /d "%~dp0"
 
 if not exist "logs" mkdir "logs"
 
-rem Do not depend on Windows Script Host: some company desktops disable .vbs.
-rem The child is detached and all startup failures remain inspectable here.
-start "PaperFlow" /b cmd.exe /d /c "python.exe -B cut_questions_gui.py >> logs\gui_startup.log 2>&1"
+rem A direct Python child keeps this console alive for the whole GUI session.
+rem Delegate to WScript so the familiar .cmd launcher leaves no cmd window open.
+start "" /b wscript.exe "%~dp0launch_cutter_gui.vbs"
 
 endlocal

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Create database-ready OCR JSON and same-ID verification crops.
 
-Only manually accepted question/answer pairs are exported.  Public delivery IDs are
-persistent, ASCII-alphanumeric identifiers stored in the annotation project, so a
-question keeps the same filename and database key across repeated exports.
+All accepted question boxes are exported. Accepted question/answer relations add
+answer artifacts; unanswered questions are marked ``pending_generation``. Public
+delivery IDs are persistent, ASCII-alphanumeric identifiers stored in the annotation
+project, so a question keeps the same filename and database key across repeated exports.
 """
 
 from __future__ import annotations
@@ -131,33 +132,37 @@ def export_ocr_delivery(
         record["id"]: (page_index, page, record)
         for page_index, page, record in data.all_questions(project)
         if record.get("region_role", "question") == "question"
+        and str(page.get("status", "")) == "accepted"
     }
     answers = {
         record["id"]: (page_index, page, record)
         for page_index, page, record in data.all_answers(project)
         if record.get("region_role", "question") == "question"
+        and str(page.get("status", "")) == "accepted"
     }
     accepted_pairs = [
         pair for pair in project.get("pairs", [])
         if pair.get("status") == "accepted" and pair.get("answer_ids")
     ]
     answer_to_questions: dict[str, list[str]] = defaultdict(list)
-    valid_pairs = []
+    ready_pairs: dict[str, tuple[dict, list[tuple[int, dict, dict]]]] = {}
     skipped = 0
     for pair in accepted_pairs:
-        question_info = questions.get(pair.get("question_id"))
+        question_id = str(pair.get("question_id", ""))
+        question_info = questions.get(question_id)
         answer_infos = [answers.get(answer_id) for answer_id in pair.get("answer_ids", [])]
         if not question_info or not answer_infos or any(info is None for info in answer_infos):
             skipped += 1
             continue
-        valid_pairs.append((pair, question_info, answer_infos))
+        ready_answers = [info for info in answer_infos if info is not None]
+        ready_pairs[question_id] = (pair, ready_answers)
         question_delivery_id = question_info[2]["delivery_id"]
-        for _page_index, _page, answer in answer_infos:
+        for _page_index, _page, answer in ready_answers:
             answer_to_questions[answer["delivery_id"]].append(question_delivery_id)
 
     answer_documents: dict[str, dict] = {}
     failed_ocr = 0
-    for _pair, _question_info, answer_infos in valid_pairs:
+    for _pair, answer_infos in ready_pairs.values():
         for page_index, page, answer in answer_infos:
             answer_id = answer["delivery_id"]
             if answer_id in answer_documents:
@@ -185,7 +190,7 @@ def export_ocr_delivery(
             )
 
     question_documents = []
-    for pair, (page_index, page, question), answer_infos in valid_pairs:
+    for page_index, page, question in questions.values():
         question_id = question["delivery_id"]
         page_folder = f"P{page_index + 1:04d}"
         image_path = question_image_dir / page_folder / f"{question_id}.jpg"
@@ -193,17 +198,21 @@ def export_ocr_delivery(
         ocr = _ocr_with_cache(question, image_path, runner)
         if ocr["status"] != "success":
             failed_ocr += 1
+        relation = ready_pairs.get(str(question.get("id", "")))
+        pair, answer_infos = relation if relation else ({}, [])
         answer_ids = [answer["delivery_id"] for _index, _page, answer in answer_infos]
+        matched = bool(pair and answer_ids)
         document = {
             "schema_version": 1,
             "id": question_id,
             "kind": "question",
             "book_id": project["delivery_book_id"],
-            "relation_id": pair["delivery_id"],
+            "relation_id": pair.get("delivery_id", "") if matched else "",
             "number_path": data.number_path(question),
             "display_number": data.display_number(question),
             "text": ocr.get("text", ""),
             "ocr": ocr,
+            "answer_status": "matched" if matched else "pending_generation",
             "answer_ids": answer_ids,
             "answers": [
                 {"id": answer_id, "text": answer_documents[answer_id]["text"]}

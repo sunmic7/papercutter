@@ -1,10 +1,14 @@
 import unittest
 
+import numpy as np
+
 import cut_questions_v4 as cutter
 from review_tools.manual_annotation_workspace import (
+    _knowledge_point_group,
     _primary_number_boundaries,
     _subsection_boundaries,
     _subsection_segments,
+    _trim_explanatory_preamble_from_first_minor,
 )
 
 
@@ -56,6 +60,65 @@ class ManualAnnotationWorkspaceRuleTests(unittest.TestCase):
             cutter, [item("上一页续文", 30, 20), item("2. 新题", 30, 180)], 1000, 240,
         )
         self.assertEqual([boundary["num"] for boundary in boundaries], [2])
+
+    def test_negative_formula_fragment_is_not_a_subsection_heading(self):
+        boundaries = _subsection_boundaries(
+            [item("（-5）表示", 20, 120)], 1000,
+        )
+        self.assertEqual(boundaries, [])
+
+    def test_knowledge_point_headings_create_real_group_boundaries(self):
+        boundaries = _subsection_boundaries([
+            item("知识点一 有理数的加法", 20, 120),
+            item("知识点二 加法运算律", 20, 620),
+        ], 1000)
+        self.assertEqual(
+            [(boundary["number"], boundary["y"], boundary["starts_segment"]) for boundary in boundaries],
+            [("一", 120, True), ("二", 620, True)],
+        )
+
+    def test_knowledge_point_heading_is_promoted_to_major_not_subsection(self):
+        group = _knowledge_point_group("知识点四 绝对值")
+        self.assertEqual(group["number"], "四")
+        self.assertEqual(group["title"], "知识点四 绝对值")
+        self.assertEqual(_knowledge_point_group("知识点12 综合测评")["number"], "十二")
+        self.assertIsNone(_knowledge_point_group("（二）课外阅读"))
+        self.assertIsNone(_knowledge_point_group("4. 普通小题"))
+
+    def test_later_knowledge_point_keeps_numbered_prefix_in_active_group(self):
+        segments = _subsection_segments(
+            cutter,
+            [item("16. 上一知识点的题", 25, 100), item("知识点二 加法运算律", 20, 600)],
+            1000, 1000, active_title="知识点一", active_number="一",
+        )
+        self.assertEqual(
+            [(segment["y0"], segment["y1"], segment["subsection_number"]) for segment in segments],
+            [(0, 600, "一"), (600, 1000, "二")],
+        )
+
+    def test_explanatory_preamble_is_not_merged_into_first_question(self):
+        page = np.full((1000, 700, 3), 255, dtype=np.uint8)
+        minors = [{
+            "num": 1,
+            "number_detected": True,
+            "_y_start": 0,
+            "_y_end": 900,
+            "_anchor_y": 650,
+            "crop_img": page[:900].copy(),
+        }]
+        ocr_items = [
+            item("有理数加法的交换律", 30, 160),
+            item("有理数加法的结合律", 30, 360),
+            item("1. 下列说法正确的是", 30, 650),
+        ]
+
+        trimmed = _trim_explanatory_preamble_from_first_minor(minors, ocr_items, page)
+
+        self.assertTrue(trimmed)
+        self.assertEqual(minors[0]["_y_start"], 642)
+        self.assertEqual(minors[0]["crop_img"].shape[:2], (258, 700))
+        self.assertTrue(minors[0]["_explanatory_preamble_removed"])
+        self.assertEqual(minors[0]["_boundary_source"], "ocr_number_after_explanation")
 
 
 if __name__ == "__main__":

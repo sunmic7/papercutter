@@ -123,8 +123,7 @@ def _answer_segments(project: dict, answer_page_index: int, answer_page: dict, a
             yield page_index, page, continuation
 
 
-def export_scope(project_path: str | Path, runtime_root: str | Path, scope_id: str,
-                 *, include_pending: bool = False) -> dict:
+def export_scope(project_path: str | Path, runtime_root: str | Path, scope_id: str) -> dict:
     project_path = Path(project_path).resolve()
     project = data.load_project(project_path)
     report = preflight_scope(project, scope_id)
@@ -141,7 +140,6 @@ def export_scope(project_path: str | Path, runtime_root: str | Path, scope_id: s
     backup = root / (target.name + ".old-" + uuid.uuid4().hex)
     temporary.mkdir(parents=True)
     dataset = []
-    skipped = 0
     try:
         for page_index, page, question in selected:
             pair = pairs.get(str(question.get("id", "")))
@@ -153,9 +151,6 @@ def export_scope(project_path: str | Path, runtime_root: str | Path, scope_id: s
                 and all(str(item[1].get("status", "")) == "accepted" for item in answer_rows if item)
                 and all(_scope_id(item[2], item[1]) == scope_id for item in answer_rows if item)
             )
-            if not matched and not include_pending:
-                skipped += 1
-                continue
             delivery_id = str(question.get("delivery_id") or question.get("id"))
             question_file = f"images/questions/{delivery_id}.jpg"
             (temporary / "images" / "questions").mkdir(parents=True, exist_ok=True)
@@ -205,7 +200,7 @@ def export_scope(project_path: str | Path, runtime_root: str | Path, scope_id: s
             "item_count": len(dataset),
             "matched_count": sum(item["answer_status"] == "matched" for item in dataset),
             "pending_generation_count": sum(item["answer_status"] == "pending_generation" for item in dataset),
-            "skipped_unmatched_count": skipped,
+            "skipped_unmatched_count": 0,
         }
         (json_root / "manifest.json").write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8",

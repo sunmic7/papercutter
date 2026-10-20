@@ -53,17 +53,18 @@ class GroupDeliveryTests(unittest.TestCase):
         self.assertTrue((output / rows[0]["question"]["image_file"]).is_file())
         self.assertTrue((output / rows[0]["answers"][0]["image_file"]).is_file())
 
-    def test_unmatched_question_can_be_deferred_for_answer_generation(self) -> None:
+    def test_unmatched_question_is_always_packaged_for_pending_answer_generation(self) -> None:
         project = data.load_project(self.project_path)
         project["pairs"] = []
-        project["answer_mode"] = "generate_later"
+        project["answer_mode"] = "textbook"
         data.save_project(project, self.project_path)
         report = preflight_scope(data.load_project(self.project_path), "scope-1")
         self.assertEqual(report["unmatched_question_count"], 1)
-        result = export_scope(self.project_path, self.root / "runtime", "scope-1", include_pending=True)
+        result = export_scope(self.project_path, self.root / "runtime", "scope-1")
         row = json.loads(Path(result["output_path"], "json", "dataset.jsonl").read_text(encoding="utf-8").strip())
         self.assertEqual(row["answer_status"], "pending_generation")
         self.assertEqual(row["answers"], [])
+        self.assertEqual(result["skipped_unmatched_count"], 0)
 
     def test_rebuild_replaces_stale_files(self) -> None:
         first = export_scope(self.project_path, self.root / "runtime", "scope-1")
