@@ -1035,6 +1035,28 @@ if (run(legacyBreak) !== '第一行\n第二行') throw new Error('literal legacy
         self.assertIn("执行一次自动的题目和答案分组匹配", source)
         self.assertNotIn(">执行安全自动匹配<", source)
 
+    def test_number_level_ui_uses_append_semantics(self):
+        """题号层级：大题号+小题号之外只在末尾追加，不再有「中间层级」。"""
+        source = (APP_JS / "ui-manager.js").read_text(encoding="utf-8")
+        self.assertIn("＋ 题号层级", source)
+        self.assertNotIn("中间层级", source)
+        self.assertIn("paperflowExtraLevels", source)
+        self.assertNotIn("paperflowMiddleLevels", source)
+        # 追加层从第 3 层开始编号（第 1 层大题号、第 2 层小题号）。
+        self.assertIn("第${index + 3}层", source)
+        # 保存时路径 = [大题号, 小题号, ...追加层]。
+        self.assertIn(
+            "effectiveMajorNumber, sourceQuestionNumber.value.trim(), ...extras",
+            source,
+        )
+
+    def test_question_card_shows_matched_answer_text(self):
+        """匹配完成后答案文字直接显示在题卡里。"""
+        source = (APP_JS / "employee-workbench.js").read_text(encoding="utf-8")
+        self.assertIn("employee-card-answer", source)
+        self.assertIn("answer_pages", source)
+        self.assertIn("record.answer || record.analysis || record.text", source)
+
     def test_confirmed_match_keeps_the_stable_pair_identity_from_backend(self):
         source = (APP_JS / "main.js").read_text(encoding="utf-8")
         start = source.index("async confirmPaperFlowMatch(noAnswer)")
