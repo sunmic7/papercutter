@@ -82,3 +82,14 @@ desktop_annotation/_ui_baseline/**
 *.deploy-key
 .claude/
 .workbuddy/
+
+# 本地产物与一次性脚本（不入库，避免误判为未入库交付物）
+reports/_audit*.jsonl
+runtime/*_cache/
+runtime/photo_qa_jobs/
+_experiments/
+_apply_edits.py
+_fix_*.py
+_patch_*.py
+_verify_json.py
+temp_edits.py
