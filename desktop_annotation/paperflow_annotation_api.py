@@ -8,12 +8,15 @@ standard library avoids adding a Flask dependency to every staff computer.
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import threading
+import time
 import traceback
 import uuid
 from datetime import datetime
@@ -30,12 +33,25 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from review_tools.manual_annotation_workspace import _answer_suggestions, _question_suggestions
+from review_tools import book_meta
+from review_tools import enrich_snapshot
 from review_tools import manual_annotation_data as annotation_data
+from review_tools import review_levels
 from review_tools.export_manual_annotations import export_project
 from review_tools.delivery_workspace import delivery_root, sync_delivery_workspace
 from review_tools.group_delivery import export_scope, preflight_scope
 from review_tools.workspace_store import database_path, page_snapshot, sync_project
-from cut_questions_v4 import infer_book_profile
+from review_tools.online_review_sync import DECISIONS_FILENAME, pull_review_decisions, submit_review_snapshot, upload_final_delivery
+from cut_questions_v4 import (
+    BOOK_PROFILE_CHOICES,
+    BOOK_PROFILE_LABELS,
+    auto_book_profile,
+    detect_book_profile,
+    infer_book_profile,
+    ocr_image,
+    read_book_profile_cache,
+)
+from layout_strategy import describe_profile
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
@@ -47,10 +63,17 @@ PRELABEL_INFERENCE_LOCK = threading.Lock()
 PRELABEL_INFLIGHT_LOCK = threading.Lock()
 PRELABEL_INFLIGHT: dict[tuple, "_PrelabelFlight"] = {}
 ANSWER_PRELABEL_REVIEW_THRESHOLD = 120
+PAPERFLOW_BRIDGE_REVISION = "enrich-snapshot-20261020"
+# 总开关：置 0/false/no/off 时 _save_page 不冻结不分级、三条 enrich 路由直接返回
+# {"ok": false, "disabled": true}，主流程行为与接入前完全一致。
+ENRICH_DISABLED_VALUES = {"0", "false", "no", "off"}
+# 整页 OCR 的"文本确实变了"阈值：整页重识别一次，逐字抖动不该把 20 题全打 stale。
+OCR_TEXT_SIMILARITY_THRESHOLD = 0.98
 MUTATING_ROUTES = {
     "/api/project/open-book", "/api/project/save-page", "/api/project/set-pair",
     "/api/project/sync-delivery", "/api/project/export", "/api/project/set-delivery-output",
     "/api/project/set-book-metadata",
+    "/api/project/set-ocr-settings",
     "/api/project/reclassify-pages",
     "/api/project/rotate-page",
     "/api/project/accept-confident-matches",
@@ -60,6 +83,8 @@ MUTATING_ROUTES = {
     "/api/project/auto-match-scopes",
     "/api/project/save-cache",
     "/api/project/export-match-scope",
+    "/api/project/enrich-prepare",
+    "/api/review/pull-decisions",
 }
 
 
@@ -176,6 +201,130 @@ def _remove_parent_question_boxes(project: dict) -> bool:
     return changed
 
 
+def _sync_page_profiles(project: dict, profile: str, previous: str = "") -> bool:
+    """转发到数据层，保证各个入口对“页面级版式跟随”的口径一致。"""
+    return annotation_data.sync_page_profiles(project, profile, previous)
+
+
+def _store_book_profile(project: dict, profile: str, source: str, reason: str,
+                        locked: bool | None = None) -> bool:
+    previous = str(project.get("profile", "") or "").strip()
+    project["profile"] = profile
+    project["profile_source"] = source
+    project["profile_reason"] = reason
+    if locked is True:
+        project["profile_locked"] = True
+    elif locked is False:
+        project.pop("profile_locked", None)
+    changed = profile != previous
+    return _sync_page_profiles(project, profile, previous) or changed
+
+
+def _auto_book_profile(book_root: Path) -> tuple[str, str, str]:
+    """书名优先，其次复用已落盘的抽样结论。返回 (profile, source, reason)。"""
+    return auto_book_profile(str(book_root), str(ROOT / "runtime"))
+
+
+def _apply_book_profile(project: dict, requested: str, book_root: Path,
+                        respect_lock: bool = True) -> bool:
+    """把一次版式设置写进项目；``requested`` 允许 ``auto``。
+
+    人工指定会置 ``profile_locked``，之后自动识别不再覆盖它。``respect_lock``
+    为 False 时表示员工明确选择了“自动识别”，此时要主动解除人工锁定。
+    """
+    requested = str(requested or "").strip()
+    if requested == "auto":
+        if (
+            respect_lock and project.get("profile_locked")
+            and str(project.get("profile") or "") in BOOK_PROFILE_CHOICES
+        ):
+            return False
+        profile, source, reason = _auto_book_profile(book_root)
+        return _store_book_profile(project, profile, source, reason, locked=False)
+    if requested not in BOOK_PROFILE_CHOICES:
+        raise ValueError("教材版式填写无效。")
+    return _store_book_profile(project, requested, "manual", "人工指定", locked=True)
+
+
+def _resolve_book_profile(project: dict, image_path: Path) -> str:
+    """预标注实际使用的版式：项目落盘值优先，其次磁盘缓存，最后按书名兜底。"""
+    stored = str(project.get("profile", "") or "").strip()
+    if project.get("profile_locked") and stored in BOOK_PROFILE_CHOICES:
+        return stored
+    if stored in BOOK_PROFILE_CHOICES and stored != "general":
+        return stored
+    book_root = Path(str(project.get("book_root") or project.get("image_root") or image_path.parent))
+    cached = read_book_profile_cache(str(book_root), str(ROOT / "runtime"))
+    if cached and cached.get("profile") in BOOK_PROFILE_CHOICES and cached["profile"] != "general":
+        return cached["profile"]
+    if stored in BOOK_PROFILE_CHOICES:
+        return stored
+    return infer_book_profile(str(book_root))
+
+
+PROFILE_DETECT_JOBS: dict[str, threading.Thread] = {}
+PROFILE_DETECT_LOCK = threading.Lock()
+# 打开教材后先让界面把首页画出来，再占 CPU 抽样；否则首屏渲染和后台 OCR
+# 抢同一批核。等待期间用户如果已经点“自动框题”，前台请求会先进推理锁。
+PROFILE_DETECT_DELAY_SECONDS = 6.0
+
+
+def _profile_detect_job(book_root: Path) -> None:
+    """后台用抽样正文补判版式。
+
+    只写版式字段并复用 ``increment_revision=False``：递增修订号会让前端下一次
+    整本缓存保存因 base_revision 不匹配而失败，而这只是一次后台推断。
+    """
+    try:
+        time.sleep(max(0.0, PROFILE_DETECT_DELAY_SECONDS))
+        result = detect_book_profile(
+            str(book_root), runtime_root=str(ROOT / "runtime"),
+            ocr_guard=PRELABEL_INFERENCE_LOCK,
+        )
+    except Exception as error:  # noqa: BLE001 - 后台推断失败必须静默降级
+        print(f"[版式] 自动识别失败（不影响切题）：{error}", flush=True)
+        return
+    if result.get("source") != "text" or result.get("profile") == "general":
+        return
+    project_path = annotation_data.default_book_project_path(str(book_root), str(ROOT / "runtime"))
+    if not project_path.is_file():
+        return
+    try:
+        project = annotation_data.load_project(project_path)
+        if project.get("profile_locked"):
+            return
+        if str(project.get("profile") or "") != "general":
+            return
+        _store_book_profile(
+            project, result["profile"], "auto_text", str(result.get("reason", "") or ""), locked=None,
+        )
+        annotation_data.save_project(project, project_path, increment_revision=False)
+        print(f"[版式] 抽样正文判定为 {result['profile']}：{result.get('reason', '')}", flush=True)
+    except Exception as error:  # noqa: BLE001 - 结果落盘失败不影响预标注
+        print(f"[版式] 判定结果落盘失败（不影响切题）：{error}", flush=True)
+
+
+def _profile_detection_enabled() -> bool:
+    flag = os.environ.get("PAPERFLOW_DISABLE_PROFILE_DETECT", "").strip().lower()
+    return flag not in {"1", "true", "yes", "on"}
+
+
+def _start_book_profile_detection(book_root: Path) -> None:
+    if not _profile_detection_enabled():
+        return
+    key = str(Path(book_root).resolve()).casefold()
+    with PROFILE_DETECT_LOCK:
+        running = PROFILE_DETECT_JOBS.get(key)
+        if running is not None and running.is_alive():
+            return
+        thread = threading.Thread(
+            target=_profile_detect_job, args=(Path(book_root),),
+            name="paperflow-profile-detect", daemon=True,
+        )
+        PROFILE_DETECT_JOBS[key] = thread
+    thread.start()
+
+
 def _prelabel(payload: dict) -> dict:
     image_path = Path(str(payload.get("image_path", ""))).expanduser()
     if not image_path.is_absolute() or not image_path.is_file():
@@ -185,6 +334,8 @@ def _prelabel(payload: dict) -> dict:
 
     profile = str(payload.get("profile", "") or "").strip()
     kind = str(payload.get("kind", "question") or "question")
+    force_refresh = bool(payload.get("force_refresh", False))
+    refresh_token = str(payload.get("refresh_token", "") or "")
     page_index = int(payload.get("page_index", -1))
     project = None
     if payload.get("project_path"):
@@ -205,9 +356,7 @@ def _prelabel(payload: dict) -> dict:
             # placeholder (for example a book titled "大试卷").
             profile = page_profile if (kind == "answer" or page_profile != "general") else ""
         if not profile:
-            profile = infer_book_profile(
-                str(project.get("book_root") or project.get("image_root") or image_path.parent)
-            )
+            profile = _resolve_book_profile(project, image_path)
     if not profile or profile == "auto":
         profile = infer_book_profile(str(image_path.parent))
     if kind not in {"question", "answer"}:
@@ -233,20 +382,37 @@ def _prelabel(payload: dict) -> dict:
     request_key = (
         str(image_path.resolve()).casefold(), source_stat.st_size, source_stat.st_mtime_ns,
         kind, profile, page_index, previous_signature,
+        # A manual regenerate must never join an earlier in-flight request.
+        "force-refresh" if force_refresh else "cached-ocr-ok",
+        refresh_token if force_refresh else "",
     )
 
     def infer() -> dict:
         if kind == "answer":
-            records = _answer_suggestions(str(image_path), profile)
+            records = _answer_suggestions(
+                str(image_path), profile, force_refresh=force_refresh,
+            )
         else:
             records = _question_suggestions(
                 str(image_path), profile, page_index=page_index,
-                previous_question=previous_question,
+                previous_question=previous_question, force_refresh=force_refresh,
             )
+            # Suggested question numbers use the same canonical digit form that
+            # the front end persists on save: 中文/圆括号/全角 digits collapse to
+            # digits, so a freshly generated box and a re-opened box display the
+            # identical label instead of switching 四-10 -> 4-10 after page hop.
+            records = [
+                annotation_data.normalize_record(
+                    {**record, "number_path": list(annotation_data.canonical_number_path(record))}
+                )
+                for record in records
+            ]
         return {
             "ok": True,
             "records": records,
             "engine": "paperflow-local",
+            "bridge_revision": PAPERFLOW_BRIDGE_REVISION,
+            "force_refresh": force_refresh,
             "profile": profile,
             "diagnostics": _prelabel_diagnostics(records, kind),
         }
@@ -262,7 +428,20 @@ def _project_response(project_path: Path, project: dict) -> dict:
         page["source_path"] = annotation_data.source_path(project, page, True)
     for page in snapshot.get("ignored_pages", []):
         page["source_path"] = str(Path(str(project.get("book_root") or project.get("image_root", ""))) / page.get("image", ""))
-    return {"ok": True, "project_path": str(project_path), "project": snapshot}
+    return {
+        "ok": True,
+        "project_path": str(project_path),
+        "project": snapshot,
+        # 版式中文名只在这里维护一份，界面按它渲染下拉框，避免前端另抄一套。
+        "book_profiles": [
+            {"value": value, "label": label} for value, label in BOOK_PROFILE_LABELS.items()
+        ],
+        # 每个版式实际启用了哪些特殊处理，界面在选版式时直接显示，
+        # 让人知道“改成试卷”到底会改变什么。
+        "book_profile_notes": {
+            value: describe_profile(value)["notes"] for value in BOOK_PROFILE_LABELS
+        },
+    }
 
 
 def _annotation_count(project: dict) -> int:
@@ -339,13 +518,41 @@ def _open_book(payload: dict) -> dict:
     project_path = annotation_data.default_book_project_path(book_root, ROOT / "runtime")
     if project_path.is_file():
         project = annotation_data.load_project(project_path)
-        changed = bool(annotation_data.remove_cached_delivery_pages(project, book_root))
+        # Persist the one-time legacy batch-scope migration as soon as the
+        # textbook is opened, so the matching dialog always reflects frames
+        # rather than a misleading full answer page.
+        changed = bool(project.pop("_paperflow_scope_migration_pending", False))
+        ocr_settings = project.get("ocr_settings")
+        if not isinstance(ocr_settings, dict):
+            project["ocr_settings"] = {"auto_page_ocr_on_confirm": True}
+            changed = True
+        elif "auto_page_ocr_on_confirm" not in ocr_settings:
+            ocr_settings["auto_page_ocr_on_confirm"] = True
+            changed = True
+        # Old clients stored the company SMB share as a delivery root.  It is
+        # publicly mounted for legacy reads, so clear only that exact retired
+        # root on open; newly generated packages then stay local until the
+        # employee explicitly uploads them through the authenticated service.
+        if annotation_data.is_company_public_delivery_root(project.get("delivery_output_root")):
+            project.pop("delivery_output_root", None)
+            changed = True
+        changed = bool(annotation_data.remove_cached_delivery_pages(project, book_root)) or changed
         changed = _remove_parent_question_boxes(project) or changed
+        # 版式画像落盘：以前每次 /api/prelabel 都按目录名现猜，结果不落盘、
+        # 界面不可见、判错改不了。打开教材时统一确定一次，后续预标注直接复用。
+        changed = _apply_book_profile(project, "auto", book_root) or changed
         if changed:
             annotation_data.save_project(project, project_path)
     else:
         project = annotation_data.create_book_project(str(book_root))
+        _apply_book_profile(project, "auto", book_root)
         annotation_data.save_project(project, project_path)
+    if (
+        str(project.get("profile") or "general") == "general"
+        and not project.get("profile_locked")
+    ):
+        # 书名判不出具体版式时后台抽样正文补判；判出结果只落缓存与版式字段。
+        _start_book_profile_detection(book_root)
     # Opening should be proportional to the source pages, not to every field in
     # every historical record. The SQLite read model is refreshed lazily only
     # when its workspace endpoint is requested.
@@ -364,6 +571,228 @@ def _load_project(payload: dict) -> tuple[Path, dict]:
     if not is_central and not is_beside_book:
         raise ValueError("标注项目路径与教材目录不匹配。")
     return project_path, project
+
+
+def _set_ocr_settings(payload: dict) -> dict:
+    """Persist per-textbook OCR behaviour instead of relying on one browser profile."""
+    project_path, project = _load_project(payload)
+    enabled = payload.get("auto_page_ocr_on_confirm")
+    if not isinstance(enabled, bool):
+        raise ValueError("自动整页识别设置无效。")
+    project["ocr_settings"] = {"auto_page_ocr_on_confirm": enabled}
+    annotation_data.save_project(project, project_path)
+    return {
+        "ok": True,
+        "ocr_settings": dict(project["ocr_settings"]),
+        "project_revision": project["project_revision"],
+    }
+
+
+def _enrich_enabled() -> bool:
+    """补全流水线总开关。每次现读环境变量，便于单测与灰度逐本切换。"""
+    value = os.environ.get("PAPERFLOW_ENRICH", "1")
+    return str(value).strip().lower() not in ENRICH_DISABLED_VALUES
+
+
+def _enrich_disabled_response() -> dict:
+    return {"ok": False, "disabled": True,
+            "error": "补全流水线已按 PAPERFLOW_ENRICH 关闭。"}
+
+
+def _save_page_enrich(project: dict, kind: str, page_index: int, *,
+                      accepted: bool) -> dict:
+    """页保存后的冻结/失效 + 单页分级 + ``review_summary`` 回写。
+
+    只在``PAPERFLOW_ENRICH`` 开启时生效：
+    - 题目页确认 → 逐条 ``freeze_page``（record 级失效粒度，§3.6）
+    - 题目页**未**确认 → 只重算级别、不冻快照（§3.4 只允许 accepted 冻结）。
+      这一段是必要的：``PAPERFLOW_ENRICH=0`` 期间存过的记录没有快照，
+      ``load_project`` 会按默认值补 ``review_level='L2'``；若不重算，这些记录
+      会永久挂着一个"算出来的 L2"，账永远对不上（QA Round 8 第 3 条）。
+    - 答案页确认 → ``refresh_answer_segment`` 回写"答案后到"（§3.4）并回刷级别
+    """
+    if not _enrich_enabled():
+        return {"enabled": False}
+    pages_key = "answer_pages" if kind == "answer" else "pages"
+    pages = project.get(pages_key) or []
+    if page_index < 0 or page_index >= len(pages):
+        return {"enabled": True, "skipped": "page_index_out_of_range"}
+    page = pages[page_index]
+    if not isinstance(page, dict):
+        return {"enabled": True, "skipped": "page_not_dict"}
+    if kind == "answer":
+        if not accepted:
+            return {"enabled": True, "skipped": "page_not_accepted"}
+        answer_ids = [
+            str(record.get("id", ""))
+            for record in page.get("answers") or []
+            if isinstance(record, dict) and record.get("id")
+        ]
+        return {"enabled": True, "answer_refresh": _guard_enrich(
+            project, kind, page_index, True,
+            lambda: enrich_snapshot.refresh_answer_segment(project, answer_ids),
+        )}
+    if not accepted:
+        levels = enrich_snapshot.refresh_page_levels(project, page_index, kind="question")
+        return {
+            "enabled": True,
+            "skipped": "page_not_accepted",
+            "review_summary": levels["review_summary"],
+            "levels_refreshed": levels["updated"],
+        }
+    return {"enabled": True, **_guard_enrich(
+        project, kind, page_index, False,
+        lambda: enrich_snapshot.freeze_page(project, page_index, kind="question"),
+    )}
+
+
+def _guard_enrich(project: dict, kind: str, page_index: int, is_answer: bool, run):
+    """跑一次补全/分级动作；任何异常都降级成返回值，绝不向上冒泡。
+
+    冒泡的代价是**整页人工标注作废**（调用方 ``_save_page`` 在这之后才写盘）。
+    这一层与 ``_save_page`` 的兜底是双保险：前者保证本函数自洽可单测，后者保证
+    将来往调用点加代码时也不会漏。
+    """
+    try:
+        return run() or {}
+    except Exception as error:  # noqa: BLE001 - 降级优先于一切
+        result = _degrade_enrich_failure(project, kind, page_index, error)
+        if is_answer:
+            result = {"ok": False, "updated": 0, **result}
+        return result
+
+
+ENRICH_ERROR_LIMIT = 300          # §2.4：enrich_error 最长 300 字
+
+
+def _enrich_error_text(error: object) -> str:
+    """异常文本（可传异常对象或字符串）规范化 + 截断。
+
+    空消息退化成异常类名 / ``"unknown"``，避免 UI 上出现空白原因。
+    """
+    text = str(error or "").strip()
+    if not text:
+        text = error.__class__.__name__ if isinstance(error, BaseException) else "unknown"
+    return text[:ENRICH_ERROR_LIMIT]
+
+
+def _degrade_enrich_failure(project: dict, kind: str, page_index: int,
+                            error: BaseException) -> dict:
+    """冻结/回填失败后的降级：标记失败 + 尽力重算级别，**绝不阻断保存**。
+
+    级别必须重算：``enrich_status='failed'`` 会命中 ``review_levels`` 的
+    ``enrich_failed`` 规则 → 强制 L2。不重算的话，这条题会带着上一次的
+    （很可能是 L0 的）级别继续往下走 —— 那正是"补全坏了却看不出来"。
+
+    答案页保存失败时，题目侧才是真正需要升 L2 的一方（回填没发生），
+    所以额外把引用这些答案的题目页也重算一次。
+    """
+    text = _enrich_error_text(error)
+    pages_key = "answer_pages" if kind == "answer" else "pages"
+    records_key = "answers" if kind == "answer" else "questions"
+    pages = (project or {}).get(pages_key) or []
+    page = pages[page_index] if isinstance(page_index, int) and 0 <= page_index < len(pages) else None
+    touched = 0
+    failed_ids: set[str] = set()
+    for record in (page or {}).get(records_key) or []:
+        if not isinstance(record, dict):
+            continue
+        record["enrich_status"] = "failed"
+        record["enrich_error"] = text
+        record_id = str(record.get("id") or "")
+        if record_id:
+            failed_ids.add(record_id)
+        touched += 1
+
+    question_pages: list[int] = []
+    if kind == "answer" and failed_ids:
+        for index, candidate in enumerate((project or {}).get("pages") or []):
+            if not isinstance(candidate, dict):
+                continue
+            for record in candidate.get("questions") or []:
+                if not isinstance(record, dict):
+                    continue
+                if failed_ids & set(enrich_snapshot.answer_ids_of(
+                        project, str(record.get("id") or ""))):
+                    question_pages.append(index)
+                    break
+
+    # 重算目标：本页（按 kind）+ 引用了失败答案的题目页（题目侧才是真正要升 L2 的一方）
+    targets: list[tuple[int, str]] = []
+    if isinstance(page_index, int) and 0 <= page_index < len(pages):
+        targets.append((page_index, kind))
+    targets.extend((index, "question") for index in question_pages)
+
+    refreshed = 0
+    for index, level_kind in targets:
+        try:
+            refreshed += int(
+                enrich_snapshot.refresh_page_levels(
+                    project, index, kind=level_kind,
+                ).get("updated", 0)
+            )
+        except Exception:  # noqa: BLE001 - 级别重算失败同样不能阻断保存
+            continue
+
+    return {"enabled": True, "degraded": True, "error": text,
+            "records": touched, "levels_refreshed": refreshed}
+
+
+def _pair_metrics(project: dict, question: dict, answer_ids) -> dict:
+    """按"人工选中的答案 vs 最强竞争者"重算 ``pair`` 字典（D1）。
+
+    - ``score``/``margin`` 一律用候选原始分，**不读** ``display_confidence``；
+    - ``ok`` 由 :func:`review_tools.review_levels.pair_ok` 算（三条件合取），
+      阈值只有 T01 那一份；
+    - ``display_confidence`` 只供匹配面板排序与可视化。
+    """
+    chosen = [str(value) for value in answer_ids or [] if str(value or "").strip()]
+    if not chosen:
+        return {"score": 0.0, "margin": 0.0, "path_match": False, "ok": False,
+                "display_confidence": 0.0}
+    chosen_set = set(chosen)
+    ranked = annotation_data.candidates(
+        project, question, limit=max(4, len(chosen) + 2), accepted_only=True,
+    )
+    chosen_scores = [
+        float(score) for score, _page_index, _page, answer in ranked
+        if str(answer.get("id", "")) in chosen_set
+    ]
+    other_scores = [
+        float(score) for score, _page_index, _page, answer in ranked
+        if str(answer.get("id", "")) not in chosen_set
+    ]
+    score = max(chosen_scores) if chosen_scores else 0.0
+    second = max(other_scores) if other_scores else 0.0
+    index = enrich_snapshot.record_index(project)
+    path_match = True
+    for answer_id in chosen:
+        answer = index.get(answer_id)
+        if not isinstance(answer, dict) or not annotation_data.number_path_matches(question, answer):
+            path_match = False
+            break
+    pair = {
+        "score": round(float(score), 2),
+        "margin": round(float(score) - float(second), 2),
+        "path_match": bool(path_match),
+        "ok": False,
+        "display_confidence": review_levels.pair_confidence(score),
+    }
+    pair["ok"] = bool(review_levels.pair_ok({"pair": pair}))
+    return pair
+
+
+def _write_pair_metrics(project: dict, question_id: str, answer_ids) -> dict:
+    """把 ``pair`` 字典写到**题记录**上（分级读记录，不读关系表）。"""
+    index = enrich_snapshot.record_index(project)
+    question = index.get(str(question_id))
+    if not isinstance(question, dict):
+        return {}
+    pair = _pair_metrics(project, question, answer_ids)
+    question["pair"] = pair
+    # D1：单值 float 的旧口径已废止，读到就清掉，避免两套阈值并存
+    question.pop("pair_confidence", None)
+    return pair
 
 
 def _save_page(payload: dict) -> dict:
@@ -387,6 +816,30 @@ def _save_page(payload: dict) -> dict:
     }
     page_scope_id = str(pages[page_index].get("match_scope_id", "") or "").strip()
     scope_regions = pages[page_index].get("match_scope_regions", [])
+    confirmed_region_ids = payload.get("confirmed_match_scope_region_ids", None)
+    confirm_all_answer_records = payload.get("confirm_all_answer_records", None)
+    if confirm_all_answer_records is not None and not isinstance(confirm_all_answer_records, bool):
+        raise ValueError("全选答案框状态无效。")
+    if confirmed_region_ids is not None:
+        if kind != "answer":
+            raise ValueError("只有答案页可以按框选分组确认。")
+        if not isinstance(confirmed_region_ids, list):
+            raise ValueError("确认的分组区域无效。")
+        valid_region_ids = {
+            str(region.get("id", "")).strip()
+            for region in scope_regions if isinstance(region, dict)
+            if str(region.get("id", "")).strip()
+        }
+        normalized_confirmed_region_ids = []
+        for value in confirmed_region_ids:
+            region_id = str(value or "").strip()
+            if not region_id or region_id not in valid_region_ids:
+                raise ValueError("确认的分组区域不存在或已变更。")
+            if region_id not in normalized_confirmed_region_ids:
+                normalized_confirmed_region_ids.append(region_id)
+        if (payload.get("accepted") and valid_region_ids and not normalized_confirmed_region_ids
+                and not confirm_all_answer_records):
+            raise ValueError("请至少勾选一个要纳入答案匹配的分组区域。")
 
     def inherited_scope(item: dict, box: list[int]) -> str:
         explicit = str(item.get("match_scope_id", "") or "").strip()
@@ -467,6 +920,11 @@ def _save_page(payload: dict) -> dict:
         for persistent_key in ("delivery_id",):
             if persistent_key in previous:
                 record[persistent_key] = previous[persistent_key]
+        # 补全字段（快照/分级/AI 结果/词表码…）同样属于逻辑记录：页面保存是
+        # 重建记录的白名单路径，不在这里接住就会把整条 AI 结果抹掉。
+        for enrich_key in annotation_data.ENRICH_PERSISTENT_KEYS:
+            if enrich_key in previous:
+                record[enrich_key] = _json_copy(previous[enrich_key])
         if isinstance(item.get("ocr"), dict):
             record["ocr"] = dict(item["ocr"])
         elif "ocr" in previous:
@@ -521,14 +979,62 @@ def _save_page(payload: dict) -> dict:
             project["pairs"] = retained_pairs
     pages[page_index][records_key] = cleaned
     pages[page_index]["status"] = "accepted" if payload.get("accepted") else "draft"
-    annotation_data.save_project(project, project_path)
+    if confirmed_region_ids is not None:
+        pages[page_index]["confirmed_match_scope_region_ids"] = normalized_confirmed_region_ids
+        selected_region_ids = set(normalized_confirmed_region_ids)
+        selected_records = []
+        for record in cleaned:
+            record_id = str(record.get("id", "")).strip()
+            if not record_id:
+                continue
+            if confirm_all_answer_records:
+                selected_records.append(record_id)
+                continue
+            box = record.get("bbox", [])
+            if not isinstance(box, (list, tuple)) or len(box) != 4:
+                continue
+            center_x = (float(box[0]) + float(box[2])) / 2
+            center_y = (float(box[1]) + float(box[3])) / 2
+            for region in scope_regions:
+                if not isinstance(region, dict) or str(region.get("id", "")).strip() not in selected_region_ids:
+                    continue
+                region_box = region.get("bbox", [])
+                if not isinstance(region_box, (list, tuple)) or len(region_box) != 4:
+                    continue
+                try:
+                    x0, y0, x1, y1 = (float(value) for value in region_box)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if x0 <= center_x <= x1 and y0 <= center_y <= y1:
+                    selected_records.append(record_id)
+                    break
+        pages[page_index]["confirmed_match_record_ids"] = selected_records
+    # 快照冻结/失效与单页分级必须紧跟记录落位（此时 project 里已是新记录），
+    # 且在任何 save_project 之前完成 —— 一次保存只写一次盘。
     warnings = annotation_data.hierarchy_warnings(cleaned)
+    # 补全是"增强"，绝不能阻断主流程：这里必须兜住所有异常。否则冻结一抛异常，
+    # 下面这行 save_project 根本不会执行，审核员刚画的框与刚填的答案会整页丢失，
+    # 而前端只看到"请求失败"。宁可这一页没有分级，也不能丢人工成果。
+    try:
+        enrich_result = _save_page_enrich(
+            project, kind, page_index, accepted=bool(payload.get("accepted")),
+        )
+    except Exception as error:  # noqa: BLE001 - 降级优先于一切
+        enrich_result = _degrade_enrich_failure(project, kind, page_index, error)
+    if isinstance(enrich_result, dict) and enrich_result.get("degraded"):
+        # 无论异常是被内层 `_guard_enrich` 吞掉还是被这层兜住，都必须让审核员看见
+        warnings.append(
+            "本页已保存，但补全与分级未完成（已降级，不影响标注结果）："
+            + _enrich_error_text(enrich_result.get("error", ""))[:120]
+        )
+    annotation_data.save_project(project, project_path)
     if payload.get("accepted") and kind == "answer":
         missing_answer_count = sum(
             not str(record.get("analysis") or record.get("text") or "").strip()
             if str(record.get("region_role", "question")) == "continuation"
             else not str(record.get("answer", "")).strip()
             for record in cleaned
+            if annotation_data.is_match_ready(pages[page_index], record)
         )
         if missing_answer_count:
             warnings.append(
@@ -540,7 +1046,13 @@ def _save_page(payload: dict) -> dict:
         "status": pages[page_index]["status"],
         "project_revision": project["project_revision"],
         "warnings": warnings,
+        "confirmed_match_scope_region_ids": list(
+            pages[page_index].get("confirmed_match_scope_region_ids", [])
+        ),
+        "confirmed_match_record_ids": list(pages[page_index].get("confirmed_match_record_ids", [])),
         "removed_pairs": len(old_pairs) - len(project.get("pairs", [])),
+        # 分级与快照结果回给前端做页头徽标；PAPERFLOW_ENRICH=0 时只有 enabled=False。
+        "enrich": enrich_result,
         # The draw button is renderer state only.  A save can contain it for
         # diagnostics, but the project always persists completed records only.
         "transient_drawing_tool_active": drawing_tool_active,
@@ -558,7 +1070,7 @@ def _match_candidates(payload: dict) -> dict:
     paired_ids = annotation_data.paired_answer_ids(project, question_id)
     answer_count = sum(
         1 for _page_index, page, answer in annotation_data.all_answers(project)
-        if str(page.get("status", "")) == "accepted"
+        if annotation_data.is_match_ready(page, answer)
         and str(answer.get("region_role", "question")) == "question"
     )
     all_ranked = annotation_data.candidates(
@@ -690,7 +1202,7 @@ def _set_pair(payload: dict) -> dict:
     accepted_question_ids = {
         str(question.get("id", ""))
         for _page_index, page, question in annotation_data.all_questions(project)
-        if str(page.get("status", "")) == "accepted"
+        if annotation_data.is_match_ready(page, question)
         and str(question.get("region_role", "question")) == "question"
     }
     if question_id not in accepted_question_ids:
@@ -698,7 +1210,7 @@ def _set_pair(payload: dict) -> dict:
     accepted_answer_ids = {
         str(answer.get("id", ""))
         for _page_index, page, answer in annotation_data.all_answers(project)
-        if str(page.get("status", "")) == "accepted"
+        if annotation_data.is_match_ready(page, answer)
         and str(answer.get("region_role", "question")) == "question"
     }
     invalid_answer_ids = [value for value in answer_ids if value not in accepted_answer_ids]
@@ -706,6 +1218,11 @@ def _set_pair(payload: dict) -> dict:
         raise ValueError("只能匹配已经确认的答案页，请先完成答案页审核。")
     status = "accepted" if answer_ids else "no_answer"
     annotation_data.set_pair(project, question_id, answer_ids, status)
+    # D1：判定读 pair{score,margin,path_match,ok}；display_confidence 只展示。
+    pair_metrics = _write_pair_metrics(project, question_id, answer_ids)
+    if _enrich_enabled():
+        # §3.4 答案后到：快照里本来就缺答案，配对成功后立刻补上并重算哈希。
+        enrich_snapshot.refresh_answer_segment(project, answer_ids)
     annotation_data.save_project(project, project_path)
     sync_project(project_path, project, ROOT / "runtime")
     saved_pair = next(
@@ -714,7 +1231,8 @@ def _set_pair(payload: dict) -> dict:
     )
     return {
         "ok": True, "status": status, "answer_ids": answer_ids,
-        "pair": saved_pair, "project_revision": project["project_revision"],
+        "pair": saved_pair, "pair_metrics": pair_metrics,
+        "project_revision": project["project_revision"],
         "delivery": None,
     }
 
@@ -754,11 +1272,17 @@ def _accept_confident_matches(payload: dict) -> dict:
         proposals.append((question_id, answer_id, float(best_score)))
         reserved_answers.add(answer_id)
     saved_pairs: dict[str, dict] = {}
+    saved_metrics: dict[str, dict] = {}
     for question_id, answer_id, _score in proposals:
         annotation_data.set_pair(project, question_id, [answer_id], "accepted")
+        saved_metrics[question_id] = _write_pair_metrics(project, question_id, [answer_id])
         saved_pairs[question_id] = next(
             pair for pair in project.get("pairs", [])
             if str(pair.get("question_id", "")) == question_id
+        )
+    if proposals and _enrich_enabled():
+        enrich_snapshot.refresh_answer_segment(
+            project, [answer_id for _question_id, answer_id, _score in proposals],
         )
     if proposals:
         annotation_data.save_project(project, project_path)
@@ -768,7 +1292,7 @@ def _accept_confident_matches(payload: dict) -> dict:
         "accepted_count": len(proposals),
         "matches": [
             {"question_id": question_id, "answer_ids": [answer_id], "score": score,
-             "pair": saved_pairs[question_id]}
+             "pair": saved_pairs[question_id], "pair_metrics": saved_metrics[question_id]}
             for question_id, answer_id, score in proposals
         ],
         "project_revision": project.get("project_revision", 0),
@@ -846,6 +1370,15 @@ def _assign_match_scope(payload: dict) -> dict:
         if set_page_default:
             page["match_scope_id"] = scope_id
         if normalized_region is not None:
+            # A later rectangle selection replaces an earlier whole-page
+            # assignment. Leaving that default in place would keep every
+            # unselected answer frame in the group.
+            previous_page_scope = str(page.get("match_scope_id", "") or "").strip()
+            if previous_page_scope:
+                page["match_scope_id"] = ""
+                for record in page.get(records_key, []):
+                    if str(record.get("match_scope_id", "") or "").strip() == previous_page_scope:
+                        record["match_scope_id"] = ""
             page.setdefault("match_scope_regions", []).append({
                 "id": "region-" + uuid.uuid4().hex,
                 "scope_id": scope_id,
@@ -913,6 +1446,12 @@ def _remove_match_scope_pages(payload: dict) -> dict:
         ]
         removed_regions += len(regions) - len(kept_regions)
         page["match_scope_regions"] = kept_regions
+        if "confirmed_match_scope_region_ids" in page:
+            kept_region_ids = {str(region.get("id", "")) for region in kept_regions}
+            page["confirmed_match_scope_region_ids"] = [
+                str(region_id) for region_id in page.get("confirmed_match_scope_region_ids", [])
+                if str(region_id) in kept_region_ids
+            ]
         for record in page.get(records_key, []):
             if str(record.get("match_scope_id", "")) == scope_id:
                 record["match_scope_id"] = ""
@@ -941,14 +1480,14 @@ def _auto_match_scopes(payload: dict) -> dict:
     question_map: dict[tuple[str, tuple[str, ...]], list[dict]] = {}
     answer_map: dict[tuple[str, tuple[str, ...]], list[dict]] = {}
     for _index, page, record in annotation_data.all_questions(project):
-        if str(page.get("status", "")) != "accepted" or record.get("region_role", "question") != "question":
+        if not annotation_data.is_match_ready(page, record) or record.get("region_role", "question") != "question":
             continue
         scope_id = str(record.get("match_scope_id") or page.get("match_scope_id") or "").strip()
         path = annotation_data.canonical_number_path(record)
         if scope_id and path:
             question_map.setdefault((scope_id, path), []).append(record)
     for _index, page, record in annotation_data.all_answers(project):
-        if str(page.get("status", "")) != "accepted" or record.get("region_role", "question") != "question":
+        if not annotation_data.is_match_ready(page, record) or record.get("region_role", "question") != "question":
             continue
         scope_id = str(record.get("match_scope_id") or page.get("match_scope_id") or "").strip()
         path = annotation_data.canonical_number_path(record)
@@ -978,10 +1517,16 @@ def _auto_match_scopes(payload: dict) -> dict:
         annotation_data.set_pair(
             project, question_id, [answer_id], "accepted", source="scope_number_auto"
         )
+        # 同分组自动配对也必须落 pair 字典，否则分级会把它误判成 pair_fail（L2）。
+        _write_pair_metrics(project, question_id, [answer_id])
         saved_pairs.append(next(
             pair for pair in project.get("pairs", [])
             if str(pair.get("question_id", "")) == question_id
         ))
+    if proposals and _enrich_enabled():
+        enrich_snapshot.refresh_answer_segment(
+            project, [answer_id for _question_id, answer_id, _scope_id in proposals],
+        )
     if proposals:
         annotation_data.save_project(project, project_path)
         sync_project(project_path, project, ROOT / "runtime")
@@ -1003,8 +1548,28 @@ def _set_delivery_output(payload: dict) -> dict:
     if not selected_root.is_absolute():
         raise ValueError("交付输出位置必须是本机文件夹。")
     selected_root = selected_root.resolve()
+    if annotation_data.is_company_public_delivery_root(selected_root):
+        raise ValueError("公司公共共享盘不再用于最终交付。请选本机文件夹，生成后使用“上传最终交付”。")
     if not selected_root.is_dir():
         raise ValueError("选择的交付输出文件夹不存在。")
+    # A network share can be visible but still be read-only for the current
+    # Windows user.  Verify write access before changing the project setting;
+    # otherwise staff only discover the permission problem after a long export.
+    probe = selected_root / f".paperflow-write-probe-{uuid.uuid4().hex}.tmp"
+    try:
+        probe.write_text("PaperFlow delivery output write check\n", encoding="utf-8")
+    except OSError as error:
+        raise ValueError(
+            "选择的交付输出文件夹无法写入。请先连接公司数据服务器共享，"
+            "并确认当前 Windows 账号具有写入权限。"
+        ) from error
+    finally:
+        try:
+            probe.unlink(missing_ok=True)
+        except OSError:
+            # A failed cleanup is harmless for delivery, and should not hide a
+            # successful write-access result behind a secondary error.
+            pass
     project["delivery_output_root"] = str(selected_root)
     annotation_data.save_project(project, project_path)
     output_path = delivery_root(project, ROOT / "runtime")
@@ -1028,6 +1593,25 @@ def _set_book_metadata(payload: dict) -> dict:
         "stage": {"小学", "初中", "高中"},
         "answer_mode": annotation_data.ANSWER_MODES,
     }
+    # D6：书级字段是全书共用的一个值，改错一个污染整本 350 题。锁定后要改必须
+    # 显式带 unlock_reason —— 不是为了防错，是为了让"整本重跑"的代价可见。
+    current_meta = {
+        key: str(project.get(key, "") or "").strip()
+        for key in ("language", "stage", "grade", "subject", "difficulty_scheme")
+    }
+    next_meta = dict(current_meta)
+    for key in ("language", "stage", "grade", "subject"):
+        next_meta[key] = str(metadata.get(key, "") or "").strip()
+    next_meta["difficulty_scheme"] = str(
+        metadata.get("difficulty_scheme", "") or current_meta.get("difficulty_scheme") or "1-5"
+    ).strip()
+    unlock_reason = str(payload.get("unlock_reason", "") or "").strip()
+    if project.get("book_meta_locked") and not unlock_reason \
+            and book_meta.book_meta_rev(next_meta) != book_meta.book_meta_rev(current_meta):
+        raise ValueError(
+            "教材信息已锁定，改动需要填写 unlock_reason（将导致全书重新补全，"
+            "请说明为什么必须改）。"
+        )
     for key in ("language", "stage", "grade", "subject"):
         value = str(metadata.get(key, "") or "").strip()
         if key in allowed and value not in allowed[key]:
@@ -1039,8 +1623,33 @@ def _set_book_metadata(payload: dict) -> dict:
     if answer_mode not in annotation_data.ANSWER_MODES:
         raise ValueError("教材答案模式填写无效。")
     project["answer_mode"] = answer_mode
+    requested_scheme = str(metadata.get("difficulty_scheme", "") or "").strip()
+    if requested_scheme:
+        if requested_scheme not in book_meta.DIFFICULTY_SCHEMES:
+            raise ValueError("难度口径填写无效。")
+        project["difficulty_scheme"] = requested_scheme
+    else:
+        project.setdefault("difficulty_scheme", "1-5")
+    requested_profile = str(metadata.get("profile", "") or "").strip()
+    if requested_profile:
+        # 版式是整本教材共用的切题策略；空串表示本次不改，避免老客户端把
+        # 已经落盘的版式覆盖成默认值。
+        _apply_book_profile(
+            project, requested_profile,
+            Path(str(project.get("book_root") or project.get("image_root") or "")),
+            respect_lock=False,
+        )
+    # 书级信息写入后立刻重算 book_meta_rev：快照失效判定（§3.5 第 5 条）与
+    # 交付门禁都读它，晚一步就会出现"改成新学科、交付包还是旧学科"。
+    project["book_meta_rev"] = book_meta.book_meta_rev(project)
+    project["book_meta_locked"] = True
+    if unlock_reason:
+        project["book_meta_unlock_reason"] = unlock_reason
+        project["book_meta_unlocked_at"] = datetime.now().isoformat(timespec="seconds")
     annotation_data.save_project(project, project_path)
     return {"ok": True, "project": _project_response(project_path, project)["project"],
+            "book_meta_rev": project["book_meta_rev"],
+            "book_meta_locked": True,
             "delivery": None}
 
 
@@ -1088,8 +1697,45 @@ def _workspace_page(payload: dict) -> dict:
     return {"ok": True, **snapshot}
 
 
+def _ensure_review_delivery_clear(project_path: Path) -> None:
+    """Block local final delivery only after a pulled review has unresolved pages.
+
+    No online file is needed here: the decision sidecar is written beside the
+    local project by ``pull_review_decisions``.  Projects never submitted for
+    review remain exportable, preserving the existing local-only workflow.
+    """
+    decision_path = project_path.resolve().with_name(DECISIONS_FILENAME)
+    if not decision_path.is_file():
+        return
+    try:
+        document = json.loads(decision_path.read_text(encoding="utf-8"))
+        decisions = document.get("decisions", [])
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("Local review decision file is invalid; pull decisions again before delivery.") from error
+    unresolved = [item for item in decisions if item.get("review_status") != "approved"]
+    # Newer review documents describe the entire submission.  A submission is
+    # eligible for delivery only when the reviewer has closed it and every
+    # source page is approved.  This deliberately blocks pending pages too.
+    if "submission_status" in document:
+        expected = int(document.get("page_count", 0) or 0)
+        complete = document.get("submission_status") == "reviewed" and expected > 0 and len(decisions) == expected
+        if not complete or unresolved:
+            statuses = ", ".join(sorted({str(item.get("review_status", "pending")) for item in unresolved})) or "pending"
+            raise ValueError(
+                f"Final crops and JSON are blocked: this review is not fully approved "
+                f"(status={document.get('submission_status')}, unresolved={len(unresolved)}, states={statuses}). "
+                "Complete the fixes, resubmit, and pull the latest approved conclusions first."
+            )
+    elif unresolved:
+        # Backward compatibility for a sidecar pulled from an older review
+        # server, which contained only completed page decisions.
+        statuses = ", ".join(sorted({str(item.get("review_status", "")) for item in unresolved}))
+        raise ValueError(f"Final crops and JSON are blocked: {len(unresolved)} reviewed page(s) still require action ({statuses}). Fix, resubmit and pull the approved conclusions first.")
+
+
 def _export_project(payload: dict) -> dict:
     project_path, _project = _load_project(payload)
+    _ensure_review_delivery_clear(project_path)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     target = ROOT / "runtime" / "manual_annotation_exports" / project_path.stem / stamp
     report = export_project(str(project_path), str(target))
@@ -1112,14 +1758,497 @@ def _group_export_preflight(payload: dict) -> dict:
 
 def _export_match_scope(payload: dict) -> dict:
     project_path, _project = _load_project(payload)
+    _ensure_review_delivery_clear(project_path)
     scope_id = str(payload.get("scope_id", "") or "").strip()
     if not scope_id:
         raise ValueError("请选择要生成的匹配分组。")
-    result = export_scope(
-        project_path, ROOT / "runtime", scope_id,
-        include_pending=bool(payload.get("include_pending", False)),
-    )
+    result = export_scope(project_path, ROOT / "runtime", scope_id)
+    # The scope package remains useful for internal review, while the customer
+    # contract is the K12 JSONL. Generate both from the same saved project so
+    # the visible “生成裁剪图片和 JSON” action never leaves staff with only an
+    # internal schema that the customer cannot import.
+    formal = sync_delivery_workspace(project_path, ROOT / "runtime", materialize_all=True)
+    result["delivery_output_path"] = str(Path(formal["output_path"]))
+    result["k12_output_path"] = str(Path(formal["output_path"]) / "k12_dataset")
+    result["k12_eligible_count"] = int(formal.get("k12", {}).get("eligible_count", 0))
     return {"ok": True, **result}
+
+
+def _review_submit(payload: dict) -> dict:
+    """Submit a review-only snapshot; the delivery exporter is never invoked."""
+    project_path, _project = _load_project(payload)
+    result = submit_review_snapshot(
+        str(payload.get("server_url", "")),
+        str(payload.get("username", "")),
+        str(payload.get("password", "")),
+        project_path,
+        int(payload.get("max_preview_side", 1600)),
+    )
+    return {
+        "ok": True,
+        **result,
+        "notice": "已按审核中心账号同步个人工程并提交审核快照；最终裁图和最终 JSON 仍只会在本机由“生成裁切图片和JSON”生成。",
+    }
+
+
+def _review_pull_decisions(payload: dict) -> dict:
+    """Save returned page decisions as a local sidecar without changing delivery files."""
+    project_path, _project = _load_project(payload)
+    submission_id = str(payload.get("submission_id", "")).strip()
+    if not submission_id:
+        raise ValueError("缺少线上审核提交编号。")
+    result = pull_review_decisions(
+        str(payload.get("server_url", "")),
+        str(payload.get("username", "")),
+        str(payload.get("password", "")),
+        submission_id,
+        project_path,
+    )
+    return {
+        "ok": True,
+        **result,
+        "notice": "审核结论已保存到教材本地目录，未生成、修改或上传任何最终裁图和最终 JSON。",
+    }
+
+
+def _review_upload_delivery(payload: dict) -> dict:
+    project_path, _project = _load_project(payload)
+    result = upload_final_delivery(str(payload.get("server_url", "")), str(payload.get("username", "")), str(payload.get("password", "")), project_path, str(payload.get("delivery_path", "")))
+    return {"ok": True, **result, "notice": "最终交付已按账号上传到服务器私有目录。"}
+
+
+def _normalize_ocr_text(text: str) -> str:
+    """对本地 OCR 输出的题面文字做数学符号归一化。
+
+    保留 heavy PaddleOCR 已经正确识别的符号（±≤≥√π∞×÷），
+    修复常见的 `|` 与 `1` 混淆、全角/半角不一致、多余空格。
+    """
+    if not text:
+        return text
+
+    # 1. 全角字母数字 → 半角
+    result = text.translate(str.maketrans(
+        "０１２３４５６７８９ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ"
+        "ａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ",
+        "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "abcdefghijklmnopqrstuvwxyz",
+    ))
+
+    # 2. 全角括号/逗号/句号/等号/分号 → 半角（保留中文句号）
+    result = result.replace("（", "(").replace("）", ")")
+    result = result.replace("，", ",").replace("；", ";").replace("、", ",")
+    result = result.replace("＝", "=").replace("＋", "+").replace("－", "-")
+    result = result.replace("＜", "<").replace("＞", ">")
+
+    # 3. 修复绝对值竖线被误读为 1 的常见模式
+    #    模式：`|a1` → `|a|` 或 `|a1` → `|a|`（结尾 1 应为 |）
+    #    仅当 1 紧跟在数学变量/符号后且后面是逗号/空格/句号/括号/行尾时
+    import re as _re
+    result = _re.sub(r"\|([a-zA-Z])(\d+)", r"|\1|", result)  # |a12 → |a|
+    result = _re.sub(r"(\d)([a-zA-Z])\|", r"\1\2|", result)  # 3a| → 3a| (no-op but safe keep)
+    #    绝对值的结尾 1 误读：|a1 → |a|（OCR 常见 |a1 结尾竖线被读成 1）
+    result = _re.sub(r"\|([a-zA-Z0-9+\-×÷^_]+?)(\d)(?=[,;.\s\)\]）\n]|$)", lambda m: f"|{m.group(1)}|" if m.group(2) == "1" and not m.group(1).endswith("1") else m.group(0), result)
+
+    # 4. 清理中文与数字之间多余空格（中文后空格→去掉，数字前空格→去掉）
+    result = _re.sub(r"([一-鿿])\s+(\d)", r"\1\2", result)
+    result = _re.sub(r"(\d)\s+([一-鿿])", r"\1\2", result)
+
+    # 5. 叠印分数 → 行内形式（如 ½ → 1/2）
+    FRACTIONS = {"½": "1/2", "⅓": "1/3", "⅔": "2/3", "¼": "1/4", "¾": "3/4",
+                 "⅕": "1/5", "⅖": "2/5", "⅗": "3/5", "⅘": "4/5",
+                 "⅙": "1/6", "⅚": "5/6", "⅛": "1/8", "⅜": "3/8", "⅝": "5/8", "⅞": "7/8"}
+    for frac_char, frac_text in FRACTIONS.items():
+        result = result.replace(frac_char, frac_text)
+
+    # 6. 两端空白清理
+    result = result.strip()
+    result = _re.sub(r"\s+", " ", result)
+
+    return result
+
+
+def _ocr_text_changed(previous: str, current: str) -> bool:
+    """整页 OCR 的新旧文本是否"实质不同"。
+
+    先去掉全部空白再比较：``_normalize_ocr_text`` 会改中文与数字之间的空格，
+    只按原文比较会把"归一化差异"误判成"人改了题面"，一次识别就把整页打 stale。
+    去掉空白后完全相同 → 没变；相似度 ≥ ``OCR_TEXT_SIMILARITY_THRESHOLD`` → 也
+    视为同一文本（OCR 逐字抖动同理）。只有真实变化才回传新文本。
+    """
+    old = re.sub(r"\s+", "", str(previous or ""))
+    new = re.sub(r"\s+", "", str(current or ""))
+    if old == new:
+        return False
+    if not old or not new:
+        # 一边为空：从无到有 / 从有到无都算实质变化
+        return True
+    ratio = difflib.SequenceMatcher(None, old, new).ratio()
+    return ratio < float(OCR_TEXT_SIMILARITY_THRESHOLD)
+
+
+def _page_ocr(payload: dict) -> dict:
+    """整页批量 OCR：用高精度 PaddleOCR 识别整页，按框返回题面文字。
+
+    **只覆盖文本确实变化的记录**（架构 §3.6）：整页 OCR 一定会把该页每个框的
+    文字重算一遍，若把结果无条件回传，一次识别就会让一页 20 题的快照全部失效、
+    人工量翻倍。所以这里按"归一化后是否实质相同"过滤：
+    没变的记录原样回传**旧文本**（前端应用后等于没改），并在 ``unchanged`` 里列出。
+    """
+    project_path, project = _load_project(payload)
+    kind = str(payload.get("kind", "question") or "question")
+    page_index = int(payload.get("page_index", -1))
+    pages_key = "answer_pages" if kind == "answer" else "pages"
+    pages = project.get(pages_key, [])
+    if page_index < 0 or page_index >= len(pages):
+        raise ValueError("页面序号无效。")
+    page = pages[page_index]
+    if str(page.get("status", "")) != "accepted":
+        raise ValueError("只有已确认的页面才能执行整页识别。")
+    image_path = annotation_data.source_path(project, page, kind == "answer")
+
+    records_key = "answers" if kind == "answer" else "questions"
+    records = [r for r in page.get(records_key, []) if isinstance(r, dict) and r.get("region_role", "question") == "question"]
+
+    if not records:
+        return {"ok": True, "results": {}, "unchanged": []}
+
+    # 整页高精度 OCR
+    ocr_items = ocr_image(image_path)
+    if not ocr_items:
+        # 识别不出东西时不能把已有文字清空：保住旧文本，只报"没识别到"
+        empty_results = {}
+        for record in records:
+            rid = str(record.get("id", ""))
+            empty_results[rid] = {
+                "text": str(record.get("text", "") or ""),
+                "confidence": 0.0,
+                "changed": False,
+            }
+        return {"ok": True, "results": empty_results,
+                "unchanged": [str(record.get("id", "")) for record in records]}
+
+    results = {}
+    unchanged: list[str] = []
+    for record in records:
+        box = record.get("bbox", [])
+        if not isinstance(box, (list, tuple)) or len(box) != 4:
+            continue
+        bx0, by0, bx1, by1 = (int(v) for v in box)
+        if bx1 <= bx0 or by1 <= by0:
+            continue
+        # 收集中心点落在框内的 OCR items，按 y 排序
+        inside = []
+        for item in ocr_items:
+            raw_box = item.get("bbox", [])
+            if not isinstance(raw_box, (list, tuple)):
+                continue
+            if len(raw_box) == 4 and all(isinstance(p, (int, float)) for p in raw_box):
+                ix0, iy0, ix1, iy1 = (int(v) for v in raw_box)
+            elif len(raw_box) == 4 and isinstance(raw_box[0], (list, tuple)):
+                pts = [int(round(v)) for p in raw_box for v in (p if isinstance(p, (list, tuple)) else [p])]
+                if len(pts) != 8:
+                    continue
+                ix0, iy0, ix1, iy1 = min(pts[0::2]), min(pts[1::2]), max(pts[0::2]), max(pts[1::2])
+            else:
+                continue
+            if ix1 <= ix0 or iy1 <= iy0:
+                continue
+            cx = (ix0 + ix1) / 2.0
+            cy = (iy0 + iy1) / 2.0
+            if bx0 <= cx <= bx1 and by0 <= cy <= by1:
+                inside.append((iy0, str(item.get("text", "") or "").strip(), float(item.get("conf", 0.0) or 0.0)))
+        # 按 y 排序后连接
+        inside.sort(key=lambda t: t[0])
+        text_parts = [t[1] for t in inside if t[1]]
+        text = "".join(text_parts)
+        conf = sum(t[2] for t in inside) / max(len(inside), 1) if inside else 0.0
+        text = _normalize_ocr_text(text)
+        rid = str(record.get("id", ""))
+        previous_text = str(record.get("text", "") or "")
+        if previous_text and not _ocr_text_changed(previous_text, text):
+            # 文字实质没变：回传旧值，前端应用后等于没改 → 不会触发快照失效
+            unchanged.append(rid)
+            results[rid] = {
+                "text": previous_text,
+                "confidence": round(conf, 4),
+                "engine": "paddleocr_local",
+                "changed": False,
+            }
+            continue
+        results[rid] = {
+            "text": text,
+            "confidence": round(conf, 4),
+            "engine": "paddleocr_local",
+            "changed": True,
+        }
+
+    return {"ok": True, "results": results, "unchanged": unchanged}
+
+
+def _enrich_prepare(payload: dict) -> dict:
+    """下发题图候选 + 触发快照冻结（G2 → G4 的入口）。
+
+    产物只写 ``record['illustration_candidates']`` 与 ``page['illustration_ready']``：
+    候选永远不是正式题图（``illustrations`` 只能由人点"采用"产生）。
+    同时在本次调用里把已确认页的题目快照冻结/失效一遍，让前端拿到的分级是新的。
+    """
+    if not _enrich_enabled():
+        return _enrich_disabled_response()
+    import cv2
+
+    from review_tools import illustration_candidates
+
+    project_path, project = _load_project(payload)
+    # 开关关闭期间保存的页面没有快照（0→1 的活锁）：prepare 是补建它们的自然入口，
+    # 否则那些记录会永远停在默认 L2，人工白看。
+    rebuilt = enrich_snapshot.rebuild_missing(project)
+    pages = project.get("pages") or []
+    if not pages:
+        return {"ok": True, "pages": 0, "candidates": 0, "frozen": 0, "stale": 0,
+                "results": []}
+
+    raw_indices = payload.get("page_indices")
+    if isinstance(raw_indices, list) and raw_indices:
+        try:
+            page_indices = sorted({int(value) for value in raw_indices})
+        except (TypeError, ValueError) as error:
+            raise ValueError("页面序号格式无效。") from error
+    elif payload.get("page_index") is not None:
+        try:
+            page_indices = [int(payload.get("page_index"))]
+        except (TypeError, ValueError) as error:
+            raise ValueError("页面序号格式无效。") from error
+    else:
+        page_indices = [
+            index for index, page in enumerate(pages)
+            if isinstance(page, dict) and str(page.get("status", "")) == "accepted"
+        ]
+    for index in page_indices:
+        if index < 0 or index >= len(pages):
+            raise ValueError("页面序号无效。")
+
+    results = []
+    total_candidates = 0
+    total_frozen = 0
+    total_stale = 0
+    for index in page_indices:
+        page = pages[index] if isinstance(pages[index], dict) else {}
+        if not page:
+            continue
+        page_result = {"page_index": index, "candidates": 0, "skipped": ""}
+        if str(page.get("status", "")) != "accepted":
+            page_result["skipped"] = "page_not_accepted"
+            results.append(page_result)
+            continue
+        records = [
+            record for record in page.get("questions") or []
+            if isinstance(record, dict)
+            and str(record.get("region_role", "question") or "question") == "question"
+        ]
+        image = None
+        try:
+            image_path = annotation_data.source_path(project, page, False)
+        except ValueError:
+            image_path = ""
+        if image_path:
+            try:
+                image = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
+            except Exception:  # noqa: BLE001 - 读不到图就当没候选，不拦住冻结
+                image = None
+        layout = None
+        if image is not None:
+            try:
+                import layout_arbiter
+
+                if layout_arbiter.is_enabled():
+                    layout = layout_arbiter.detect(image, with_regions=True)
+            except Exception:  # noqa: BLE001 - 版面裁判是可选依赖
+                layout = None
+        # layout 传空 dict 而不是 None：None 会让 collect() 再跑一次版面裁判。
+        candidates = illustration_candidates.collect(
+            image, index, records, layout=layout if isinstance(layout, dict) else {},
+        )
+        by_owner: dict[str, list] = {}
+        for item in candidates:
+            owner_id = str(item.get("owner_id") or "")
+            if owner_id:
+                by_owner.setdefault(owner_id, []).append(item)
+        for record in records:
+            record["illustration_candidates"] = by_owner.get(str(record.get("id") or ""), [])
+        # "没算" ≠ "没图"：版面裁判不可用时 illustration_ready 保持 False，
+        # 否则 no_image_candidate 规则会把整页题目误判 L2（§8.2）。
+        page["illustration_ready"] = isinstance(layout, dict)
+        if isinstance(layout, dict):
+            page["layout_revision"] = str(layout.get("revision") or "")
+        # 候选落位后必须在**同一事务**里重算本页级别：`illustration_ready` 由假变真
+        # 会让 no_image_candidate / image_owner_* 的结论翻转，不重算就留着假风险。
+        frozen = enrich_snapshot.freeze_page(
+            project, index, kind="question",
+            columns=(layout.get("columns") if isinstance(layout, dict) else None),
+        )
+        total_frozen += int(frozen.get("frozen", 0))
+        total_stale += int(frozen.get("stale", 0))
+        total_candidates += len(candidates)
+        page_result.update({
+            "candidates": len(candidates),
+            "frozen": frozen.get("frozen", 0),
+            "stale": frozen.get("stale", 0),
+            "illustration_ready": page["illustration_ready"],
+            "review_summary": frozen.get("review_summary", {}),
+        })
+        results.append(page_result)
+
+    annotation_data.save_project(project, project_path, increment_revision=False)
+    sync_project(project_path, project, ROOT / "runtime")
+    return {
+        "ok": True,
+        "pages": len([item for item in results if not item.get("skipped")]),
+        "candidates": total_candidates,
+        "frozen": total_frozen,
+        "stale": total_stale,
+        "rebuilt": rebuilt,
+        "results": results,
+        "project_revision": project.get("project_revision", 0),
+    }
+
+
+def _enrich_status(payload: dict) -> dict:
+    """分级 / 待办统计（只读，不落盘）：给 UI 的"本页风险 N 条"与批量面板用。"""
+    if not _enrich_enabled():
+        return _enrich_disabled_response()
+    _project_path, project = _load_project(payload)
+    enrichment = project.get("enrichment")
+    enrichment = enrichment if isinstance(enrichment, dict) else {}
+
+    records: list[dict] = []
+    page_summaries: list[dict] = []
+    positions: dict[str, int] = {}
+    for page_index, page in enumerate(project.get("pages") or []):
+        if not isinstance(page, dict):
+            continue
+        page_records = [
+            record for record in page.get("questions") or []
+            if isinstance(record, dict)
+            and str(record.get("region_role", "question") or "question") == "question"
+        ]
+        for record in page_records:
+            record_id = str(record.get("id") or "")
+            if record_id:
+                positions[record_id] = page_index
+            records.append(record)
+        page_summaries.append({
+            "page_index": page_index,
+            "image": str(page.get("image", "")),
+            "status": str(page.get("status", "")),
+            "illustration_ready": bool(page.get("illustration_ready", False)),
+            "record_count": len(page_records),
+            "review_summary": (
+                page.get("review_summary")
+                if isinstance(page.get("review_summary"), dict)
+                else enrich_snapshot.page_review_summary(page)
+            ),
+        })
+
+    status_counts: dict[str, int] = {}
+    for record in records:
+        key = str(record.get("enrich_status") or "none")
+        status_counts[key] = status_counts.get(key, 0) + 1
+
+    # "待办"与"不可计算/不可冻结"互斥（QA Round 8 缺口 1）：
+    # 没有可用快照的记录既算不出可信级别、也没法交付补全，单独归 blocked，
+    # 不能同时挂在 L2 风险与待办里 —— 否则同一道题会被数两次、人工以为有两条活。
+    pending_status = ("pending", "stale", "kp_stale", "analysis_stale", "failed", "rejected")
+    todo = []
+    blocked = []
+    for record in records:
+        record_id = str(record.get("id") or "")
+        level = str(record.get("review_level") or review_levels.DEFAULT_LEVEL)
+        status = str(record.get("enrich_status") or "none")
+        has_snapshot = enrich_snapshot.is_valid_snapshot(record.get("snapshot"))
+        item = {
+            "question_id": record_id,
+            "page_index": positions.get(record_id, -1),
+            "display_number": str(record.get("display_number", "")),
+            "review_level": level,
+            "review_reasons": list(record.get("review_reasons") or []),
+            "enrich_status": status,
+            "snapshot_id": str(record.get("snapshot_id") or ""),
+        }
+        if not has_snapshot:
+            blocked.append({**item, "blocked": "no_snapshot"})
+            continue
+        if level == "L0" and status not in pending_status:
+            continue
+        todo.append(item)
+
+    level_stats = review_levels.batch_stats(records)
+    return {
+        "ok": True,
+        "enabled": True,
+        "bridge_revision": PAPERFLOW_BRIDGE_REVISION,
+        "rule_version": review_levels.RULE_VERSION,
+        "schema_version": int(enrichment.get("schema_version", 1) or 1),
+        "taxonomy_version": str(enrichment.get("taxonomy_version") or ""),
+        "prompt_version": str(enrichment.get("prompt_version") or ""),
+        "model": str(enrichment.get("model") or ""),
+        "batch_id": str(enrichment.get("batch_id") or ""),
+        "degraded": enrichment.get("degraded") if isinstance(enrichment.get("degraded"), dict) else {},
+        "book_meta_rev": str(project.get("book_meta_rev") or ""),
+        "book_meta_locked": bool(project.get("book_meta_locked", False)),
+        "difficulty_scheme": str(project.get("difficulty_scheme") or "1-5"),
+        "level_stats": level_stats,
+        "review_summary": {
+            "L0": level_stats.get("L0", 0),
+            "L1": level_stats.get("L1", 0),
+            "L2": level_stats.get("L2", 0),
+        },
+        "enrich_summary": status_counts,
+        "todo_count": len(todo),
+        "todo": todo[:200],
+        "blocked_count": len(blocked),
+        "blocked": blocked[:200],
+        "pages": page_summaries,
+    }
+
+
+
+def _book_meta_suggest(payload: dict) -> dict:
+    """G0b：书名解析候选。**只出候选，绝不写库**（写库必须走 set-book-metadata）。"""
+    if not _enrich_enabled():
+        return _enrich_disabled_response()
+    _project_path, project = _load_project(payload)
+    title = str(payload.get("title", "") or "").strip()
+    if not title:
+        root_value = str(project.get("book_root") or project.get("image_root") or "")
+        title = Path(root_value).name if root_value else ""
+    scheme = str(project.get("difficulty_scheme") or "1-5")
+    candidates = book_meta.guess_book_metadata(title, difficulty_scheme=scheme)
+    current = {
+        key: str(project.get(key, "") or "")
+        for key in ("language", "stage", "grade", "subject", "difficulty_scheme")
+    }
+    proposed = dict(current)
+    for key in ("language", "stage", "grade", "subject"):
+        value = str(candidates.get(key) or "").strip()
+        if value:
+            proposed[key] = value
+    proposed["difficulty_scheme"] = scheme
+    validation = book_meta.validate_book_metadata_revision(
+        proposed,
+        str(project.get("book_meta_rev") or ""),
+        locked=bool(project.get("book_meta_locked", False)),
+    )
+    return {
+        "ok": True,
+        "title": title,
+        "candidates": candidates,
+        "current": current,
+        "proposed": proposed,
+        "book_meta_rev": str(project.get("book_meta_rev") or ""),
+        "book_meta_locked": bool(project.get("book_meta_locked", False)),
+        "validation": validation,
+        "note": "候选仅供参考，必须人工确认后由 set-book-metadata 落库；书级字段一错污染整本。",
+    }
 
 
 ROUTES = {
@@ -1137,6 +2266,7 @@ ROUTES = {
     "/api/project/auto-match-scopes": _auto_match_scopes,
     "/api/project/set-delivery-output": _set_delivery_output,
     "/api/project/set-book-metadata": _set_book_metadata,
+    "/api/project/set-ocr-settings": _set_ocr_settings,
     "/api/project/save-cache": _save_project_cache,
     "/api/project/delivery-location": _delivery_location,
     "/api/project/workspace-page": _workspace_page,
@@ -1144,6 +2274,13 @@ ROUTES = {
     "/api/project/sync-delivery": _sync_delivery,
     "/api/project/group-export-preflight": _group_export_preflight,
     "/api/project/export-match-scope": _export_match_scope,
+    "/api/review/submit": _review_submit,
+    "/api/review/pull-decisions": _review_pull_decisions,
+    "/api/review/upload-delivery": _review_upload_delivery,
+    "/api/project/enrich-prepare": _enrich_prepare,
+    "/api/project/enrich-status": _enrich_status,
+    "/api/project/book-meta-suggest": _book_meta_suggest,
+    "/api/project/page-ocr": _page_ocr,
 }
 
 
@@ -1171,7 +2308,14 @@ class PaperFlowHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib request handler API
         if urlparse(self.path).path == "/api/health":
-            self._respond(HTTPStatus.OK, {"ok": True, "service": "paperflow-local"})
+            self._respond(HTTPStatus.OK, {
+                "ok": True,
+                "service": "paperflow-local",
+                "bridge_revision": PAPERFLOW_BRIDGE_REVISION,
+                # 让排查和前端提示都能知道模型是否已经热好：
+                # pending / loading / ready / failed / disabled。
+                "prewarm": prewarm_state(),
+            })
             return
         self._respond(HTTPStatus.NOT_FOUND, {"ok": False, "error": "Not found"})
 
@@ -1193,20 +2337,145 @@ class PaperFlowHandler(BaseHTTPRequestHandler):
                     result = route(payload)
             else:
                 result = route(payload)
-            self._respond(HTTPStatus.OK, result)
         except ValueError as error:
             self._respond(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(error)})
+            return
         except Exception as error:  # Keep a local worker failure actionable in UI.
             traceback.print_exc()
             self._respond(HTTPStatus.INTERNAL_SERVER_ERROR, {
                 "ok": False,
                 "error": f"本地预标注失败：{error}",
             })
+            return
+        # 成功响应必须放在 try 之外。以前它在 try 里，前端超时断开后写入
+        # 会抛 ConnectionAbortedError，被 except 当成业务失败再写一次响应，
+        # 日志里因此刷出两段自相矛盾的 traceback。
+        self._respond(HTTPStatus.OK, result)
+
+
+# ── 启动预热 ────────────────────────────────────────────────────────────
+# 首次「自动框题」原本要在请求线程里加载 PP-OCRv5 轻量模型和中等模型，
+# 冷启动实测 100~150 秒，远超标注员的耐心，日志里看起来就像程序卡死。
+# 这里在服务启动后空闲时先把模型加载好，用户点击时只剩推理时间。
+# 排查问题时可用环境变量 PAPERFLOW_DISABLE_PREWARM=1 关闭预热。
+PREWARM_DELAY_SECONDS = 6.0
+PREWARM_STATE_LOCK = threading.Lock()
+PREWARM_STATE: dict[str, object] = {"status": "pending", "seconds": 0.0, "detail": ""}
+
+
+def _set_prewarm_state(status: str, seconds: float = 0.0, detail: str = "") -> None:
+    with PREWARM_STATE_LOCK:
+        PREWARM_STATE.update({
+            "status": status,
+            "seconds": round(seconds, 1),
+            "detail": detail,
+        })
+
+
+def prewarm_state() -> dict:
+    """Return a copy so callers (health check, logs) never mutate shared state."""
+    with PREWARM_STATE_LOCK:
+        return dict(PREWARM_STATE)
+
+
+def _prewarm_layout_arbiter() -> str:
+    """预热版面裁判模型，返回一句可直接拼到日志里的说明。
+
+    裁判只在"现有规则分出 ≥3 栏"时才介入（实测约 7% 的页），所以它的加载
+    被放在 OCR 之后：绝大多数点击用不到它，但真用到时不该再等 5~15 秒。
+    任何异常都只降级为"不预热"，绝不影响 OCR 预热的成功判定。
+    """
+    try:
+        import layout_arbiter
+
+        if not layout_arbiter.is_enabled():
+            return "；版面裁判已按开关关闭"
+        if not layout_arbiter.available():
+            return "；版面裁判模型缺失，将按原规则运行"
+        started = time.perf_counter()
+        with PRELABEL_INFERENCE_LOCK:
+            layout_arbiter._get_pipe()  # noqa: SLF001 预热，与 detect 复用同一单例
+        elapsed = time.perf_counter() - started
+        return f"；版面裁判已就绪（{elapsed:.1f} 秒）"
+    except Exception as error:  # noqa: BLE001 - 预热失败必须静默降级
+        print(f"[预热] 版面裁判未加载（不影响使用）：{error}", flush=True)
+        return "；版面裁判未加载，将按原规则运行"
+
+
+def _prewarm_ocr_models() -> None:
+    """Load both local OCR predictors before an annotator asks for a page.
+
+    Runs on a daemon thread and takes ``PRELABEL_INFERENCE_LOCK`` exactly like a
+    real pre-label call: a click that arrives mid-warm-up waits for the same
+    model load it would otherwise have triggered itself, instead of two threads
+    driving one Paddle predictor.
+    """
+    started = time.perf_counter()
+    _set_prewarm_state("loading")
+    try:
+        import cut_questions_v4 as cutter
+
+        print("[预热] 后台加载本地 OCR 模型（此时仍可正常打开教材、翻页、画框）...", flush=True)
+        with PRELABEL_INFERENCE_LOCK:
+            fast_engine = cutter.get_fast_ocr_engine()
+            print(
+                f"[预热] 轻量结构扫描模型{'已就绪' if fast_engine is not None else '不可用，将回退高精度'}",
+                flush=True,
+            )
+            cutter.get_ocr_engine()
+            print("[预热] 高精度识别模型已就绪", flush=True)
+            # 一次极小空白图推理，让 Paddle 完成首次算子编译与内存分配。
+            # 个别版本在空白图上会报错，这不影响真实页面识别，忽略即可。
+            canvas = np.full((240, 180, 3), 255, dtype=np.uint8)
+            for label, attribute in (("轻量", "_run_fast_ocr"), ("高精度", "_run_ocr")):
+                runner = getattr(cutter, attribute, None)
+                if runner is None:
+                    continue
+                try:
+                    runner(canvas)
+                except Exception as error:  # noqa: BLE001 - 试跑失败必须降级
+                    print(f"[预热] {label}模型试跑跳过：{error}", flush=True)
+        elapsed = time.perf_counter() - started
+        # 版面裁判单独预热：它只有 7% 的页面会真正用到，但一旦用到就要额外
+        # 5~15 秒加载模型。放在 OCR 之后、用独立 try，失败不牵连 OCR 预热结论。
+        arbiter_note = _prewarm_layout_arbiter()
+        _set_prewarm_state("ready", elapsed, arbiter_note)
+        print(
+            f"[预热] 本地 OCR 已就绪，耗时 {elapsed:.1f} 秒；首次自动框题无需再等模型加载。"
+            + (f"{arbiter_note}" if arbiter_note else ""),
+            flush=True,
+        )
+    except Exception as error:  # noqa: BLE001 - 预热失败绝不能影响服务可用性
+        elapsed = time.perf_counter() - started
+        traceback.print_exc()
+        _set_prewarm_state("failed", elapsed, str(error))
+        print(
+            f"[预热] 本地 OCR 预热失败（不影响使用，点击时仍会自行加载）：{error}",
+            flush=True,
+        )
+
+
+def _start_prewarm_thread() -> None:
+    disabled = os.environ.get("PAPERFLOW_DISABLE_PREWARM", "").strip().lower()
+    if disabled in {"1", "true", "yes", "on"}:
+        _set_prewarm_state("disabled")
+        print("[预热] 已按 PAPERFLOW_DISABLE_PREWARM 关闭预热。", flush=True)
+        return
+
+    def runner() -> None:
+        # 先让 Electron 的健康检查完成握手，再占用 CPU 加载模型，
+        # 否则启动瞬间的模型加载可能让健康检查超时。
+        time.sleep(PREWARM_DELAY_SECONDS)
+        _prewarm_ocr_models()
+
+    threading.Thread(target=runner, name="paperflow-ocr-prewarm", daemon=True).start()
 
 
 def main() -> None:
     server = ThreadingHTTPServer(("127.0.0.1", 8601), PaperFlowHandler)
+    server.daemon_threads = True
     print("PaperFlow local annotation bridge listening on 127.0.0.1:8601", flush=True)
+    _start_prewarm_thread()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

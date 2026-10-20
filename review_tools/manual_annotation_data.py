@@ -16,12 +16,65 @@ import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 
+from review_tools import review_levels
+
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
 REGION_ROLES = {"question", "group", "continuation", "shared_material"}
 ANSWER_MODES = {"textbook", "generate_later", "mixed"}
 DELIVERY_ID_PATTERN = re.compile(r"^[A-Za-z0-9]+$")
 GENERATED_DELIVERY_MARKERS = {"manifest.json", "database_import.json", "quality_report.json"}
+# 记录级"后端独占"字段：渲染层从不写它们，整工程 autosave 时必须原样接住。
+# 这是 R2 的唯一防线 —— 少了它，员工用旧版 Electron 打开工程点一次保存，
+# 整本的 AI 补全结果（快照/分级/知识点）就会被前端快照覆盖抹掉。
+ENRICH_PERSISTENT_KEYS = (
+    "snapshot", "snapshot_id", "review_level", "review_reasons",
+    "field_source", "field_confidence", "enrich_status", "enrich_error",
+    "illustration_candidates", "kp_codes", "kp_rejected", "analysis_check",
+    "pair", "review_trace",
+)
+# 页级同类字段（§2.3）：候选就绪标记与分级计数同样只由后端写。
+ENRICH_PERSISTENT_PAGE_KEYS = (
+    "review_summary", "illustration_ready", "layout_revision",
+    "page_consistency", "question_density",
+)
+# 工程级：整本补全状态与书级口径，渲染层只读。
+ENRICH_PERSISTENT_PROJECT_KEYS = (
+    "enrichment", "book_meta_rev", "book_meta_locked", "difficulty_scheme",
+)
+# 新字段的默认值：老工程读出来字段齐全，调用方不必到处 .get 兜底。
+ENRICH_DEFAULT_VALUES = {
+    "snapshot": None,
+    "snapshot_id": "",
+    "review_level": "L2",          # 没算过就按需人看（§2.4 第 3 条）
+    "review_reasons": [],
+    "field_source": {},
+    "field_confidence": {},
+    "enrich_status": "none",
+    "enrich_error": "",
+    "illustration_candidates": [],
+    "kp_codes": [],
+    "kp_rejected": [],
+    "analysis_check": {},
+    "pair": {},
+    "review_trace": {},
+}
+# normalize_record 只补惰性字段（含 review_reasons 但不含 review_level）：
+# 记录在"后端算出级别"之前不带任何分级外观。
+ENRICH_NORMALIZE_DEFAULTS = {
+    key: value for key, value in ENRICH_DEFAULT_VALUES.items() if key != "review_level"
+}
+
+
+def enrich_fields_enabled() -> bool:
+    """补全流水线总开关（与桥服务同一个环境变量、同一套取值）。
+
+    ``PAPERFLOW_ENRICH=0`` 时数据层也不补这 14 个字段，读盘结果与接入前逐字节
+    一致 —— "关闭开关 = 回到旧行为"必须连字段都不出现，否则 UI/交付层仍会
+    因为读到默认 ``L2`` 而改变行为。
+    """
+    value = str(os.environ.get("PAPERFLOW_ENRICH", "1")).strip().lower()
+    return value not in {"0", "false", "no", "off"}
 _CIRCLED_NUMBERS = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
 _CHINESE_DIGITS = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
                    "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
@@ -248,7 +301,52 @@ def normalize_record(record: dict) -> dict:
     )
     record["display_number"] = display_number(record)
     record["minor_number_inferred"] = bool(record.get("minor_number_inferred", False))
+    # 补全流水线的记录级字段：只补缺失，不覆盖已有值。分级字段（review_level）
+    # 刻意不在这里补 —— 新建记录在"后端算出级别"之前不该带任何徽标，
+    # 否则关闭 PAPERFLOW_ENRICH 时老工程会突然显示成一片 L2。
+    if enrich_fields_enabled():
+        for key, default in ENRICH_NORMALIZE_DEFAULTS.items():
+            if key not in record:
+                record[key] = _clone(default)
     return record
+
+
+def apply_enrich_defaults(record: dict) -> dict:
+    """读盘时把 14 个补全字段补齐（老工程读出来字段齐全）。
+
+    与 :func:`normalize_record` 的区别只有一条：这里连 ``review_level`` 也补成
+    ``L2``（§2.4 的默认值"没算过就按需人看"）。只在 ``load_project`` 里用 ——
+    也就是说：**磁盘上读出来的记录**是齐的，**前端新建的记录**不带分级。
+
+    默认级别的两个取值都来自 :mod:`review_tools.review_levels`（``DEFAULT_LEVEL``
+    与 ``RULE_VERSION``），**不写字面量**：否则导出守门与这里会在某次规则升版后
+    各说各话（QA Round 8 缺口 3）。补出来的这一条在 ``review_trace`` 里明确标
+    ``level_source='default'``、``computed_at=''``，交付门禁据此区分
+    "算过是 L2" 和 "从没算过"。
+    """
+    if not isinstance(record, dict):
+        return record
+    for key, default in ENRICH_DEFAULT_VALUES.items():
+        if key not in record:
+            record[key] = _clone(default)
+        elif record[key] is None and default is not None:
+            record[key] = _clone(default)
+    if "review_level" not in record or not str(record.get("review_level") or "").strip():
+        record["review_level"] = review_levels.DEFAULT_LEVEL
+        trace = record.get("review_trace")
+        trace = dict(trace) if isinstance(trace, dict) else {}
+        if not str(trace.get("computed_at") or ""):
+            trace.setdefault("level_source", "default")
+            trace["rule_version"] = review_levels.RULE_VERSION
+            record["review_trace"] = trace
+    return record
+
+
+def _clone(value):
+    """深拷贝一个 JSON 值；用于把默认值/权威字段接进另一条记录。"""
+    if isinstance(value, (dict, list)):
+        return json.loads(json.dumps(value, ensure_ascii=False))
+    return value
 
 
 def _image_key(path: Path) -> tuple[int, int | str, str]:
@@ -412,6 +510,7 @@ def create_project(question_root: str, answer_root: str = "", profile: str = "ge
         "ignored_pages": [],
         "match_scopes": [],
         "answer_mode": "textbook",
+        "ocr_settings": {"auto_page_ocr_on_confirm": True},
         "pairs": [],
     }
 
@@ -441,9 +540,32 @@ def create_book_project(book_root: str, profile: str = "general") -> dict:
         "ignored_pages": [],
         "match_scopes": [],
         "answer_mode": "textbook",
+        "ocr_settings": {"auto_page_ocr_on_confirm": True},
         "pairs": [],
     }
     return project
+
+
+def sync_page_profiles(project: dict, profile: str, previous: str = "") -> bool:
+    """让页面级 profile 跟随教材级：只覆盖空值、general 和上一版自动值。
+
+    页面级 profile 是 Qt 工作台、切题评估等入口直接读取的字段，只改教材级
+    会让这些入口仍按旧版式切题；而人工单独调过某页时不应当被覆盖。
+    """
+    if not profile:
+        return False
+    changed = False
+    for pages_key in ("pages", "answer_pages"):
+        for page in project.get(pages_key, []):
+            if not isinstance(page, dict):
+                continue
+            current = str(page.get("profile", "") or "").strip()
+            if current not in {"", "general"} and current != previous:
+                continue
+            if current != profile:
+                page["profile"] = profile
+                changed = True
+    return changed
 
 
 def default_book_project_path(book_root: str, runtime_root: str | os.PathLike[str]) -> Path:
@@ -513,13 +635,17 @@ def merge_persistent_delivery_state(incoming: dict, existing: dict) -> None:
         incoming["delivery_book_id"] = existing_book_id
 
     # These fields are changed through dedicated backend endpoints and are not
-    # editable by the whole-project cache form.
+    # editable by the whole-project cache form.  The layout profile belongs here
+    # as well: it can be resolved by a background detection job after the
+    # renderer took its snapshot, and a stale snapshot must not undo that.
     for key in (
         "book_root", "image_root", "answer_image_root",
         "delivery_output_root", "language", "stage", "grade", "subject",
+        "profile", "profile_source", "profile_reason", "profile_locked",
+        *ENRICH_PERSISTENT_PROJECT_KEYS,
     ):
         if key in existing:
-            incoming[key] = existing[key]
+            incoming[key] = _clone(existing[key])
         elif key in {"book_root", "image_root", "answer_image_root"}:
             incoming.pop(key, None)
 
@@ -538,16 +664,23 @@ def merge_persistent_delivery_state(incoming: dict, existing: dict) -> None:
         ("ignored_pages", "answers", "A"),
     ):
         authoritative = {
-            str(record["id"]): str(record.get("delivery_id", "") or "")
+            str(record["id"]): record
             for record in records(existing, pages_key, records_key)
         }
         for record in records(incoming, pages_key, records_key):
-            public_id = authoritative.get(str(record["id"]), "")
+            source = authoritative.get(str(record["id"]), {})
+            public_id = str(source.get("delivery_id", "") or "")
             if _valid_delivery_id(public_id, prefix):
                 record["delivery_id"] = public_id
+            # R2 的唯一防线：这些字段只有后端会写，渲染层的整工程快照里可能
+            # 根本没有（旧版 UI）或是过期值 —— 一律以磁盘上的后端状态为准。
+            for key in ENRICH_PERSISTENT_KEYS:
+                if key in source:
+                    record[key] = _clone(source[key])
 
     # Page rotation is changed only through the dedicated backend endpoint.
     # Preserve it by immutable source-image identity during whole-cache saves.
+    # 页级的候选就绪标记与分级计数同理：它们是后端写的，旧版渲染层不认识。
     for pages_key in ("pages", "answer_pages", "ignored_pages"):
         authoritative_pages = {
             str(page.get("image", "")): page
@@ -562,6 +695,9 @@ def merge_persistent_delivery_state(incoming: dict, existing: dict) -> None:
                     page[key] = authoritative[key]
                 else:
                     page.pop(key, None)
+            for key in ENRICH_PERSISTENT_PAGE_KEYS:
+                if key in authoritative:
+                    page[key] = _clone(authoritative[key])
 
     incoming_question_ids = {
         str(record["id"])
@@ -613,6 +749,9 @@ def merge_persistent_delivery_state(incoming: dict, existing: dict) -> None:
 
 
 def save_project(project: dict, path: str | os.PathLike[str], *, increment_revision: bool = True) -> None:
+    # Internal marker used only while opening an older batch-preannotation
+    # project.  It must never leak into the durable project schema.
+    project.pop("_paperflow_scope_migration_pending", None)
     project["annotation_version"] = 5
     try:
         revision = max(0, int(project.get("project_revision", 0)))
@@ -627,6 +766,154 @@ def save_project(project: dict, path: str | os.PathLike[str], *, increment_revis
     temporary = target.with_suffix(target.suffix + ".tmp")
     temporary.write_text(json.dumps(project, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(temporary, target)
+    _mirror_project_to_shared_delivery(project)
+
+
+def is_company_public_delivery_root(value: object) -> bool:
+    """Return whether a legacy PaperFlow public-share path was selected.
+
+    Final delivery now travels through the authenticated review service.  Keep
+    this narrow allowlist of retired paths so local folders and unrelated
+    company shares are not unexpectedly changed.
+    """
+    normalized = str(value or "").strip().replace("/", "\\").rstrip("\\").casefold()
+    return normalized == r"\\192.168.1.204\paperflowtest\projects" or normalized == r"f:\paperflowdata\public\projects"
+
+
+def _mirror_project_to_shared_delivery(project: dict) -> None:
+    """Publish a read-only progress snapshot beside a shared delivery package.
+
+    The local annotation project remains authoritative.  A transient SMB failure
+    must never prevent a staff member from saving local work, so this best-effort
+    mirror is intentionally non-fatal and will be refreshed by the next save.
+    """
+    configured_root = str(project.get("delivery_output_root", "") or "").strip()
+    book_id = str(project.get("delivery_book_id", "") or "").strip()
+    if not configured_root or not book_id or is_company_public_delivery_root(configured_root):
+        return
+    root = Path(configured_root).expanduser()
+    if not root.is_absolute():
+        return
+    target = root.resolve() / book_id / "PaperFlow标注项目.json"
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(json.dumps(project, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, target)
+    except OSError:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _migrate_batch_page_scopes_to_frame_regions(project: dict) -> bool:
+    """Convert legacy cutter page-wide scopes into the actual emitted frames.
+
+    Only the old batch-preannotation format is migrated.  A staff member's
+    deliberate page-wide scope must retain its meaning, so normal/manual
+    projects are never changed here.
+    """
+    if str(project.get("preannotation_mode", "") or "") != "paperflow":
+        return False
+    changed = False
+    for pages_key, records_key in (("pages", "questions"), ("answer_pages", "answers")):
+        for page in project.get(pages_key, []):
+            page_scope = str(page.get("match_scope_id", "") or "").strip()
+            regions = page.get("match_scope_regions", [])
+            if not page_scope or not isinstance(regions, list) or regions:
+                continue
+            migrated_regions = []
+            seen = set()
+            for record in page.get(records_key, []):
+                record_scope = str(record.get("match_scope_id", "") or "").strip()
+                # Old batch output used the page as a fallback for ordinary
+                # records.  Explicitly unassigned fallback answer frames must
+                # stay out of any group.
+                if not record_scope and record.get("origin") != "batch_unmatched_answer":
+                    record_scope = page_scope
+                    record["match_scope_id"] = page_scope
+                if record_scope != page_scope:
+                    continue
+                box = record.get("bbox", [])
+                if not isinstance(box, (list, tuple)) or len(box) != 4:
+                    continue
+                try:
+                    normalized_box = [int(round(float(value))) for value in box]
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if normalized_box[2] <= normalized_box[0] or normalized_box[3] <= normalized_box[1]:
+                    continue
+                key = (record_scope, tuple(normalized_box))
+                if key in seen:
+                    continue
+                seen.add(key)
+                migrated_regions.append({
+                    "id": "region-prelabel-" + str(record.get("id", "") or len(migrated_regions) + 1),
+                    "scope_id": record_scope,
+                    "bbox": normalized_box,
+                })
+            if migrated_regions:
+                page["match_scope_id"] = ""
+                page["match_scope_regions"] = migrated_regions
+                changed = True
+    return changed
+
+
+def _migrate_region_scope_overrides(project: dict) -> bool:
+    """Resolve the old "whole page + later region" assignment ambiguity.
+
+    A region selection is an explicit, later user action and therefore replaces
+    a previous page-wide default. Earlier UI versions retained both fields,
+    which made the coverage panel report "whole page" and kept unselected
+    frames in the old group. Materialise the region memberships on the records,
+    then remove the stale page default.
+    """
+    changed = False
+    for pages_key, records_key in (("pages", "questions"), ("answer_pages", "answers")):
+        for page in project.get(pages_key, []):
+            page_scope = str(page.get("match_scope_id", "") or "").strip()
+            regions = page.get("match_scope_regions", [])
+            if not page_scope or not isinstance(regions, list) or not regions:
+                continue
+            valid_regions = []
+            for region in regions:
+                if not isinstance(region, dict):
+                    continue
+                scope_id = str(region.get("scope_id", "") or "").strip()
+                box = region.get("bbox", [])
+                if not scope_id or not isinstance(box, (list, tuple)) or len(box) != 4:
+                    continue
+                try:
+                    x0, y0, x1, y1 = (float(value) for value in box)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if x1 <= x0 or y1 <= y0:
+                    continue
+                valid_regions.append((scope_id, x0, y0, x1, y1))
+            if not valid_regions:
+                continue
+            for record in page.get(records_key, []):
+                if str(record.get("match_scope_id", "") or "").strip() == page_scope:
+                    record["match_scope_id"] = ""
+                    changed = True
+            for scope_id, x0, y0, x1, y1 in valid_regions:
+                for record in page.get(records_key, []):
+                    box = record.get("bbox", [])
+                    if not isinstance(box, (list, tuple)) or len(box) != 4:
+                        continue
+                    try:
+                        center_x = (float(box[0]) + float(box[2])) / 2
+                        center_y = (float(box[1]) + float(box[3])) / 2
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    if x0 <= center_x <= x1 and y0 <= center_y <= y1:
+                        if str(record.get("match_scope_id", "") or "") != scope_id:
+                            record["match_scope_id"] = scope_id
+                            changed = True
+            page["match_scope_id"] = ""
+            changed = True
+    return changed
 
 
 def load_project(path: str | os.PathLike[str]) -> dict:
@@ -660,8 +947,22 @@ def load_project(path: str | os.PathLike[str]) -> dict:
         page.setdefault("original_kind", "question")
         page.setdefault("match_scope_id", "")
         page.setdefault("match_scope_regions", [])
+    if _migrate_batch_page_scopes_to_frame_regions(project):
+        project["_paperflow_scope_migration_pending"] = True
+    if _migrate_region_scope_overrides(project):
+        project["_paperflow_scope_migration_pending"] = True
     ensure_ids(project)
     ensure_delivery_ids(project)
+    # 老工程读出来补齐 14 个补全字段：UI/交付/分级三处都直接读，不再各自兜底。
+    # 开关关闭时整段跳过（读盘结果与接入前一致）。
+    if enrich_fields_enabled():
+        for pages_key, records_key in (("pages", "questions"), ("answer_pages", "answers"),
+                                      ("ignored_pages", "questions"), ("ignored_pages", "answers")):
+            for page in project.get(pages_key) or []:
+                if not isinstance(page, dict):
+                    continue
+                for record in page.get(records_key) or []:
+                    apply_enrich_defaults(record)
     return project
 
 
@@ -921,6 +1222,59 @@ def _tokens(value: object) -> set[str]:
     return set(re.findall(r"[\u4e00-\u9fff]{1,6}|[A-Za-z]{2,}|\d+", str(value or "").lower()))
 
 
+def is_match_ready(page: dict, record: dict) -> bool:
+    """Whether one confirmed record is currently available to answer matching.
+
+    An answer page can be confirmed as a page while the reviewer deliberately
+    exposes only selected match-scope rectangles to matching.  Older projects
+    have no selection field and retain the historical whole-page behaviour.
+    """
+    if str(page.get("status", "")) != "accepted":
+        return False
+    # New confirmations persist the exact answer-frame IDs rather than only
+    # the selected scope rectangles.  This makes "select all on this page"
+    # include ungrouped frames too, and keeps the result stable after reload.
+    if "confirmed_match_record_ids" in page:
+        return str(record.get("id", "")).strip() in {
+            str(value).strip()
+            for value in page.get("confirmed_match_record_ids", [])
+            if str(value).strip()
+        }
+    regions = page.get("match_scope_regions", [])
+    if not isinstance(regions, list) or not regions:
+        return True
+    if "confirmed_match_scope_region_ids" not in page:
+        return True
+    selected_ids = {
+        str(value).strip()
+        for value in page.get("confirmed_match_scope_region_ids", [])
+        if str(value).strip()
+    }
+    if not selected_ids:
+        return False
+    box = record.get("bbox", []) if isinstance(record, dict) else []
+    if not isinstance(box, (list, tuple)) or len(box) != 4:
+        return False
+    try:
+        center_x = (float(box[0]) + float(box[2])) / 2
+        center_y = (float(box[1]) + float(box[3])) / 2
+    except (TypeError, ValueError, OverflowError):
+        return False
+    for region in regions:
+        if not isinstance(region, dict) or str(region.get("id", "")).strip() not in selected_ids:
+            continue
+        region_box = region.get("bbox", [])
+        if not isinstance(region_box, (list, tuple)) or len(region_box) != 4:
+            continue
+        try:
+            x0, y0, x1, y1 = (float(value) for value in region_box)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if x0 <= center_x <= x1 and y0 <= center_y <= y1:
+            return True
+    return False
+
+
 def candidates(project: dict, question: dict, limit: int = 30,
                accepted_only: bool = False) -> list[tuple[float, int, dict, dict]]:
     """Rank local candidates; it is assistance, never an automatic pairing."""
@@ -934,7 +1288,7 @@ def candidates(project: dict, question: dict, limit: int = 30,
     context = _tokens(" ".join(str(question.get(key, "")) for key in ("major_title", "context", "text")))
     ranked = []
     for page_index, page, answer in all_answers(project):
-        if accepted_only and str(page.get("status", "")) != "accepted":
+        if accepted_only and not is_match_ready(page, answer):
             continue
         normalize_record(answer)
         if answer.get("region_role") != "question":
