@@ -751,7 +751,7 @@ class AnnotationApiTests(unittest.TestCase):
             first_answer["id"], second_answer["id"], ungrouped_answer["id"],
         })
 
-    def test_scope_auto_match_accepts_only_unique_confirmed_canonical_numbers(self) -> None:
+    def test_scope_auto_match_pairs_same_scope_and_canonical_number(self) -> None:
         scope = api._upsert_match_scope({
             "project_path": str(self.project_path), "name": "第二单元",
         })["scope"]
@@ -776,7 +776,8 @@ class AnnotationApiTests(unittest.TestCase):
         self.assertEqual(result["pairs"][0]["source"], "scope_number_auto")
         self.assertEqual(result["pairs"][0]["answer_ids"], ["a-scoped"])
 
-    def test_scope_auto_match_abstains_when_a_number_is_ambiguous(self) -> None:
+    def test_scope_auto_match_pairs_duplicate_numbers_to_the_same_answer(self) -> None:
+        """新规则：同分组+同题号即自动配对；同号多题共用同一答案。"""
         project = api.annotation_data.load_project(self.project_path)
         scope_id = "scope-duplicate"
         project["match_scopes"] = [{"id": scope_id, "name": "重复题号试卷"}]
@@ -789,8 +790,11 @@ class AnnotationApiTests(unittest.TestCase):
         ])
         api.annotation_data.save_project(project, self.project_path)
         result = api._auto_match_scopes({"project_path": str(self.project_path)})
-        self.assertEqual(result["accepted_count"], 0)
-        self.assertEqual(result["conflict_count"], 1)
+        self.assertEqual(result["accepted_count"], 2)
+        self.assertEqual(result["conflict_count"], 0)
+        answer_id = project["answer_pages"][0]["answers"][0]["id"]
+        paired_answers = {tuple(pair["answer_ids"]) for pair in result["pairs"]}
+        self.assertEqual(paired_answers, {(answer_id,)})
 
     def test_selected_question_and_answer_pages_can_be_removed_from_a_scope(self) -> None:
         scope = api._upsert_match_scope({

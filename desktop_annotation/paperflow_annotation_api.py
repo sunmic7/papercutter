@@ -63,7 +63,7 @@ PRELABEL_INFERENCE_LOCK = threading.Lock()
 PRELABEL_INFLIGHT_LOCK = threading.Lock()
 PRELABEL_INFLIGHT: dict[tuple, "_PrelabelFlight"] = {}
 ANSWER_PRELABEL_REVIEW_THRESHOLD = 120
-PAPERFLOW_BRIDGE_REVISION = "moved-book-root-heal-20261020"
+PAPERFLOW_BRIDGE_REVISION = "scope-number-match-relaxed-20261020"
 # 总开关：置 0/false/no/off 时 _save_page 不冻结不分级、三条 enrich 路由直接返回
 # {"ok": false, "disabled": true}，主流程行为与接入前完全一致。
 ENRICH_DISABLED_VALUES = {"0", "false", "no", "off"}
@@ -1477,7 +1477,12 @@ def _remove_match_scope_pages(payload: dict) -> dict:
 
 
 def _auto_match_scopes(payload: dict) -> dict:
-    """Match only unique confirmed Q/A records sharing scope and canonical number."""
+    """Match confirmed Q/A records sharing scope and canonical number.
+
+    按用户规则放宽：同分组且完整题号相同即自动配对，不再要求两侧唯一。
+    同号的多道题（常见于跨页续题被切成多个框）会共用同一批答案；没有
+    对应答案的题号保持待处理，交人工核对。
+    """
     project_path, project = _load_project(payload)
     existing_questions = {
         str(pair.get("question_id", "")) for pair in project.get("pairs", [])
@@ -1503,7 +1508,7 @@ def _auto_match_scopes(payload: dict) -> dict:
         if scope_id and path:
             answer_map.setdefault((scope_id, path), []).append(record)
 
-    proposals: list[tuple[str, str, str]] = []
+    proposals: list[tuple[str, list[str], str]] = []
     conflicts = []
     all_keys = sorted(set(question_map).union(answer_map), key=lambda item: (item[0], item[1]))
     for scope_id, path in all_keys:
@@ -1511,30 +1516,33 @@ def _auto_match_scopes(payload: dict) -> dict:
         answers = answer_map.get((scope_id, path), [])
         available_questions = [item for item in questions if str(item.get("id", "")) not in existing_questions]
         available_answers = [item for item in answers if str(item.get("id", "")) not in used_answers]
-        if len(questions) == 1 and len(answers) == 1 and len(available_questions) == 1 and len(available_answers) == 1:
-            proposals.append((str(questions[0]["id"]), str(answers[0]["id"]), scope_id))
+        if available_questions and available_answers:
+            answer_ids = [str(item["id"]) for item in available_answers]
+            for question in available_questions:
+                proposals.append((str(question["id"]), answer_ids, scope_id))
         elif questions or answers:
             conflicts.append({
                 "scope_id": scope_id,
                 "number": "-".join(path),
                 "question_count": len(questions),
                 "answer_count": len(answers),
-                "reason": "ambiguous_or_already_matched",
+                "reason": "no_available_counterpart",
             })
     saved_pairs = []
-    for question_id, answer_id, scope_id in proposals:
+    for question_id, answer_ids, scope_id in proposals:
         annotation_data.set_pair(
-            project, question_id, [answer_id], "accepted", source="scope_number_auto"
+            project, question_id, answer_ids, "accepted", source="scope_number_auto"
         )
         # 同分组自动配对也必须落 pair 字典，否则分级会把它误判成 pair_fail（L2）。
-        _write_pair_metrics(project, question_id, [answer_id])
+        _write_pair_metrics(project, question_id, answer_ids)
         saved_pairs.append(next(
             pair for pair in project.get("pairs", [])
             if str(pair.get("question_id", "")) == question_id
         ))
     if proposals and _enrich_enabled():
         enrich_snapshot.refresh_answer_segment(
-            project, [answer_id for _question_id, answer_id, _scope_id in proposals],
+            project,
+            sorted({answer_id for _question_id, answer_ids, _scope_id in proposals for answer_id in answer_ids}),
         )
     if proposals:
         annotation_data.save_project(project, project_path)
