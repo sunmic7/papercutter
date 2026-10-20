@@ -326,7 +326,8 @@ class EmployeeWorkbenchInteractionTests(unittest.TestCase):
 
     def test_typing_only_marks_memory_dirty_without_disk_autosave(self):
         source = (APP_JS / "main.js").read_text(encoding="utf-8")
-        start = source.index("schedulePaperFlowSave()")
+        # 锚定方法定义本身；调用点（如配对画框）会出现在定义之前。
+        start = source.index("schedulePaperFlowSave() {")
         end = source.index("commitCurrentPaperFlowPageToMemory", start)
         method = source[start:end]
         self.assertIn("退出时保存", method)
@@ -1098,6 +1099,15 @@ if (run(legacyBreak) !== '第一行\n第二行') throw new Error('literal legacy
         # 绘制与选中两个钩子都要接上。
         self.assertIn("void this.onPaperFlowPairFrameDrawn(annotation)", main_source)
         self.assertIn("setPaperFlowPairQuestion(cardAnnotation.id)", main_source)
+        # 答案页点选已有答案框也要配对（刚画的框由创建钩子处理）。
+        select_pos = main_source.index("onAnnotationSelect(annotation)")
+        self.assertIn(
+            "pairPaperFlowAnswerFrame(cardAnnotation, false)",
+            main_source[select_pos:],
+        )
+        # 配对时把配对源题框的题号同步到答案框上。
+        self.assertIn("attrs.paperflowNumberPath = questionPath.slice()", main_source)
+        self.assertIn("attrs.paperflowNumberInferred = false", main_source)
         # 确认本页后自动补配挂起的答案框。
         self.assertIn("await this.flushPaperFlowPairAnswers()", main_source)
         # 配对复用既有 set-pair 端点，后端零改动。
