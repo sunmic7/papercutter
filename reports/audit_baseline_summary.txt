@@ -1,0 +1,189 @@
+{
+  "pages": 21,
+  "applicable_pages": 10,
+  "blocks": 62,
+  "major_printed": 45,
+  "major_captured": 40,
+  "major_recall": 0.8889,
+  "minor_printed": 114,
+  "minor_cuts": 105,
+  "pages_with_error": 7,
+  "avg_seconds": 74.64,
+  "untitled_with_evidence": 2,
+  "merged_blocks": 3,
+  "duplicate_title_blocks": 2,
+  "collapsed_blocks": 4,
+  "empty_blocks": 2,
+  "undetected": 4,
+  "tiny_cuts": 0,
+  "giant_cuts": 0,
+  "bad_quality": 2,
+  "seq_breaks": 0,
+  "continuation_blocks": 2,
+  "error_rate": 0.7
+}
+
+全能测控系列课堂练习六年级下册数学北师2015
+{
+  "pages": 3,
+  "applicable_pages": 1,
+  "blocks": 8,
+  "major_printed": 6,
+  "major_captured": 3,
+  "major_recall": 0.5,
+  "minor_printed": 4,
+  "minor_cuts": 7,
+  "pages_with_error": 1,
+  "avg_seconds": 54.99,
+  "untitled_with_evidence": 1,
+  "merged_blocks": 1,
+  "duplicate_title_blocks": 0,
+  "collapsed_blocks": 0,
+  "empty_blocks": 0,
+  "undetected": 0,
+  "tiny_cuts": 0,
+  "giant_cuts": 0,
+  "bad_quality": 0,
+  "seq_breaks": 0,
+  "continuation_blocks": 0,
+  "error_rate": 1.0
+}
+
+口算速算天天练四年级上册数学新课标人教版2015
+{
+  "pages": 3,
+  "applicable_pages": 1,
+  "blocks": 7,
+  "major_printed": 5,
+  "major_captured": 5,
+  "major_recall": 1.0,
+  "minor_printed": 3,
+  "minor_cuts": 7,
+  "pages_with_error": 0,
+  "avg_seconds": 59.3,
+  "untitled_with_evidence": 0,
+  "merged_blocks": 0,
+  "duplicate_title_blocks": 0,
+  "collapsed_blocks": 0,
+  "empty_blocks": 0,
+  "undetected": 0,
+  "tiny_cuts": 0,
+  "giant_cuts": 0,
+  "bad_quality": 0,
+  "seq_breaks": 0,
+  "continuation_blocks": 0,
+  "error_rate": 0.0
+}
+
+抢先起跑暑假衔接教程四年级数学2015
+{
+  "pages": 3,
+  "applicable_pages": 2,
+  "blocks": 11,
+  "major_printed": 9,
+  "major_captured": 8,
+  "major_recall": 0.8889,
+  "minor_printed": 24,
+  "minor_cuts": 13,
+  "pages_with_error": 1,
+  "avg_seconds": 103.75,
+  "untitled_with_evidence": 1,
+  "merged_blocks": 1,
+  "duplicate_title_blocks": 0,
+  "collapsed_blocks": 2,
+  "empty_blocks": 0,
+  "undetected": 3,
+  "tiny_cuts": 0,
+  "giant_cuts": 0,
+  "bad_quality": 2,
+  "seq_breaks": 0,
+  "continuation_blocks": 0,
+  "error_rate": 0.5
+}
+
+数学奥赛天天练小学四年级2015
+{
+  "pages": 3,
+  "applicable_pages": 1,
+  "blocks": 3,
+  "major_printed": 2,
+  "major_captured": 1,
+  "major_recall": 0.5,
+  "minor_printed": 6,
+  "minor_cuts": 4,
+  "pages_with_error": 1,
+  "avg_seconds": 50.68,
+  "untitled_with_evidence": 0,
+  "merged_blocks": 1,
+  "duplicate_title_blocks": 0,
+  "collapsed_blocks": 0,
+  "empty_blocks": 0,
+  "undetected": 0,
+  "tiny_cuts": 0,
+  "giant_cuts": 0,
+  "bad_quality": 0,
+  "seq_breaks": 0,
+  "continuation_blocks": 0,
+  "error_rate": 1.0
+}
+
+金版卷王名师面对面大试卷数学六年级下册人教版
+{
+  "pages": 3,
+  "applicable_pages": 1,
+  "blocks": 10,
+  "major_printed": 4,
+  "major_captured": 4,
+  "major_recall": 1.0,
+  "minor_printed": 18,
+  "minor_cuts": 18,
+  "pages_with_error": 1,
+  "avg_seconds": 65.9,
+  "untitled_with_evidence": 0,
+  "merged_blocks": 0,
+  "duplicate_title_blocks": 1,
+  "collapsed_blocks": 0,
+  "empty_blocks": 1,
+  "undetected": 0,
+  "tiny_cuts": 0,
+  "giant_cuts": 0,
+  "bad_quality": 0,
+  "seq_breaks": 0,
+  "continuation_blocks": 1,
+  "error_rate": 1.0
+}
+
+金版卷王名师面对面大试卷数学四年级下册北师大版
+{
+  "pages": 6,
+  "applicable_pages": 4,
+  "blocks": 23,
+  "major_printed": 19,
+  "major_captured": 19,
+  "major_recall": 1.0,
+  "minor_printed": 59,
+  "minor_cuts": 56,
+  "pages_with_error": 3,
+  "avg_seconds": 93.92,
+  "untitled_with_evidence": 0,
+  "merged_blocks": 0,
+  "duplicate_title_blocks": 1,
+  "collapsed_blocks": 2,
+  "empty_blocks": 1,
+  "undetected": 1,
+  "tiny_cuts": 0,
+  "giant_cuts": 0,
+  "bad_quality": 0,
+  "seq_breaks": 0,
+  "continuation_blocks": 1,
+  "error_rate": 0.75
+}
+
+错误类型分布：
+      4  大题没切开（印刷多题只切出1题）
+      3  一个块含多个大题
+      2  空壳块（高度异常小）
+      2  同一大题标题被切成两块
+      2  标题退化为整页（块内是大题开头）
+
+写入 reports/audit_baseline_summary.json

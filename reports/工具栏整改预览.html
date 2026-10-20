@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>顶部工具栏整改预览</title>
+<link rel="stylesheet" href="file:///F:/papercutter/desktop_annotation/PaperFlow-Annotation/resources/app/css/styles.css">
+<link rel="stylesheet" href="file:///F:/papercutter/desktop_annotation/PaperFlow-Annotation/resources/app/css/employee-workbench.css">
+<style>
+  html, body { margin:0; }
+  body { background:#eef2f7; font-family:"Microsoft YaHei","PingFang SC",sans-serif; }
+  .preview-stage .toolbar { position:relative; top:0; left:0; right:0; }
+  .preview-body { padding:22px 26px; color:#475467; font-size:13px; line-height:1.8; }
+  .preview-body h2 { margin:0 0 8px; font-size:16px; color:#1d2939; }
+  .preview-body b { color:#1d2939; }
+</style>
+</head>
+<body>
+<div class="preview-stage">
+  <header class="toolbar">
+    <div class="toolbar-left">
+      <span class="image-counter"><span id="currentImageIndex">5</span> / <span id="totalImages">44</span></span>
+      <span class="question-counter" id="questionCounter">📝 <span id="currentQuestionCount">9</span> 道题</span>
+    </div>
+        <div class="workspace-controls pf-toolbar-actions">
+            <!-- 第 1 组：整本教材只需设置一次 -->
+            <div class="pf-action-group" aria-label="教材">
+                <button id="openWorkspace" class="btn btn-primary" title="选择这本教材存放图片的文件夹">
+                    <i class="icon-folder"></i>
+                    <span>打开教材</span>
+                </button>
+                <div class="pf-menu-wrap">
+                    <button type="button" class="btn pf-menu-trigger" data-pf-menu-target="pfMenuBook"
+                            title="教材信息、页面分类、匹配分组" aria-haspopup="true" aria-expanded="false">
+                        <span>教材设置</span><i class="pf-caret">▾</i>
+                    </button>
+                    <div class="pf-menu" id="pfMenuBook" role="menu" hidden>
+                        <button type="button" id="editBookMetadata" class="pf-menu-item" role="menuitem">
+                            <span>教材信息</span>
+                            <span class="pf-menu-hint">语言、年级、学科；一本教材只需设一次</span>
+                        </button>
+                        <button type="button" id="managePaperFlowPages" class="pf-menu-item" role="menuitem">
+                            <span>页面分类</span>
+                            <span class="pf-menu-hint">哪些页是题目、哪些页是答案、哪些不用</span>
+                        </button>
+                        <button type="button" id="manageMatchScopes" class="pf-menu-item" role="menuitem">
+                            <span>匹配分组</span>
+                            <span class="pf-menu-hint">哪几页的答案，配哪几页的题目</span>
+                        </button>
+                        <button type="button" id="markCurrentPaperFlowPage" class="pf-menu-item" role="menuitem" disabled hidden>
+                            <span>当前页设为答案页</span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <span class="pf-group-divider" aria-hidden="true"></span>
+
+            <!-- 第 2 组：每一页都要做的动作 -->
+            <div class="pf-action-group" aria-label="当前页">
+                <button id="generatePrelabels" class="btn btn-success" title="程序自动找出当前页每一道题的位置，可以再手工调整">
+                    <i class="icon-magic"></i> <span>自动框题</span>
+                </button>
+                <button id="employeeDrawQuestion" class="btn employee-draw-button" title="按住鼠标左键，在图上拖出一个框">
+                    <span>✎ 绘制题框</span>
+                </button>
+                <button id="employeeDeleteSelected" class="btn employee-delete-button" title="删除选中的框，也可以按 Delete 键">
+                    <span>删除</span>
+                </button>
+                <button id="clearAll" class="btn employee-delete-button" title="删掉本页所有框，重新开始" disabled>
+                    <i class="icon-clear-all"></i>
+                    <span>清空本页</span>
+                </button>
+                <button id="confirmPaperFlowPage" class="btn btn-primary" title="这一页检查完了，保存并标记为已完成">
+                    <span>确认本页</span>
+                </button>
+            </div>
+
+            <span class="pf-group-divider" aria-hidden="true"></span>
+
+            <!-- 第 3 组：生成与交接 -->
+            <div class="pf-action-group" aria-label="交付">
+                <button id="exportPaperFlowProject" class="btn btn-success" title="把题目和答案裁成图片，并生成交付文件">
+                    <span>生成交付文件</span>
+                </button>
+                <div class="pf-menu-wrap">
+                    <button type="button" class="btn btn-info pf-menu-trigger" data-pf-menu-target="pfMenuReview"
+                            title="提交审核、上传交付、下载审核意见" aria-haspopup="true" aria-expanded="false">
+                        <span>审核</span><i class="pf-caret">▾</i>
+                    </button>
+                    <div class="pf-menu" id="pfMenuReview" role="menu" hidden>
+                        <button type="button" id="submitPaperFlowReview" class="pf-menu-item" role="menuitem">
+                            <span>提交审核</span>
+                            <span class="pf-menu-hint">把这一批框交给审核员检查</span>
+                        </button>
+                        <button type="button" id="uploadPaperFlowDelivery" class="pf-menu-item" role="menuitem">
+                            <span>上传交付</span>
+                            <span class="pf-menu-hint">把刚生成的文件传到服务器</span>
+                        </button>
+                        <button type="button" id="pullPaperFlowReview" class="pf-menu-item" role="menuitem">
+                            <span>下载审核意见</span>
+                            <span class="pf-menu-hint">取回审核员改过的地方，不会覆盖你的框</span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+    <div class="toolbar-center">
+      <button class="btn btn-nav" title="上一张">‹</button>
+      <div class="image-info"><span id="currentImageName">第5页.jpg</span><span class="separator">|</span><span id="zoomLevel">100%</span></div>
+      <button class="btn btn-nav" title="下一张">›</button>
+    </div>
+    <div class="toolbar-right">
+      <button class="btn btn-zoom" title="缩小">−</button>
+      <button class="btn btn-zoom" title="重置">0</button>
+      <button class="btn btn-zoom" title="放大">+</button>
+      <button id="toggleAnnotations" class="btn btn-toggle active" title="显示/隐藏标注 (Q)"><span>显示标注(Q)</span></button>
+      <button id="showShortcuts" class="btn btn-help" title="快捷键说明 (F1)">快捷键</button>
+    </div>
+  </header>
+
+  <div class="preview-body">
+    <h2>整改后：13 个平铺按钮 → 3 组 8 个入口</h2>
+    <p><b>教材</b>：打开教材 ｜ 教材设置▾（教材信息 / 页面分类 / 匹配分组）</p>
+    <p><b>当前页</b>：自动框题 ｜ 绘制题框 ｜ 删除 ｜ 清空本页 ｜ 确认本页</p>
+    <p><b>交付</b>：生成交付文件 ｜ 审核▾（提交审核 / 上传交付 / 下载审核意见）</p>
+    <p>点「教材设置」或「审核」可以看到下拉菜单；点其他地方或按 Esc 收起。</p>
+  </div>
+</div>
+<script>
+document.querySelectorAll('.pf-menu-trigger').forEach(function (trigger) {
+  var menu = document.getElementById(trigger.getAttribute('data-pf-menu-target'));
+  if (!menu) return;
+  var triggers = document.querySelectorAll('.pf-menu-trigger');
+  function closeAll(keep) {
+    triggers.forEach(function (item) {
+      var m = document.getElementById(item.getAttribute('data-pf-menu-target'));
+      if (!m || m === keep) return;
+      m.hidden = true; item.classList.remove('open');
+    });
+  }
+  trigger.addEventListener('click', function (event) {
+    event.stopPropagation();
+    var willOpen = menu.hidden;
+    closeAll(willOpen ? menu : null);
+    menu.hidden = !willOpen;
+    trigger.classList.toggle('open', willOpen);
+  });
+  menu.addEventListener('click', function (e) { e.stopPropagation(); if (e.target.closest('.pf-menu-item')) closeAll(); });
+});
+document.addEventListener('click', function () { closeAll(); });
+document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeAll(); });
+</script>
+</body>
+</html>

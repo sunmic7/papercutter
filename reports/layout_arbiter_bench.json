@@ -1,0 +1,2799 @@
+[
+  {
+    "page": 1,
+    "file": "20210126153256260561.jpg",
+    "shape": [
+      4897,
+      3381
+    ],
+    "ratio": 1.448,
+    "majors": [],
+    "production_items": 19,
+    "arbiter_seconds": 16.47,
+    "arbiter_columns": [
+      [
+        0,
+        4897
+      ]
+    ],
+    "arbiter_gutters": [],
+    "layout_regions": 7,
+    "baseline_regions": [
+      [
+        0,
+        4897
+      ]
+    ],
+    "baseline": {
+      "block_count": 1,
+      "titled_blocks": 0,
+      "untitled_blocks": 1,
+      "major_expected": 0,
+      "major_captured": 0,
+      "major_recall": null,
+      "merged_blocks": 0,
+      "blocks": [
+        {
+          "title": "整页",
+          "idx": null,
+          "col": null,
+          "bounds": [
+            0,
+            4897
+          ],
+          "box": [
+            0,
+            0,
+            4897,
+            3381
+          ],
+          "majors_inside": []
+        }
+      ]
+    },
+    "arbiter": {
+      "block_count": 1,
+      "titled_blocks": 0,
+      "untitled_blocks": 1,
+      "major_expected": 0,
+      "major_captured": 0,
+      "major_recall": null,
+      "merged_blocks": 0,
+      "blocks": [
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "left",
+          "bounds": [
+            0,
+            4897
+          ],
+          "box": [
+            0,
+            0,
+            4897,
+            3381
+          ],
+          "majors_inside": []
+        }
+      ]
+    }
+  },
+  {
+    "page": 2,
+    "file": "20210126153256260562.jpg",
+    "shape": [
+      4897,
+      3381
+    ],
+    "ratio": 1.448,
+    "majors": [],
+    "production_items": 0,
+    "arbiter_seconds": 0.06,
+    "arbiter_columns": [
+      [
+        0,
+        4897
+      ]
+    ],
+    "arbiter_gutters": [],
+    "layout_regions": 0,
+    "baseline_regions": [
+      [
+        0,
+        4897
+      ]
+    ],
+    "baseline": {
+      "block_count": 1,
+      "titled_blocks": 0,
+      "untitled_blocks": 1,
+      "major_expected": 0,
+      "major_captured": 0,
+      "major_recall": null,
+      "merged_blocks": 0,
+      "blocks": [
+        {
+          "title": "整页",
+          "idx": null,
+          "col": null,
+          "bounds": [
+            0,
+            4897
+          ],
+          "box": [
+            0,
+            0,
+            4897,
+            3381
+          ],
+          "majors_inside": []
+        }
+      ]
+    },
+    "arbiter": {
+      "block_count": 1,
+      "titled_blocks": 0,
+      "untitled_blocks": 1,
+      "major_expected": 0,
+      "major_captured": 0,
+      "major_recall": null,
+      "merged_blocks": 0,
+      "blocks": [
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "left",
+          "bounds": [
+            0,
+            4897
+          ],
+          "box": [
+            0,
+            0,
+            4897,
+            3381
+          ],
+          "majors_inside": []
+        }
+      ]
+    }
+  },
+  {
+    "page": 3,
+    "file": "20210126153256260563.jpg",
+    "shape": [
+      4887,
+      3351
+    ],
+    "ratio": 1.458,
+    "majors": [],
+    "production_items": 18,
+    "arbiter_seconds": 0.07,
+    "arbiter_columns": [
+      [
+        0,
+        4887
+      ]
+    ],
+    "arbiter_gutters": [],
+    "layout_regions": 4,
+    "baseline_regions": [
+      [
+        0,
+        4887
+      ]
+    ],
+    "baseline": {
+      "block_count": 2,
+      "titled_blocks": 0,
+      "untitled_blocks": 2,
+      "major_expected": 0,
+      "major_captured": 0,
+      "major_recall": null,
+      "merged_blocks": 0,
+      "blocks": [
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "left",
+          "bounds": [
+            0,
+            2519
+          ],
+          "box": [
+            0,
+            0,
+            2519,
+            3351
+          ],
+          "majors_inside": []
+        },
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "right",
+          "bounds": [
+            2519,
+            4887
+          ],
+          "box": [
+            2519,
+            0,
+            4887,
+            3351
+          ],
+          "majors_inside": []
+        }
+      ]
+    },
+    "arbiter": {
+      "block_count": 1,
+      "titled_blocks": 0,
+      "untitled_blocks": 1,
+      "major_expected": 0,
+      "major_captured": 0,
+      "major_recall": null,
+      "merged_blocks": 0,
+      "blocks": [
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "left",
+          "bounds": [
+            0,
+            4887
+          ],
+          "box": [
+            0,
+            0,
+            4887,
+            3351
+          ],
+          "majors_inside": []
+        }
+      ]
+    }
+  },
+  {
+    "page": 4,
+    "file": "20210126153256260564.jpg",
+    "shape": [
+      4887,
+      3351
+    ],
+    "ratio": 1.458,
+    "majors": [],
+    "production_items": 82,
+    "arbiter_seconds": 0.07,
+    "arbiter_columns": [
+      [
+        0,
+        4887
+      ]
+    ],
+    "arbiter_gutters": [],
+    "layout_regions": 4,
+    "baseline_regions": [
+      [
+        0,
+        2571
+      ],
+      [
+        2571,
+        3696
+      ],
+      [
+        3696,
+        4887
+      ]
+    ],
+    "baseline": {
+      "block_count": 3,
+      "titled_blocks": 0,
+      "untitled_blocks": 3,
+      "major_expected": 0,
+      "major_captured": 0,
+      "major_recall": null,
+      "merged_blocks": 0,
+      "blocks": [
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "column_1",
+          "bounds": [
+            0,
+            2571
+          ],
+          "box": [
+            0,
+            0,
+            2571,
+            3351
+          ],
+          "majors_inside": []
+        },
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "column_2",
+          "bounds": [
+            2571,
+            3696
+          ],
+          "box": [
+            2571,
+            0,
+            3696,
+            3351
+          ],
+          "majors_inside": []
+        },
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "column_3",
+          "bounds": [
+            3696,
+            4887
+          ],
+          "box": [
+            3696,
+            0,
+            4887,
+            3351
+          ],
+          "majors_inside": []
+        }
+      ]
+    },
+    "arbiter": {
+      "block_count": 1,
+      "titled_blocks": 0,
+      "untitled_blocks": 1,
+      "major_expected": 0,
+      "major_captured": 0,
+      "major_recall": null,
+      "merged_blocks": 0,
+      "blocks": [
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "left",
+          "bounds": [
+            0,
+            4887
+          ],
+          "box": [
+            0,
+            0,
+            4887,
+            3351
+          ],
+          "majors_inside": []
+        }
+      ]
+    }
+  },
+  {
+    "page": 5,
+    "file": "20210126153256260565.jpg",
+    "shape": [
+      4897,
+      3377
+    ],
+    "ratio": 1.45,
+    "majors": [
+      {
+        "idx": 3,
+        "text": "三、判断。(5分)",
+        "y": 136,
+        "x": 2760.0036111111112
+      },
+      {
+        "idx": 4,
+        "text": "四、选择。(8分)",
+        "y": 799,
+        "x": 2762.724166666667
+      },
+      {
+        "idx": 1,
+        "text": "一、卷面书写。(5分)",
+        "y": 973,
+        "x": 511.4644444444445
+      },
+      {
+        "idx": 2,
+        "text": "二、想一想，填一填。(20分)",
+        "y": 1275,
+        "x": 594.4413888888889
+      },
+      {
+        "idx": 5,
+        "text": "五、在()里填上合适的数。(6分)",
+        "y": 1697,
+        "x": 3025.257777777778
+      },
+      {
+        "idx": 6,
+        "text": "六、计算。(30分)",
+        "y": 2105,
+        "x": 2781.7680555555557
+      }
+    ],
+    "production_items": 139,
+    "arbiter_seconds": 0.08,
+    "arbiter_columns": [
+      [
+        0,
+        2434
+      ],
+      [
+        2434,
+        4897
+      ]
+    ],
+    "arbiter_gutters": [
+      2434
+    ],
+    "layout_regions": 66,
+    "baseline_regions": [
+      [
+        0,
+        2703
+      ],
+      [
+        2703,
+        4098
+      ],
+      [
+        4098,
+        4897
+      ]
+    ],
+    "baseline": {
+      "block_count": 4,
+      "titled_blocks": 2,
+      "untitled_blocks": 2,
+      "major_expected": 6,
+      "major_captured": 2,
+      "major_recall": 0.3333333333333333,
+      "merged_blocks": 1,
+      "blocks": [
+        {
+          "title": "一、卷面书写。（5分）",
+          "idx": 1,
+          "col": "column_1",
+          "bounds": [
+            0,
+            2703
+          ],
+          "box": [
+            0,
+            967,
+            2703,
+            1262
+          ],
+          "majors_inside": [
+            1
+          ]
+        },
+        {
+          "title": "二、想一想，填一填。（20分）",
+          "idx": 2,
+          "col": "column_1",
+          "bounds": [
+            0,
+            2703
+          ],
+          "box": [
+            0,
+            1262,
+            2703,
+            3377
+          ],
+          "majors_inside": [
+            2
+          ]
+        },
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "column_2",
+          "bounds": [
+            2703,
+            4098
+          ],
+          "box": [
+            2703,
+            0,
+            4098,
+            3377
+          ],
+          "majors_inside": [
+            3,
+            4,
+            5,
+            6
+          ]
+        },
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "column_3",
+          "bounds": [
+            4098,
+            4897
+          ],
+          "box": [
+            4098,
+            0,
+            4897,
+            3377
+          ],
+          "majors_inside": []
+        }
+      ]
+    },
+    "arbiter": {
+      "block_count": 6,
+      "titled_blocks": 6,
+      "untitled_blocks": 0,
+      "major_expected": 6,
+      "major_captured": 6,
+      "major_recall": 1.0,
+      "merged_blocks": 0,
+      "blocks": [
+        {
+          "title": "一、卷面书写。（5分）",
+          "idx": 1,
+          "col": "column_1",
+          "bounds": [
+            0,
+            2434
+          ],
+          "box": [
+            0,
+            967,
+            2434,
+            1262
+          ],
+          "majors_inside": [
+            1
+          ]
+        },
+        {
+          "title": "二、想一想，填一填。（20分）",
+          "idx": 2,
+          "col": "column_1",
+          "bounds": [
+            0,
+            2434
+          ],
+          "box": [
+            0,
+            1262,
+            2434,
+            3377
+          ],
+          "majors_inside": [
+            2
+          ]
+        },
+        {
+          "title": "三、判断。(5分)",
+          "idx": 3,
+          "col": "column_2",
+          "bounds": [
+            2434,
+            4897
+          ],
+          "box": [
+            2434,
+            123,
+            4897,
+            799
+          ],
+          "majors_inside": [
+            3
+          ]
+        },
+        {
+          "title": "四、选择。（8分）",
+          "idx": 4,
+          "col": "column_2",
+          "bounds": [
+            2434,
+            4897
+          ],
+          "box": [
+            2434,
+            799,
+            4897,
+            1692
+          ],
+          "majors_inside": [
+            4
+          ]
+        },
+        {
+          "title": "五、在()里填上合适的数。（6分）",
+          "idx": 5,
+          "col": "column_2",
+          "bounds": [
+            2434,
+            4897
+          ],
+          "box": [
+            2434,
+            1692,
+            4897,
+            2085
+          ],
+          "majors_inside": [
+            5
+          ]
+        },
+        {
+          "title": "六、计算。（30分）",
+          "idx": 6,
+          "col": "column_2",
+          "bounds": [
+            2434,
+            4897
+          ],
+          "box": [
+            2434,
+            2085,
+            4897,
+            3377
+          ],
+          "majors_inside": [
+            6
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "page": 6,
+    "file": "20210126153256260566.jpg",
+    "shape": [
+      4897,
+      3377
+    ],
+    "ratio": 1.45,
+    "majors": [
+      {
+        "idx": 7,
+        "text": "七、解决问题。(31分)",
+        "y": 1961,
+        "x": 554.9933333333335
+      }
+    ],
+    "production_items": 35,
+    "arbiter_seconds": 0.07,
+    "arbiter_columns": [
+      [
+        0,
+        2522
+      ],
+      [
+        2522,
+        4897
+      ]
+    ],
+    "arbiter_gutters": [
+      2522
+    ],
+    "layout_regions": 21,
+    "baseline_regions": [
+      [
+        0,
+        2521
+      ],
+      [
+        2521,
+        4897
+      ]
+    ],
+    "baseline": {
+      "block_count": 3,
+      "titled_blocks": 1,
+      "untitled_blocks": 2,
+      "major_expected": 1,
+      "major_captured": 1,
+      "major_recall": 1.0,
+      "merged_blocks": 0,
+      "blocks": [
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "left",
+          "bounds": [
+            0,
+            2515
+          ],
+          "box": [
+            0,
+            0,
+            2515,
+            1958
+          ],
+          "majors_inside": []
+        },
+        {
+          "title": "七、解决问题。（31分）",
+          "idx": 7,
+          "col": "left",
+          "bounds": [
+            0,
+            2515
+          ],
+          "box": [
+            0,
+            1958,
+            2515,
+            3377
+          ],
+          "majors_inside": [
+            7
+          ]
+        },
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "right",
+          "bounds": [
+            2515,
+            4897
+          ],
+          "box": [
+            2515,
+            0,
+            4897,
+            3377
+          ],
+          "majors_inside": []
+        }
+      ]
+    },
+    "arbiter": {
+      "block_count": 3,
+      "titled_blocks": 1,
+      "untitled_blocks": 2,
+      "major_expected": 1,
+      "major_captured": 1,
+      "major_recall": 1.0,
+      "merged_blocks": 0,
+      "blocks": [
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "column_1",
+          "bounds": [
+            0,
+            2522
+          ],
+          "box": [
+            0,
+            0,
+            2522,
+            1958
+          ],
+          "majors_inside": []
+        },
+        {
+          "title": "七、解决问题。（31分）",
+          "idx": 7,
+          "col": "column_1",
+          "bounds": [
+            0,
+            2522
+          ],
+          "box": [
+            0,
+            1958,
+            2522,
+            3377
+          ],
+          "majors_inside": [
+            7
+          ]
+        },
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "column_2",
+          "bounds": [
+            2522,
+            4897
+          ],
+          "box": [
+            2522,
+            0,
+            4897,
+            3377
+          ],
+          "majors_inside": []
+        }
+      ]
+    }
+  },
+  {
+    "page": 7,
+    "file": "20210126153256260567.jpg",
+    "shape": [
+      4896,
+      3377
+    ],
+    "ratio": 1.45,
+    "majors": [
+      {
+        "idx": 3,
+        "text": "三、我来当法官。(对的打“√”，错的打“×”)(5分)",
+        "y": 106,
+        "x": 3171.5199999999995
+      },
+      {
+        "idx": 4,
+        "text": "四、精挑细选。(将正确答案的序号填在括号里)(10分)",
+        "y": 688,
+        "x": 3230.0
+      },
+      {
+        "idx": 1,
+        "text": "一、卷面书写。(5分)",
+        "y": 949,
+        "x": 499.12
+      },
+      {
+        "idx": 2,
+        "text": "二、填一填。(24分)",
+        "y": 1248,
+        "x": 485.52
+      },
+      {
+        "idx": 5,
+        "text": "五、比大小。(在○里填上“>”或“<”)(6分)",
+        "y": 1670,
+        "x": 3102.16
+      },
+      {
+        "idx": 6,
+        "text": "六、计算。(28分)",
+        "y": 2099,
+        "x": 2768.9599999999996
+      }
+    ],
+    "production_items": 123,
+    "arbiter_seconds": 0.06,
+    "arbiter_columns": [
+      [
+        0,
+        2422
+      ],
+      [
+        2422,
+        4896
+      ]
+    ],
+    "arbiter_gutters": [
+      2422
+    ],
+    "layout_regions": 76,
+    "baseline_regions": [
+      [
+        0,
+        2435
+      ],
+      [
+        2435,
+        4896
+      ]
+    ],
+    "baseline": {
+      "block_count": 7,
+      "titled_blocks": 7,
+      "untitled_blocks": 0,
+      "major_expected": 6,
+      "major_captured": 6,
+      "major_recall": 1.0,
+      "merged_blocks": 0,
+      "blocks": [
+        {
+          "title": "一、卷面书写。（5分）",
+          "idx": 1,
+          "col": "left",
+          "bounds": [
+            0,
+            2420
+          ],
+          "box": [
+            0,
+            946,
+            2420,
+            1241
+          ],
+          "majors_inside": [
+            1
+          ]
+        },
+        {
+          "title": "二、填一填。（24分）",
+          "idx": 2,
+          "col": "left",
+          "bounds": [
+            0,
+            2420
+          ],
+          "box": [
+            0,
+            1241,
+            2420,
+            3377
+          ],
+          "majors_inside": [
+            2
+          ]
+        },
+        {
+          "title": "三、我来当法官。（对的打“√”，错的打“×”)(5分）",
+          "idx": 3,
+          "col": "right",
+          "bounds": [
+            2420,
+            4896
+          ],
+          "box": [
+            2420,
+            94,
+            4896,
+            676
+          ],
+          "majors_inside": [
+            3
+          ]
+        },
+        {
+          "title": "四、精挑细选。（将正确答案的序号填在括号里)(10分）",
+          "idx": 4,
+          "col": "right",
+          "bounds": [
+            2420,
+            4896
+          ],
+          "box": [
+            2420,
+            676,
+            4896,
+            692
+          ],
+          "majors_inside": []
+        },
+        {
+          "title": "四、精挑细选。（将正确答案的序号填在括号里）（10分）",
+          "idx": 4,
+          "col": "right",
+          "bounds": [
+            2420,
+            4896
+          ],
+          "box": [
+            2420,
+            692,
+            4896,
+            1662
+          ],
+          "majors_inside": [
+            4
+          ]
+        },
+        {
+          "title": "五、比大小。（在里填上“_”或“_”)(6分)",
+          "idx": 5,
+          "col": "right",
+          "bounds": [
+            2420,
+            4896
+          ],
+          "box": [
+            2420,
+            1662,
+            4896,
+            2092
+          ],
+          "majors_inside": [
+            5
+          ]
+        },
+        {
+          "title": "六、计算。(28分）",
+          "idx": 6,
+          "col": "right",
+          "bounds": [
+            2420,
+            4896
+          ],
+          "box": [
+            2420,
+            2092,
+            4896,
+            3377
+          ],
+          "majors_inside": [
+            6
+          ]
+        }
+      ]
+    },
+    "arbiter": {
+      "block_count": 7,
+      "titled_blocks": 7,
+      "untitled_blocks": 0,
+      "major_expected": 6,
+      "major_captured": 6,
+      "major_recall": 1.0,
+      "merged_blocks": 0,
+      "blocks": [
+        {
+          "title": "一、卷面书写。（5分）",
+          "idx": 1,
+          "col": "column_1",
+          "bounds": [
+            0,
+            2421
+          ],
+          "box": [
+            0,
+            946,
+            2421,
+            1241
+          ],
+          "majors_inside": [
+            1
+          ]
+        },
+        {
+          "title": "二、填一填。（24分）",
+          "idx": 2,
+          "col": "column_1",
+          "bounds": [
+            0,
+            2421
+          ],
+          "box": [
+            0,
+            1241,
+            2421,
+            3377
+          ],
+          "majors_inside": [
+            2
+          ]
+        },
+        {
+          "title": "三、我来当法官。（对的打“√”，错的打“×”)(5分）",
+          "idx": 3,
+          "col": "column_2",
+          "bounds": [
+            2421,
+            4896
+          ],
+          "box": [
+            2421,
+            94,
+            4896,
+            676
+          ],
+          "majors_inside": [
+            3
+          ]
+        },
+        {
+          "title": "四、精挑细选。（将正确答案的序号填在括号里)(10分）",
+          "idx": 4,
+          "col": "column_2",
+          "bounds": [
+            2421,
+            4896
+          ],
+          "box": [
+            2421,
+            676,
+            4896,
+            692
+          ],
+          "majors_inside": []
+        },
+        {
+          "title": "四、精挑细选。（将正确答案的序号填在括号里）（10分）",
+          "idx": 4,
+          "col": "column_2",
+          "bounds": [
+            2421,
+            4896
+          ],
+          "box": [
+            2421,
+            692,
+            4896,
+            1662
+          ],
+          "majors_inside": [
+            4
+          ]
+        },
+        {
+          "title": "五、比大小。（在里填上“_”或“_”)(6分)",
+          "idx": 5,
+          "col": "column_2",
+          "bounds": [
+            2421,
+            4896
+          ],
+          "box": [
+            2421,
+            1662,
+            4896,
+            2092
+          ],
+          "majors_inside": [
+            5
+          ]
+        },
+        {
+          "title": "六、计算。(28分）",
+          "idx": 6,
+          "col": "column_2",
+          "bounds": [
+            2421,
+            4896
+          ],
+          "box": [
+            2421,
+            2092,
+            4896,
+            3377
+          ],
+          "majors_inside": [
+            6
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "page": 8,
+    "file": "20210126153256260568.jpg",
+    "shape": [
+      4896,
+      3377
+    ],
+    "ratio": 1.45,
+    "majors": [
+      {
+        "idx": 7,
+        "text": "七、解决问题。(27分)",
+        "y": 1732,
+        "x": 545.3599999999999
+      }
+    ],
+    "production_items": 33,
+    "arbiter_seconds": 0.06,
+    "arbiter_columns": [
+      [
+        0,
+        2511
+      ],
+      [
+        2511,
+        4896
+      ]
+    ],
+    "arbiter_gutters": [
+      2511
+    ],
+    "layout_regions": 23,
+    "baseline_regions": [
+      [
+        0,
+        2511
+      ],
+      [
+        2511,
+        4896
+      ]
+    ],
+    "baseline": {
+      "block_count": 3,
+      "titled_blocks": 1,
+      "untitled_blocks": 2,
+      "major_expected": 1,
+      "major_captured": 1,
+      "major_recall": 1.0,
+      "merged_blocks": 0,
+      "blocks": [
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "left",
+          "bounds": [
+            0,
+            2503
+          ],
+          "box": [
+            0,
+            0,
+            2503,
+            1736
+          ],
+          "majors_inside": []
+        },
+        {
+          "title": "七、解决问题。（27分）",
+          "idx": 7,
+          "col": "left",
+          "bounds": [
+            0,
+            2503
+          ],
+          "box": [
+            0,
+            1736,
+            2503,
+            3377
+          ],
+          "majors_inside": [
+            7
+          ]
+        },
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "right",
+          "bounds": [
+            2503,
+            4896
+          ],
+          "box": [
+            2503,
+            0,
+            4896,
+            3377
+          ],
+          "majors_inside": []
+        }
+      ]
+    },
+    "arbiter": {
+      "block_count": 3,
+      "titled_blocks": 1,
+      "untitled_blocks": 2,
+      "major_expected": 1,
+      "major_captured": 1,
+      "major_recall": 1.0,
+      "merged_blocks": 0,
+      "blocks": [
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "column_1",
+          "bounds": [
+            0,
+            2511
+          ],
+          "box": [
+            0,
+            0,
+            2511,
+            1736
+          ],
+          "majors_inside": []
+        },
+        {
+          "title": "七、解决问题。（27分）",
+          "idx": 7,
+          "col": "column_1",
+          "bounds": [
+            0,
+            2511
+          ],
+          "box": [
+            0,
+            1736,
+            2511,
+            3377
+          ],
+          "majors_inside": [
+            7
+          ]
+        },
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "column_2",
+          "bounds": [
+            2511,
+            4896
+          ],
+          "box": [
+            2511,
+            0,
+            4896,
+            3377
+          ],
+          "majors_inside": []
+        }
+      ]
+    }
+  },
+  {
+    "page": 9,
+    "file": "20210126153256260569.jpg",
+    "shape": [
+      4901,
+      3378
+    ],
+    "ratio": 1.451,
+    "majors": [
+      {
+        "idx": 3,
+        "text": "三、判断。(5分)",
+        "y": 111,
+        "x": 2760.8966666666665
+      },
+      {
+        "idx": 4,
+        "text": "四、选择。(10分)",
+        "y": 732,
+        "x": 2775.8719444444446
+      },
+      {
+        "idx": 1,
+        "text": "一、卷面书写。(5分)",
+        "y": 920,
+        "x": 506.43666666666667
+      },
+      {
+        "idx": 2,
+        "text": "二、填一填。(20分)",
+        "y": 1222,
+        "x": 488.73861111111114
+      },
+      {
+        "idx": 5,
+        "text": "五、计算。(8分)",
+        "y": 1873,
+        "x": 2762.258055555556
+      }
+    ],
+    "production_items": 107,
+    "arbiter_seconds": 0.06,
+    "arbiter_columns": [
+      [
+        0,
+        2428
+      ],
+      [
+        2428,
+        4901
+      ]
+    ],
+    "arbiter_gutters": [
+      2428
+    ],
+    "layout_regions": 47,
+    "baseline_regions": [
+      [
+        0,
+        2447
+      ],
+      [
+        2447,
+        4257
+      ],
+      [
+        4257,
+        4901
+      ]
+    ],
+    "baseline": {
+      "block_count": 6,
+      "titled_blocks": 5,
+      "untitled_blocks": 1,
+      "major_expected": 5,
+      "major_captured": 5,
+      "major_recall": 1.0,
+      "merged_blocks": 0,
+      "blocks": [
+        {
+          "title": "一、卷面书写。（5分）",
+          "idx": 1,
+          "col": "column_1",
+          "bounds": [
+            0,
+            2447
+          ],
+          "box": [
+            0,
+            915,
+            2447,
+            1222
+          ],
+          "majors_inside": [
+            1
+          ]
+        },
+        {
+          "title": "二、填一填。（20分）",
+          "idx": 2,
+          "col": "column_1",
+          "bounds": [
+            0,
+            2447
+          ],
+          "box": [
+            0,
+            1222,
+            2447,
+            3378
+          ],
+          "majors_inside": [
+            2
+          ]
+        },
+        {
+          "title": "三、判断。（5分）",
+          "idx": 3,
+          "col": "column_2",
+          "bounds": [
+            2447,
+            4257
+          ],
+          "box": [
+            2447,
+            103,
+            4257,
+            722
+          ],
+          "majors_inside": [
+            3
+          ]
+        },
+        {
+          "title": "四、选择。（10分）",
+          "idx": 4,
+          "col": "column_2",
+          "bounds": [
+            2447,
+            4257
+          ],
+          "box": [
+            2447,
+            722,
+            4257,
+            1866
+          ],
+          "majors_inside": [
+            4
+          ]
+        },
+        {
+          "title": "五、计算。（8分）",
+          "idx": 5,
+          "col": "column_2",
+          "bounds": [
+            2447,
+            4257
+          ],
+          "box": [
+            2447,
+            1866,
+            4257,
+            3378
+          ],
+          "majors_inside": [
+            5
+          ]
+        },
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "column_3",
+          "bounds": [
+            4257,
+            4901
+          ],
+          "box": [
+            4257,
+            0,
+            4901,
+            3378
+          ],
+          "majors_inside": []
+        }
+      ]
+    },
+    "arbiter": {
+      "block_count": 5,
+      "titled_blocks": 5,
+      "untitled_blocks": 0,
+      "major_expected": 5,
+      "major_captured": 5,
+      "major_recall": 1.0,
+      "merged_blocks": 0,
+      "blocks": [
+        {
+          "title": "一、卷面书写。（5分）",
+          "idx": 1,
+          "col": "column_1",
+          "bounds": [
+            0,
+            2428
+          ],
+          "box": [
+            0,
+            915,
+            2428,
+            1222
+          ],
+          "majors_inside": [
+            1
+          ]
+        },
+        {
+          "title": "二、填一填。（20分）",
+          "idx": 2,
+          "col": "column_1",
+          "bounds": [
+            0,
+            2428
+          ],
+          "box": [
+            0,
+            1222,
+            2428,
+            3378
+          ],
+          "majors_inside": [
+            2
+          ]
+        },
+        {
+          "title": "三、判断。（5分）",
+          "idx": 3,
+          "col": "column_2",
+          "bounds": [
+            2428,
+            4901
+          ],
+          "box": [
+            2428,
+            103,
+            4901,
+            722
+          ],
+          "majors_inside": [
+            3
+          ]
+        },
+        {
+          "title": "四、选择。（10分）",
+          "idx": 4,
+          "col": "column_2",
+          "bounds": [
+            2428,
+            4901
+          ],
+          "box": [
+            2428,
+            722,
+            4901,
+            1866
+          ],
+          "majors_inside": [
+            4
+          ]
+        },
+        {
+          "title": "五、计算。（8分）",
+          "idx": 5,
+          "col": "column_2",
+          "bounds": [
+            2428,
+            4901
+          ],
+          "box": [
+            2428,
+            1866,
+            4901,
+            3378
+          ],
+          "majors_inside": [
+            5
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "page": 10,
+    "file": "20210126153256260570.jpg",
+    "shape": [
+      4901,
+      3378
+    ],
+    "ratio": 1.451,
+    "majors": [
+      {
+        "idx": 6,
+        "text": "六、我会画。(18分)",
+        "y": 103,
+        "x": 514.605
+      },
+      {
+        "idx": 7,
+        "text": "七、数一数，填一填。(9分)",
+        "y": 2115,
+        "x": 593.5655555555555
+      },
+      {
+        "idx": 8,
+        "text": "八、解决问题。(30分)",
+        "y": 2586,
+        "x": 535.0258333333334
+      }
+    ],
+    "production_items": 44,
+    "arbiter_seconds": 0.07,
+    "arbiter_columns": [
+      [
+        0,
+        2428
+      ],
+      [
+        2428,
+        4901
+      ]
+    ],
+    "arbiter_gutters": [
+      2428
+    ],
+    "layout_regions": 27,
+    "baseline_regions": [
+      [
+        0,
+        2497
+      ],
+      [
+        2497,
+        4901
+      ]
+    ],
+    "baseline": {
+      "block_count": 4,
+      "titled_blocks": 3,
+      "untitled_blocks": 1,
+      "major_expected": 3,
+      "major_captured": 3,
+      "major_recall": 1.0,
+      "merged_blocks": 0,
+      "blocks": [
+        {
+          "title": "六、我会画。（18分）",
+          "idx": 6,
+          "col": "left",
+          "bounds": [
+            0,
+            2407
+          ],
+          "box": [
+            0,
+            96,
+            2407,
+            2112
+          ],
+          "majors_inside": [
+            6
+          ]
+        },
+        {
+          "title": "七、数一数，填一填。(9分）",
+          "idx": 7,
+          "col": "left",
+          "bounds": [
+            0,
+            2407
+          ],
+          "box": [
+            0,
+            2112,
+            2407,
+            2591
+          ],
+          "majors_inside": [
+            7
+          ]
+        },
+        {
+          "title": "八、解决问题。（30分）",
+          "idx": 8,
+          "col": "left",
+          "bounds": [
+            0,
+            2407
+          ],
+          "box": [
+            0,
+            2591,
+            2407,
+            3378
+          ],
+          "majors_inside": [
+            8
+          ]
+        },
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "right",
+          "bounds": [
+            2407,
+            4901
+          ],
+          "box": [
+            2407,
+            0,
+            4901,
+            3378
+          ],
+          "majors_inside": []
+        }
+      ]
+    },
+    "arbiter": {
+      "block_count": 4,
+      "titled_blocks": 3,
+      "untitled_blocks": 1,
+      "major_expected": 3,
+      "major_captured": 3,
+      "major_recall": 1.0,
+      "merged_blocks": 0,
+      "blocks": [
+        {
+          "title": "六、我会画。（18分）",
+          "idx": 6,
+          "col": "column_1",
+          "bounds": [
+            0,
+            2428
+          ],
+          "box": [
+            0,
+            96,
+            2428,
+            2112
+          ],
+          "majors_inside": [
+            6
+          ]
+        },
+        {
+          "title": "七、数一数，填一填。(9分）",
+          "idx": 7,
+          "col": "column_1",
+          "bounds": [
+            0,
+            2428
+          ],
+          "box": [
+            0,
+            2112,
+            2428,
+            2591
+          ],
+          "majors_inside": [
+            7
+          ]
+        },
+        {
+          "title": "八、解决问题。（30分）",
+          "idx": 8,
+          "col": "column_1",
+          "bounds": [
+            0,
+            2428
+          ],
+          "box": [
+            0,
+            2591,
+            2428,
+            3378
+          ],
+          "majors_inside": [
+            8
+          ]
+        },
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "column_2",
+          "bounds": [
+            2428,
+            4901
+          ],
+          "box": [
+            2428,
+            0,
+            4901,
+            3378
+          ],
+          "majors_inside": []
+        }
+      ]
+    }
+  },
+  {
+    "page": 11,
+    "file": "20210126153256260571.jpg",
+    "shape": [
+      4893,
+      3377
+    ],
+    "ratio": 1.449,
+    "majors": [
+      {
+        "idx": 4,
+        "text": "四、选择。(将正确答案的序号填在括号里)(10分)",
+        "y": 328,
+        "x": 3188.6049999999996
+      },
+      {
+        "idx": 1,
+        "text": "一、卷面书写。(5分)",
+        "y": 937,
+        "x": 513.765
+      },
+      {
+        "idx": 2,
+        "text": "二、填空。(14分)",
+        "y": 1225,
+        "x": 467.55333333333334
+      },
+      {
+        "idx": 5,
+        "text": "五、仔细观察，分一分，填一填。（12分）",
+        "y": 1777,
+        "x": 3044.533333333333
+      },
+      {
+        "idx": 3,
+        "text": "三、我来当法官。(对的打“√”，错的打“×”)(5分)",
+        "y": 2704,
+        "x": 880.74
+      },
+      {
+        "idx": 6,
+        "text": "六、灵活运用。(21分)",
+        "y": 2889,
+        "x": 2843.376666666667
+      }
+    ],
+    "production_items": 116,
+    "arbiter_seconds": 0.06,
+    "arbiter_columns": [
+      [
+        0,
+        2489
+      ],
+      [
+        2489,
+        4893
+      ]
+    ],
+    "arbiter_gutters": [
+      2489
+    ],
+    "layout_regions": 48,
+    "baseline_regions": [
+      [
+        0,
+        2451
+      ],
+      [
+        2451,
+        4893
+      ]
+    ],
+    "baseline": {
+      "block_count": 7,
+      "titled_blocks": 6,
+      "untitled_blocks": 1,
+      "major_expected": 6,
+      "major_captured": 6,
+      "major_recall": 1.0,
+      "merged_blocks": 0,
+      "blocks": [
+        {
+          "title": "一、卷面书写。（5分）",
+          "idx": 1,
+          "col": "left",
+          "bounds": [
+            0,
+            2450
+          ],
+          "box": [
+            0,
+            937,
+            2450,
+            1231
+          ],
+          "majors_inside": [
+            1
+          ]
+        },
+        {
+          "title": "二、填空。（14分）",
+          "idx": 2,
+          "col": "left",
+          "bounds": [
+            0,
+            2450
+          ],
+          "box": [
+            0,
+            1231,
+            2450,
+            2692
+          ],
+          "majors_inside": [
+            2
+          ]
+        },
+        {
+          "title": "三、我来当法官。（对的打“√”，错的打“×”)(5分)",
+          "idx": 3,
+          "col": "left",
+          "bounds": [
+            0,
+            2450
+          ],
+          "box": [
+            0,
+            2692,
+            2450,
+            3377
+          ],
+          "majors_inside": [
+            3
+          ]
+        },
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "right",
+          "bounds": [
+            2450,
+            4893
+          ],
+          "box": [
+            2450,
+            0,
+            4893,
+            323
+          ],
+          "majors_inside": []
+        },
+        {
+          "title": "四、选择。（将正确答案的序号填在括号里）(10分）",
+          "idx": 4,
+          "col": "right",
+          "bounds": [
+            2450,
+            4893
+          ],
+          "box": [
+            2450,
+            323,
+            4893,
+            1771
+          ],
+          "majors_inside": [
+            4
+          ]
+        },
+        {
+          "title": "五、仔细观察，分一分，填一填。（12分）",
+          "idx": 5,
+          "col": "right",
+          "bounds": [
+            2450,
+            4893
+          ],
+          "box": [
+            2450,
+            1771,
+            4893,
+            2889
+          ],
+          "majors_inside": [
+            5
+          ]
+        },
+        {
+          "title": "六、灵活运用。（21分）",
+          "idx": 6,
+          "col": "right",
+          "bounds": [
+            2450,
+            4893
+          ],
+          "box": [
+            2450,
+            2889,
+            4893,
+            3377
+          ],
+          "majors_inside": [
+            6
+          ]
+        }
+      ]
+    },
+    "arbiter": {
+      "block_count": 7,
+      "titled_blocks": 6,
+      "untitled_blocks": 1,
+      "major_expected": 6,
+      "major_captured": 6,
+      "major_recall": 1.0,
+      "merged_blocks": 0,
+      "blocks": [
+        {
+          "title": "一、卷面书写。（5分）",
+          "idx": 1,
+          "col": "column_1",
+          "bounds": [
+            0,
+            2489
+          ],
+          "box": [
+            0,
+            937,
+            2489,
+            1231
+          ],
+          "majors_inside": [
+            1
+          ]
+        },
+        {
+          "title": "二、填空。（14分）",
+          "idx": 2,
+          "col": "column_1",
+          "bounds": [
+            0,
+            2489
+          ],
+          "box": [
+            0,
+            1231,
+            2489,
+            2692
+          ],
+          "majors_inside": [
+            2
+          ]
+        },
+        {
+          "title": "三、我来当法官。（对的打“√”，错的打“×”)(5分)",
+          "idx": 3,
+          "col": "column_1",
+          "bounds": [
+            0,
+            2489
+          ],
+          "box": [
+            0,
+            2692,
+            2489,
+            3377
+          ],
+          "majors_inside": [
+            3
+          ]
+        },
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "column_2",
+          "bounds": [
+            2489,
+            4893
+          ],
+          "box": [
+            2489,
+            0,
+            4893,
+            323
+          ],
+          "majors_inside": []
+        },
+        {
+          "title": "四、选择。（将正确答案的序号填在括号里）(10分）",
+          "idx": 4,
+          "col": "column_2",
+          "bounds": [
+            2489,
+            4893
+          ],
+          "box": [
+            2489,
+            323,
+            4893,
+            1771
+          ],
+          "majors_inside": [
+            4
+          ]
+        },
+        {
+          "title": "五、仔细观察，分一分，填一填。（12分）",
+          "idx": 5,
+          "col": "column_2",
+          "bounds": [
+            2489,
+            4893
+          ],
+          "box": [
+            2489,
+            1771,
+            4893,
+            2889
+          ],
+          "majors_inside": [
+            5
+          ]
+        },
+        {
+          "title": "六、灵活运用。（21分）",
+          "idx": 6,
+          "col": "column_2",
+          "bounds": [
+            2489,
+            4893
+          ],
+          "box": [
+            2489,
+            2889,
+            4893,
+            3377
+          ],
+          "majors_inside": [
+            6
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "page": 12,
+    "file": "20210126153256260572.jpg",
+    "shape": [
+      4893,
+      3377
+    ],
+    "ratio": 1.449,
+    "majors": [
+      {
+        "idx": 8,
+        "text": "八、解决问题。(22分)",
+        "y": 437,
+        "x": 2870.56
+      },
+      {
+        "idx": 7,
+        "text": "七、操作题。(16分)",
+        "y": 1777,
+        "x": 520.5608333333333
+      }
+    ],
+    "production_items": 52,
+    "arbiter_seconds": 0.07,
+    "arbiter_columns": [
+      [
+        0,
+        2514
+      ],
+      [
+        2514,
+        4893
+      ]
+    ],
+    "arbiter_gutters": [
+      2514
+    ],
+    "layout_regions": 24,
+    "baseline_regions": [
+      [
+        0,
+        2485
+      ],
+      [
+        2485,
+        4893
+      ]
+    ],
+    "baseline": {
+      "block_count": 4,
+      "titled_blocks": 2,
+      "untitled_blocks": 2,
+      "major_expected": 2,
+      "major_captured": 2,
+      "major_recall": 1.0,
+      "merged_blocks": 0,
+      "blocks": [
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "left",
+          "bounds": [
+            0,
+            2501
+          ],
+          "box": [
+            0,
+            0,
+            2501,
+            1771
+          ],
+          "majors_inside": []
+        },
+        {
+          "title": "七、操作题。（16分）",
+          "idx": 7,
+          "col": "left",
+          "bounds": [
+            0,
+            2501
+          ],
+          "box": [
+            0,
+            1771,
+            2501,
+            3377
+          ],
+          "majors_inside": [
+            7
+          ]
+        },
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "right",
+          "bounds": [
+            2501,
+            4893
+          ],
+          "box": [
+            2501,
+            0,
+            4893,
+            433
+          ],
+          "majors_inside": []
+        },
+        {
+          "title": "八、解决问题。（22分）",
+          "idx": 8,
+          "col": "right",
+          "bounds": [
+            2501,
+            4893
+          ],
+          "box": [
+            2501,
+            433,
+            4893,
+            3377
+          ],
+          "majors_inside": [
+            8
+          ]
+        }
+      ]
+    },
+    "arbiter": {
+      "block_count": 4,
+      "titled_blocks": 2,
+      "untitled_blocks": 2,
+      "major_expected": 2,
+      "major_captured": 2,
+      "major_recall": 1.0,
+      "merged_blocks": 0,
+      "blocks": [
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "column_1",
+          "bounds": [
+            0,
+            2513
+          ],
+          "box": [
+            0,
+            0,
+            2513,
+            1771
+          ],
+          "majors_inside": []
+        },
+        {
+          "title": "七、操作题。（16分）",
+          "idx": 7,
+          "col": "column_1",
+          "bounds": [
+            0,
+            2513
+          ],
+          "box": [
+            0,
+            1771,
+            2513,
+            3377
+          ],
+          "majors_inside": [
+            7
+          ]
+        },
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "column_2",
+          "bounds": [
+            2513,
+            4893
+          ],
+          "box": [
+            2513,
+            0,
+            4893,
+            433
+          ],
+          "majors_inside": []
+        },
+        {
+          "title": "八、解决问题。（22分）",
+          "idx": 8,
+          "col": "column_2",
+          "bounds": [
+            2513,
+            4893
+          ],
+          "box": [
+            2513,
+            433,
+            4893,
+            3377
+          ],
+          "majors_inside": [
+            8
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "page": 28,
+    "file": "20210126153256260588.jpg",
+    "shape": [
+      4894,
+      3377
+    ],
+    "ratio": 1.449,
+    "majors": [
+      {
+        "idx": 7,
+        "text": "七、看图列方程，并解方程。(16分)",
+        "y": 668,
+        "x": 723.2244444444444
+      },
+      {
+        "idx": 8,
+        "text": "八、解决问题。(25分)",
+        "y": 1916,
+        "x": 554.6533333333333
+      }
+    ],
+    "production_items": 44,
+    "arbiter_seconds": 0.06,
+    "arbiter_columns": [
+      [
+        0,
+        1356
+      ],
+      [
+        1356,
+        2522
+      ],
+      [
+        2522,
+        4894
+      ]
+    ],
+    "arbiter_gutters": [
+      1356,
+      2522
+    ],
+    "layout_regions": 20,
+    "baseline_regions": [
+      [
+        0,
+        1331
+      ],
+      [
+        1331,
+        2531
+      ],
+      [
+        2531,
+        4894
+      ]
+    ],
+    "baseline": {
+      "block_count": 5,
+      "titled_blocks": 2,
+      "untitled_blocks": 3,
+      "major_expected": 2,
+      "major_captured": 2,
+      "major_recall": 1.0,
+      "merged_blocks": 0,
+      "blocks": [
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "column_1",
+          "bounds": [
+            0,
+            1331
+          ],
+          "box": [
+            0,
+            0,
+            1331,
+            659
+          ],
+          "majors_inside": []
+        },
+        {
+          "title": "七、看图列方程，并解方程。（16分）",
+          "idx": 7,
+          "col": "column_1",
+          "bounds": [
+            0,
+            1331
+          ],
+          "box": [
+            0,
+            659,
+            1331,
+            1919
+          ],
+          "majors_inside": [
+            7
+          ]
+        },
+        {
+          "title": "八、解决问题。（25分）",
+          "idx": 8,
+          "col": "column_1",
+          "bounds": [
+            0,
+            1331
+          ],
+          "box": [
+            0,
+            1919,
+            1331,
+            3377
+          ],
+          "majors_inside": [
+            8
+          ]
+        },
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "column_2",
+          "bounds": [
+            1331,
+            2531
+          ],
+          "box": [
+            1331,
+            0,
+            2531,
+            3377
+          ],
+          "majors_inside": []
+        },
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "column_3",
+          "bounds": [
+            2531,
+            4894
+          ],
+          "box": [
+            2531,
+            0,
+            4894,
+            3377
+          ],
+          "majors_inside": []
+        }
+      ]
+    },
+    "arbiter": {
+      "block_count": 5,
+      "titled_blocks": 2,
+      "untitled_blocks": 3,
+      "major_expected": 2,
+      "major_captured": 2,
+      "major_recall": 1.0,
+      "merged_blocks": 0,
+      "blocks": [
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "column_1",
+          "bounds": [
+            0,
+            1356
+          ],
+          "box": [
+            0,
+            0,
+            1356,
+            659
+          ],
+          "majors_inside": []
+        },
+        {
+          "title": "七、看图列方程，并解方程。（16分）",
+          "idx": 7,
+          "col": "column_1",
+          "bounds": [
+            0,
+            1356
+          ],
+          "box": [
+            0,
+            659,
+            1356,
+            1919
+          ],
+          "majors_inside": [
+            7
+          ]
+        },
+        {
+          "title": "八、解决问题。（25分）",
+          "idx": 8,
+          "col": "column_1",
+          "bounds": [
+            0,
+            1356
+          ],
+          "box": [
+            0,
+            1919,
+            1356,
+            3377
+          ],
+          "majors_inside": [
+            8
+          ]
+        },
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "column_2",
+          "bounds": [
+            1356,
+            2522
+          ],
+          "box": [
+            1356,
+            0,
+            2522,
+            3377
+          ],
+          "majors_inside": []
+        },
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "column_3",
+          "bounds": [
+            2522,
+            4894
+          ],
+          "box": [
+            2522,
+            0,
+            4894,
+            3377
+          ],
+          "majors_inside": []
+        }
+      ]
+    }
+  },
+  {
+    "page": 43,
+    "file": "20210126153256260603.jpg",
+    "shape": [
+      4894,
+      3381
+    ],
+    "ratio": 1.448,
+    "majors": [],
+    "production_items": 1,
+    "arbiter_seconds": 0.07,
+    "arbiter_columns": [
+      [
+        0,
+        4894
+      ]
+    ],
+    "arbiter_gutters": [],
+    "layout_regions": 1,
+    "baseline_regions": [
+      [
+        0,
+        4894
+      ]
+    ],
+    "baseline": {
+      "block_count": 1,
+      "titled_blocks": 0,
+      "untitled_blocks": 1,
+      "major_expected": 0,
+      "major_captured": 0,
+      "major_recall": null,
+      "merged_blocks": 0,
+      "blocks": [
+        {
+          "title": "整页",
+          "idx": null,
+          "col": null,
+          "bounds": [
+            0,
+            4894
+          ],
+          "box": [
+            0,
+            0,
+            4894,
+            3381
+          ],
+          "majors_inside": []
+        }
+      ]
+    },
+    "arbiter": {
+      "block_count": 1,
+      "titled_blocks": 0,
+      "untitled_blocks": 1,
+      "major_expected": 0,
+      "major_captured": 0,
+      "major_recall": null,
+      "merged_blocks": 0,
+      "blocks": [
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "left",
+          "bounds": [
+            0,
+            4894
+          ],
+          "box": [
+            0,
+            0,
+            4894,
+            3381
+          ],
+          "majors_inside": []
+        }
+      ]
+    }
+  },
+  {
+    "page": 44,
+    "file": "20210126153256260604.jpg",
+    "shape": [
+      4894,
+      3381
+    ],
+    "ratio": 1.448,
+    "majors": [],
+    "production_items": 31,
+    "arbiter_seconds": 0.06,
+    "arbiter_columns": [
+      [
+        0,
+        4894
+      ]
+    ],
+    "arbiter_gutters": [],
+    "layout_regions": 12,
+    "baseline_regions": [
+      [
+        0,
+        3757
+      ],
+      [
+        3757,
+        4894
+      ]
+    ],
+    "baseline": {
+      "block_count": 1,
+      "titled_blocks": 0,
+      "untitled_blocks": 1,
+      "major_expected": 0,
+      "major_captured": 0,
+      "major_recall": null,
+      "merged_blocks": 0,
+      "blocks": [
+        {
+          "title": "整页",
+          "idx": null,
+          "col": null,
+          "bounds": [
+            0,
+            4894
+          ],
+          "box": [
+            0,
+            0,
+            4894,
+            3381
+          ],
+          "majors_inside": []
+        }
+      ]
+    },
+    "arbiter": {
+      "block_count": 1,
+      "titled_blocks": 0,
+      "untitled_blocks": 1,
+      "major_expected": 0,
+      "major_captured": 0,
+      "major_recall": null,
+      "merged_blocks": 0,
+      "blocks": [
+        {
+          "title": "整页",
+          "idx": null,
+          "col": "left",
+          "bounds": [
+            0,
+            4894
+          ],
+          "box": [
+            0,
+            0,
+            4894,
+            3381
+          ],
+          "majors_inside": []
+        }
+      ]
+    }
+  }
+]

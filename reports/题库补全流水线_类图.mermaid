@@ -1,0 +1,154 @@
+classDiagram
+    class ProjectDoc {
+        +str project_revision
+        +dict enrichment
+        +str difficulty_scheme
+        +str book_meta_rev
+        +bool book_meta_locked
+        +list pages
+        +list answer_pages
+        +list pairs
+        +str language
+        +str stage
+        +str grade
+        +str subject
+        +str delivery_book_id
+    }
+    class QuestionRecord {
+        +str id
+        +list bbox
+        +str region_role
+        +bool minor_number_inferred
+        +str text
+        +str answer
+        +str question_type
+        +list knowledge_points
+        +str difficulty
+        +str analysis
+        +list illustrations
+        +dict snapshot
+        +str snapshot_id
+        +str review_level
+        +list review_reasons
+        +dict field_source
+        +dict field_confidence
+        +str enrich_status
+        +list illustration_candidates
+        +list kp_codes
+        +list kp_rejected
+        +dict analysis_check
+        +dict pair
+        +dict review_trace
+    }
+    class SnapshotFreezer {
+        +str SNAPSHOT_VERSION
+        +freeze_or_invalidate(project, page, record, old) dict
+        +refresh_answer_segment(project, answer_ids) None
+        +hash_of(snapshot) str
+        +page_sha1(image) str
+        +is_valid(record, page) bool
+    }
+    class IllustrationExtractor {
+        +dict RULES
+        +collect(page_image, page_index, records, layout) list
+        +assign_owner(image_box, records, columns) dict
+        +hard_reject(crop, image_box, page_shape, label) str
+    }
+    class EnrichService {
+        +str PROMPT_VERSION
+        +dict SCHEMA
+        +enrich_one(record, snapshot, images, taxonomy) EnrichmentResult
+        +enrich_batch(project, concurrency, limit, dry_run) dict
+        +cache_key(snapshot, image_shas, taxonomy_version, book_meta_rev) str
+    }
+    class VLMClient {
+        +analyze_json_call(image, prompt, max_side, retries, timeout) dict
+    }
+    class KnowledgeTaxonomy {
+        +str version
+        +str subject
+        +load(subject, version) KnowledgeTaxonomy
+        +resolve(text) str
+        +validate(names) tuple
+        +prompt_vocabulary(stage, grade, limit) list
+        +stats() dict
+    }
+    class AnalysisVerifier {
+        +str VERIFIER_VERSION
+        +verify(record, snapshot) dict
+        +_structure_checks(record) list
+        +_numeric_recompute(text, answer) dict
+        +_symbol_subset(analysis, sources) dict
+    }
+    class ReviewLevelPolicy {
+        +str RULE_VERSION
+        +pair_ok(record) bool
+        +pair_margin(record) float
+        +compute_review_level(record, page, ctx) tuple
+        +batch_stats(records) dict
+        +check_difficulty_distribution(records) dict
+    }
+    class BookMetaGuesser {
+        +guess_book_metadata(book_name, directory) dict
+        +validate_book_metadata_revision(project) dict
+    }
+    class PageConsistency {
+        +float SIGMA_K
+        +extract_printed_majors(page_records) list
+        +check_page(project, page_index) dict
+        +book_density_stats(project) dict
+    }
+    class SamplingPlanner {
+        +acceptance_sample_size(error_rate, rules) int
+        +resolve_sampling_scope(project, records) dict
+        +build_sample(records, level, scope) dict
+        +record_finding(sample, item_id, error_class, note) dict
+        +accept_or_reject(sample) dict
+        +degrade_batch(project, batch_id, reason) dict
+        +escalate_stratum(project, stratum_id, error_class) dict
+        +build_recall(project, scope_id) dict
+        +build_patch(recall, fixed_rows) dict
+    }
+    class BatchPipeline {
+        +run_book(project_path, book_root, options) dict
+        +stage_gate(project) dict
+        +stage_cut(project) dict
+        +stage_images(project) dict
+        +stage_consistency(project) dict
+        +stage_enrich(project) dict
+        +stage_verify(project) dict
+        +stage_levels(project) dict
+    }
+    class DeliveryWriter {
+        +_k12_validation(sample, image_sizes) list
+        +_write_k12_delivery(root, project) dict
+        +sync_delivery_workspace(project_path, runtime_root) dict
+    }
+    class LayoutArbiter {
+        +str REVISION
+        +detect(img, with_regions) dict
+        +image_regions(img) list
+        +resolve_regions(img, regions, ocr_items) list
+    }
+
+    ProjectDoc "1" --> "*" QuestionRecord : contains
+    QuestionRecord "1" --> "0..1" SnapshotFreezer : snapshot frozen by
+    IllustrationExtractor --> QuestionRecord : writes illustration_candidates
+    IllustrationExtractor --> LayoutArbiter : reads image_boxes
+    EnrichService --> QuestionRecord : writes 4 ai fields
+    EnrichService --> KnowledgeTaxonomy : validates kp
+    EnrichService --> SnapshotFreezer : reads snapshot
+    EnrichService --> VLMClient : one call per record
+    AnalysisVerifier --> QuestionRecord : writes analysis_check
+    ReviewLevelPolicy --> QuestionRecord : writes review_level
+    ReviewLevelPolicy --> BookMetaGuesser : reads book_meta_rev
+    ReviewLevelPolicy --> PageConsistency : reads page checks
+    SamplingPlanner --> ProjectDoc : reads L0 pools by batch and stratum
+    BatchPipeline --> IllustrationExtractor
+    BatchPipeline --> EnrichService
+    BatchPipeline --> AnalysisVerifier
+    BatchPipeline --> ReviewLevelPolicy
+    BatchPipeline --> BookMetaGuesser
+    BatchPipeline --> PageConsistency
+    BatchPipeline --> SamplingPlanner
+    DeliveryWriter --> QuestionRecord : reads delivery fields only

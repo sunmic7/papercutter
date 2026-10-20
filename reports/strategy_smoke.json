@@ -1,0 +1,30 @@
+[
+  {
+    "book": "小学奥数专题突破一年级数学2014",
+    "profile": "olympiad",
+    "file": "image0000387A.jpg",
+    "seconds": 93.6,
+    "page_kind": "question",
+    "applicable": false,
+    "block_count": 1,
+    "major_printed": 0,
+    "major_captured": 0,
+    "titles": [
+      "整页"
+    ]
+  },
+  {
+    "book": "教材解读一年级上册数学冀教版2013",
+    "profile": "instructional",
+    "file": "Scan_09-08-2022_1451_0007.jpg",
+    "seconds": 81.0,
+    "page_kind": "question",
+    "applicable": true,
+    "block_count": 1,
+    "major_printed": 0,
+    "major_captured": 0,
+    "titles": [
+      "整页"
+    ]
+  }
+]

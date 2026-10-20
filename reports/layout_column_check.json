@@ -1,0 +1,834 @@
+[
+  {
+    "page": 1,
+    "file": "20210126153256260561.jpg",
+    "ratio": 1.448,
+    "arbiter_columns": [
+      [
+        0,
+        4897
+      ]
+    ],
+    "visual_split": null,
+    "verdict": "一致",
+    "seconds": 22.44,
+    "cached": false
+  },
+  {
+    "page": 2,
+    "file": "20210126153256260562.jpg",
+    "ratio": 1.448,
+    "arbiter_columns": [
+      [
+        0,
+        4897
+      ]
+    ],
+    "visual_split": null,
+    "verdict": "一致",
+    "seconds": 4.35,
+    "cached": false
+  },
+  {
+    "page": 3,
+    "file": "20210126153256260563.jpg",
+    "ratio": 1.458,
+    "arbiter_columns": [
+      [
+        0,
+        4887
+      ]
+    ],
+    "visual_split": null,
+    "verdict": "一致",
+    "seconds": 4.41,
+    "cached": false
+  },
+  {
+    "page": 4,
+    "file": "20210126153256260564.jpg",
+    "ratio": 1.458,
+    "arbiter_columns": [
+      [
+        0,
+        4887
+      ]
+    ],
+    "visual_split": 2260,
+    "verdict": "裁判少分",
+    "seconds": 4.44,
+    "cached": false
+  },
+  {
+    "page": 5,
+    "file": "20210126153256260565.jpg",
+    "ratio": 1.45,
+    "arbiter_columns": [
+      [
+        0,
+        2434
+      ],
+      [
+        2434,
+        4897
+      ]
+    ],
+    "visual_split": 2444,
+    "verdict": "一致",
+    "seconds": 4.48,
+    "cached": false
+  },
+  {
+    "page": 6,
+    "file": "20210126153256260566.jpg",
+    "ratio": 1.45,
+    "arbiter_columns": [
+      [
+        0,
+        2522
+      ],
+      [
+        2522,
+        4897
+      ]
+    ],
+    "visual_split": 2521,
+    "verdict": "一致",
+    "seconds": 4.27,
+    "cached": false
+  },
+  {
+    "page": 7,
+    "file": "20210126153256260567.jpg",
+    "ratio": 1.45,
+    "arbiter_columns": [
+      [
+        0,
+        2422
+      ],
+      [
+        2422,
+        4896
+      ]
+    ],
+    "visual_split": 2431,
+    "verdict": "一致",
+    "seconds": 4.3,
+    "cached": false
+  },
+  {
+    "page": 8,
+    "file": "20210126153256260568.jpg",
+    "ratio": 1.45,
+    "arbiter_columns": [
+      [
+        0,
+        2511
+      ],
+      [
+        2511,
+        4896
+      ]
+    ],
+    "visual_split": 2513,
+    "verdict": "一致",
+    "seconds": 4.31,
+    "cached": false
+  },
+  {
+    "page": 9,
+    "file": "20210126153256260569.jpg",
+    "ratio": 1.451,
+    "arbiter_columns": [
+      [
+        0,
+        2428
+      ],
+      [
+        2428,
+        4901
+      ]
+    ],
+    "visual_split": 2442,
+    "verdict": "一致",
+    "seconds": 4.36,
+    "cached": false
+  },
+  {
+    "page": 10,
+    "file": "20210126153256260570.jpg",
+    "ratio": 1.451,
+    "arbiter_columns": [
+      [
+        0,
+        2428
+      ],
+      [
+        2428,
+        4901
+      ]
+    ],
+    "visual_split": 2507,
+    "verdict": "一致",
+    "seconds": 4.38,
+    "cached": false
+  },
+  {
+    "page": 11,
+    "file": "20210126153256260571.jpg",
+    "ratio": 1.449,
+    "arbiter_columns": [
+      [
+        0,
+        2489
+      ],
+      [
+        2489,
+        4893
+      ]
+    ],
+    "visual_split": 2454,
+    "verdict": "一致",
+    "seconds": 4.37,
+    "cached": false
+  },
+  {
+    "page": 12,
+    "file": "20210126153256260572.jpg",
+    "ratio": 1.449,
+    "arbiter_columns": [
+      [
+        0,
+        2514
+      ],
+      [
+        2514,
+        4893
+      ]
+    ],
+    "visual_split": 2507,
+    "verdict": "一致",
+    "seconds": 4.22,
+    "cached": false
+  },
+  {
+    "page": 13,
+    "file": "20210126153256260573.jpg",
+    "ratio": 1.451,
+    "arbiter_columns": [
+      [
+        0,
+        2488
+      ],
+      [
+        2488,
+        4898
+      ]
+    ],
+    "visual_split": 2444,
+    "verdict": "一致",
+    "seconds": 4.29,
+    "cached": false
+  },
+  {
+    "page": 14,
+    "file": "20210126153256260574.jpg",
+    "ratio": 1.451,
+    "arbiter_columns": [
+      [
+        0,
+        2506
+      ],
+      [
+        2506,
+        4898
+      ]
+    ],
+    "visual_split": 2506,
+    "verdict": "一致",
+    "seconds": 4.14,
+    "cached": false
+  },
+  {
+    "page": 15,
+    "file": "20210126153256260575.jpg",
+    "ratio": 1.45,
+    "arbiter_columns": [
+      [
+        0,
+        2472
+      ],
+      [
+        2472,
+        4895
+      ]
+    ],
+    "visual_split": 2431,
+    "verdict": "一致",
+    "seconds": 4.12,
+    "cached": false
+  },
+  {
+    "page": 16,
+    "file": "20210126153256260576.jpg",
+    "ratio": 1.45,
+    "arbiter_columns": [
+      [
+        0,
+        2513
+      ],
+      [
+        2513,
+        4895
+      ]
+    ],
+    "visual_split": 2520,
+    "verdict": "一致",
+    "seconds": 4.16,
+    "cached": false
+  },
+  {
+    "page": 17,
+    "file": "20210126153256260577.jpg",
+    "ratio": 1.451,
+    "arbiter_columns": [
+      [
+        0,
+        2484
+      ],
+      [
+        2484,
+        4898
+      ]
+    ],
+    "visual_split": 2444,
+    "verdict": "一致",
+    "seconds": 4.14,
+    "cached": false
+  },
+  {
+    "page": 18,
+    "file": "20210126153256260578.jpg",
+    "ratio": 1.451,
+    "arbiter_columns": [
+      [
+        0,
+        2527
+      ],
+      [
+        2527,
+        4898
+      ]
+    ],
+    "visual_split": 2514,
+    "verdict": "一致",
+    "seconds": 4.14,
+    "cached": false
+  },
+  {
+    "page": 19,
+    "file": "20210126153256260579.jpg",
+    "ratio": 1.45,
+    "arbiter_columns": [
+      [
+        0,
+        2484
+      ],
+      [
+        2484,
+        4895
+      ]
+    ],
+    "visual_split": 2447,
+    "verdict": "一致",
+    "seconds": 4.23,
+    "cached": false
+  },
+  {
+    "page": 20,
+    "file": "20210126153256260580.jpg",
+    "ratio": 1.45,
+    "arbiter_columns": [
+      [
+        0,
+        2472
+      ],
+      [
+        2472,
+        4895
+      ]
+    ],
+    "visual_split": 2500,
+    "verdict": "一致",
+    "seconds": 4.14,
+    "cached": false
+  },
+  {
+    "page": 21,
+    "file": "20210126153256260581.jpg",
+    "ratio": 1.45,
+    "arbiter_columns": [
+      [
+        0,
+        2432
+      ],
+      [
+        2432,
+        4897
+      ]
+    ],
+    "visual_split": 2440,
+    "verdict": "一致",
+    "seconds": 4.13,
+    "cached": false
+  },
+  {
+    "page": 22,
+    "file": "20210126153256260582.jpg",
+    "ratio": 1.45,
+    "arbiter_columns": [
+      [
+        0,
+        2518
+      ],
+      [
+        2518,
+        4897
+      ]
+    ],
+    "visual_split": 2526,
+    "verdict": "一致",
+    "seconds": 4.25,
+    "cached": false
+  },
+  {
+    "page": 23,
+    "file": "20210126153256260583.jpg",
+    "ratio": 1.449,
+    "arbiter_columns": [
+      [
+        0,
+        2479
+      ],
+      [
+        2479,
+        4893
+      ]
+    ],
+    "visual_split": 2446,
+    "verdict": "一致",
+    "seconds": 4.24,
+    "cached": false
+  },
+  {
+    "page": 24,
+    "file": "20210126153256260584.jpg",
+    "ratio": 1.449,
+    "arbiter_columns": [
+      [
+        0,
+        2365
+      ],
+      [
+        2365,
+        4893
+      ]
+    ],
+    "visual_split": 2499,
+    "verdict": "一致",
+    "seconds": 4.26,
+    "cached": false
+  },
+  {
+    "page": 25,
+    "file": "20210126153256260585.jpg",
+    "ratio": 1.451,
+    "arbiter_columns": [
+      [
+        0,
+        2481
+      ],
+      [
+        2481,
+        4897
+      ]
+    ],
+    "visual_split": 2448,
+    "verdict": "一致",
+    "seconds": 4.33,
+    "cached": false
+  },
+  {
+    "page": 26,
+    "file": "20210126153256260586.jpg",
+    "ratio": 1.451,
+    "arbiter_columns": [
+      [
+        0,
+        2369
+      ],
+      [
+        2369,
+        4897
+      ]
+    ],
+    "visual_split": 2379,
+    "verdict": "一致",
+    "seconds": 4.2,
+    "cached": false
+  },
+  {
+    "page": 27,
+    "file": "20210126153256260587.jpg",
+    "ratio": 1.449,
+    "arbiter_columns": [
+      [
+        0,
+        2437
+      ],
+      [
+        2437,
+        4894
+      ]
+    ],
+    "visual_split": 2447,
+    "verdict": "一致",
+    "seconds": 4.21,
+    "cached": false
+  },
+  {
+    "page": 28,
+    "file": "20210126153256260588.jpg",
+    "ratio": 1.449,
+    "arbiter_columns": [
+      [
+        0,
+        1356
+      ],
+      [
+        1356,
+        2522
+      ],
+      [
+        2522,
+        4894
+      ]
+    ],
+    "visual_split": 2528,
+    "verdict": "一致",
+    "seconds": 4.24,
+    "cached": false
+  },
+  {
+    "page": 29,
+    "file": "20210126153256260589.jpg",
+    "ratio": 1.45,
+    "arbiter_columns": [
+      [
+        0,
+        2494
+      ],
+      [
+        2494,
+        4895
+      ]
+    ],
+    "visual_split": 2451,
+    "verdict": "一致",
+    "seconds": 4.11,
+    "cached": false
+  },
+  {
+    "page": 30,
+    "file": "20210126153256260590.jpg",
+    "ratio": 1.45,
+    "arbiter_columns": [
+      [
+        0,
+        2517
+      ],
+      [
+        2517,
+        4895
+      ]
+    ],
+    "visual_split": 2520,
+    "verdict": "一致",
+    "seconds": 4.21,
+    "cached": false
+  },
+  {
+    "page": 31,
+    "file": "20210126153256260591.jpg",
+    "ratio": 1.45,
+    "arbiter_columns": [
+      [
+        0,
+        2424
+      ],
+      [
+        2424,
+        4896
+      ]
+    ],
+    "visual_split": 2435,
+    "verdict": "一致",
+    "seconds": 4.24,
+    "cached": false
+  },
+  {
+    "page": 32,
+    "file": "20210126153256260592.jpg",
+    "ratio": 1.45,
+    "arbiter_columns": [
+      [
+        0,
+        2415
+      ],
+      [
+        2415,
+        4896
+      ]
+    ],
+    "visual_split": 2456,
+    "verdict": "一致",
+    "seconds": 4.3,
+    "cached": false
+  },
+  {
+    "page": 33,
+    "file": "20210126153256260593.jpg",
+    "ratio": 1.45,
+    "arbiter_columns": [
+      [
+        0,
+        2478
+      ],
+      [
+        2478,
+        4895
+      ]
+    ],
+    "visual_split": 2480,
+    "verdict": "一致",
+    "seconds": 4.27,
+    "cached": false
+  },
+  {
+    "page": 34,
+    "file": "20210126153256260594.jpg",
+    "ratio": 1.45,
+    "arbiter_columns": [
+      [
+        0,
+        2480
+      ],
+      [
+        2480,
+        4895
+      ]
+    ],
+    "visual_split": 2484,
+    "verdict": "一致",
+    "seconds": 4.39,
+    "cached": false
+  },
+  {
+    "page": 35,
+    "file": "20210126153256260595.jpg",
+    "ratio": 1.45,
+    "arbiter_columns": [
+      [
+        0,
+        2432
+      ],
+      [
+        2432,
+        4896
+      ]
+    ],
+    "visual_split": 2452,
+    "verdict": "一致",
+    "seconds": 4.11,
+    "cached": false
+  },
+  {
+    "page": 36,
+    "file": "20210126153256260596.jpg",
+    "ratio": 1.45,
+    "arbiter_columns": [
+      [
+        0,
+        2517
+      ],
+      [
+        2517,
+        4896
+      ]
+    ],
+    "visual_split": 2517,
+    "verdict": "一致",
+    "seconds": 4.1,
+    "cached": false
+  },
+  {
+    "page": 37,
+    "file": "20210126153256260597.jpg",
+    "ratio": 1.451,
+    "arbiter_columns": [
+      [
+        0,
+        2489
+      ],
+      [
+        2489,
+        4900
+      ]
+    ],
+    "visual_split": 2450,
+    "verdict": "一致",
+    "seconds": 4.27,
+    "cached": false
+  },
+  {
+    "page": 38,
+    "file": "20210126153256260598.jpg",
+    "ratio": 1.451,
+    "arbiter_columns": [
+      [
+        0,
+        2393
+      ],
+      [
+        2393,
+        4900
+      ]
+    ],
+    "visual_split": 2405,
+    "verdict": "一致",
+    "seconds": 4.04,
+    "cached": false
+  },
+  {
+    "page": 39,
+    "file": "20210126153256260599.jpg",
+    "ratio": 1.45,
+    "arbiter_columns": [
+      [
+        0,
+        2487
+      ],
+      [
+        2487,
+        4900
+      ]
+    ],
+    "visual_split": 2450,
+    "verdict": "一致",
+    "seconds": 4.0,
+    "cached": false
+  },
+  {
+    "page": 40,
+    "file": "20210126153256260600.jpg",
+    "ratio": 1.45,
+    "arbiter_columns": [
+      [
+        0,
+        2505
+      ],
+      [
+        2505,
+        4900
+      ]
+    ],
+    "visual_split": 2511,
+    "verdict": "一致",
+    "seconds": 4.11,
+    "cached": false
+  },
+  {
+    "page": 41,
+    "file": "20210126153256260601.jpg",
+    "ratio": 1.45,
+    "arbiter_columns": [
+      [
+        0,
+        1277
+      ],
+      [
+        1277,
+        2433
+      ],
+      [
+        2433,
+        3589
+      ],
+      [
+        3589,
+        4902
+      ]
+    ],
+    "visual_split": 2430,
+    "verdict": "一致",
+    "seconds": 4.18,
+    "cached": false
+  },
+  {
+    "page": 42,
+    "file": "20210126153256260602.jpg",
+    "ratio": 1.45,
+    "arbiter_columns": [
+      [
+        0,
+        1301
+      ],
+      [
+        1301,
+        2457
+      ],
+      [
+        2457,
+        3613
+      ],
+      [
+        3613,
+        4902
+      ]
+    ],
+    "visual_split": 2455,
+    "verdict": "一致",
+    "seconds": 3.98,
+    "cached": false
+  },
+  {
+    "page": 43,
+    "file": "20210126153256260603.jpg",
+    "ratio": 1.448,
+    "arbiter_columns": [
+      [
+        0,
+        4894
+      ]
+    ],
+    "visual_split": null,
+    "verdict": "一致",
+    "seconds": 4.14,
+    "cached": false
+  },
+  {
+    "page": 44,
+    "file": "20210126153256260604.jpg",
+    "ratio": 1.448,
+    "arbiter_columns": [
+      [
+        0,
+        4894
+      ]
+    ],
+    "visual_split": null,
+    "verdict": "一致",
+    "seconds": 4.04,
+    "cached": false
+  }
+]

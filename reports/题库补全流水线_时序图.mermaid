@@ -1,0 +1,73 @@
+sequenceDiagram
+    autonumber
+    participant E as 员工(Electron main.js)
+    participant API as 桥服务 _save_page
+    participant SN as enrich_snapshot
+    participant LV as review_levels
+    participant BM as book_meta
+    participant PC as page_consistency
+    participant BATCH as pipeline_batch
+    participant EN as enrich_service
+    participant VL as vlm_hybrid
+    participant TAX as knowledge_taxonomy
+    participant AV as analysis_verifier
+    participant SP as sampling
+    participant DW as delivery_workspace
+
+    Note over E,DW: (0) 书级门禁 G0 + 书名解析 G0b
+    BATCH->>BM: guess_book_metadata(书名, 目录)
+    BM-->>E: 学科/学段/年级/学期 候选 + confidence
+    E->>API: 确认书级字段（一次/书）
+    API->>BM: validate_book_metadata_revision(project)
+    API-->>BATCH: book_meta_rev（变化则整本 stale）
+
+    Note over E,DW: (1) 人工确认一次，唯一的人工输入动作
+    E->>API: 保存并确认本页(records 框/题号/text/answer)
+    API->>API: 白名单构造记录(665-696) + save_project
+    loop 每条 region_role=question
+        API->>SN: freeze_or_invalidate(project, page, record, old)
+        SN->>SN: page_sha1 + hash_of(snapshot 含 book_meta_rev)
+        SN-->>API: snapshot 或 stale 标记
+        API->>LV: compute_review_level(record, page, ctx)
+        LV-->>API: (level, reasons)
+    end
+    API-->>E: warnings 本页风险 N 条 + review_summary
+
+    Note over BATCH,DW: (2) 离线批处理，无人值守，可断点续跑
+    BATCH->>BATCH: stage_cut 调 _question_suggestions 串行推理
+    BATCH->>BATCH: stage_images layout_arbiter.image_regions + assign_owner + hard_reject
+    BATCH->>PC: stage_consistency check_page + book_density_stats
+    PC-->>BATCH: major_sequence_gap / page_density_outlier 告警
+    BATCH->>EN: stage_enrich concurrency=4
+    loop 每条待补全记录
+        EN->>EN: cache_key(snapshot, image_shas, taxonomy_version, book_meta_rev)
+        alt 缓存命中
+            EN-->>EN: 复用结果 ai_cached
+        else 未命中
+            EN->>VL: analyze_json_call(拼图, prompt)
+            VL->>VL: _prepare_image + _request 重试 1s/2s/4s
+            VL-->>EN: JSON dict 或 None
+        end
+        EN->>TAX: validate(knowledge_points)
+        TAX-->>EN: accepted + rejected
+        EN->>AV: verify(record, snapshot)
+        AV-->>EN: status + checks
+        EN-->>BATCH: EnrichmentResult 或 rejected 或 failed
+    end
+    BATCH->>LV: stage_levels 全量重算 + check_difficulty_distribution
+    BATCH->>SP: build_sample(L1) + resolve_sampling_scope(batch 或 stratum)
+
+    Note over DW: (3) 交付门禁 G8
+    DW->>DW: _k12_validation 加严 + review_level + 难度值域一致性 + suspected_missing
+    alt book_meta_dirty 或存在 L2 未复核
+        DW-->>E: 拒绝出包 + 具体原因进 quality_report
+    else 通过
+        DW-->>E: dataset.jsonl + quality_report.json
+    end
+
+    Note over SP: (4) 零缺陷验收与两级退化
+    E->>SP: 提交抽检结论(封闭 error_class)
+    SP->>SP: accept_or_reject 0 缺陷放行，1 缺陷即停
+    SP->>SP: degrade_batch 本批 L0 全降 L2 且不出包
+    SP->>SP: 全检同类错>=3 才 escalate_stratum 回溯该层
+    SP->>SP: build_recall + build_patch + affected_customer_packages（绝不改历史包）
