@@ -68,3 +68,8 @@ runtime/report_review/
 runtime/sidebar_previews/
 runtime/workspace_db/
 runtime/regression_samples/
+# T03 起的 UI 审计基线：源码副本不入库，只把哈希清单纳入版本控制
+desktop_annotation/_ui_baseline/**
+!desktop_annotation/_ui_baseline/
+!desktop_annotation/_ui_baseline/**/
+!desktop_annotation/_ui_baseline/**/_manifest.json

@@ -1,0 +1,71 @@
+{
+ "created_at": "2026-10-20T10:02:20",
+ "source": "desktop_annotation/PaperFlow-Annotation/resources/app",
+ "policy": "仅文本源（js/html/css/json），排除 exe/dll/asar/node/图片",
+ "files": {
+  "electron/exit-cache.js": {
+   "sha1": "a9f84f19ac3693a6b3d83bdc154c6e6d366fe654",
+   "size": 6076
+  },
+  "electron/main.js": {
+   "sha1": "ada66e92680f721bac8a34ca0fc454477a1ad9e5",
+   "size": 45561
+  },
+  "electron/preload.js": {
+   "sha1": "6ad901e0c96443ef1894ffd65eb970148aab4101",
+   "size": 4486
+  },
+  "js/annotation-manager.js": {
+   "sha1": "62bf4f85798a6592878df73c90df8dafd147ae74",
+   "size": 91350
+  },
+  "js/coordinate-system.js": {
+   "sha1": "e891a3e4fd4918d65ac04f72147efdfaf8f32c5d",
+   "size": 8980
+  },
+  "js/data-manager.js": {
+   "sha1": "d636b5251d6bf693a40dabbf946da4cd83972f49",
+   "size": 34225
+  },
+  "js/employee-workbench.js": {
+   "sha1": "7804457c1e7bddcdd6d6b3081d5a39c268499c46",
+   "size": 34092
+  },
+  "js/image-manager.js": {
+   "sha1": "b2d3a306d6e72bfc71a8138ffc6a2ee0fa569b21",
+   "size": 34291
+  },
+  "js/latex-renderer.js": {
+   "sha1": "a1ccab987c527318ccab7d3f879a85b40e18c858",
+   "size": 22876
+  },
+  "js/main.js": {
+   "sha1": "4d12680faf44497b1f4e0753fbec8ec67d1fab7c",
+   "size": 237907
+  },
+  "js/ocr-service.js": {
+   "sha1": "7f40e3db33e0ea6446b3684daaf8688e15552065",
+   "size": 45365
+  },
+  "js/quality-check.js": {
+   "sha1": "17ca11d39902cd700d79549097446692d06ecdb2",
+   "size": 33575
+  },
+  "js/ui-manager.js": {
+   "sha1": "3a1e973c5b271a34e8054513e64d5be27b63e92b",
+   "size": 189607
+  },
+  "js/utils.js": {
+   "sha1": "3a7b9508ba76e9c10b07c8e95745955294c4e4ad",
+   "size": 29008
+  },
+  "js/workspace-manager.js": {
+   "sha1": "437310333c6ad751ae3cda9d0e72e49c74da4cdf",
+   "size": 32927
+  },
+  "index.html": {
+   "sha1": "7e942e11b1b9ff820d5f8409a40e1492a41a713a",
+   "size": 32244
+  }
+ }
+}
