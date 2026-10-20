@@ -1051,11 +1051,24 @@ if (run(legacyBreak) !== '第一行\n第二行') throw new Error('literal legacy
         )
 
     def test_question_card_shows_matched_answer_text(self):
-        """匹配完成后答案文字直接显示在题卡里。"""
-        source = (APP_JS / "employee-workbench.js").read_text(encoding="utf-8")
-        self.assertIn("employee-card-answer", source)
-        self.assertIn("answer_pages", source)
-        self.assertIn("record.answer || record.analysis || record.text", source)
+        """匹配完成后答案文字显示在题干内容下方，点击可跳到答案所在页。"""
+        ui_source = (APP_JS / "ui-manager.js").read_text(encoding="utf-8")
+        # 答案块插在题干内容 form-group 之后。
+        content_group_end = ui_source.index("generatePreviewArea('previewContent')")
+        insert_at = ui_source.index("${matchedAnswerBlock}", content_group_end)
+        self.assertLess(content_group_end, insert_at)
+        self.assertIn("buildMatchedAnswerBlock", ui_source)
+        self.assertIn("record.answer || record.analysis || record.text", ui_source)
+        self.assertIn("pf-card-answer-jump", ui_source)
+        self.assertIn("data-answer-locations", ui_source)
+        # 答案块不再出现在卡片摘要区。
+        workbench_source = (APP_JS / "employee-workbench.js").read_text(encoding="utf-8")
+        self.assertNotIn("employee-card-answer", workbench_source)
+        # 主程序有跳转实现：切答案页 + 选中并聚焦答案框。
+        main_source = (APP_JS / "main.js").read_text(encoding="utf-8")
+        self.assertIn("async jumpToPaperFlowAnswer(", main_source)
+        self.assertIn("loadPaperFlowKind('answer', page.image)", main_source)
+        self.assertIn("selectAnnotation(first.answerId)", main_source)
 
     def test_confirmed_match_keeps_the_stable_pair_identity_from_backend(self):
         source = (APP_JS / "main.js").read_text(encoding="utf-8")
