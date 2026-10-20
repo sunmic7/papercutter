@@ -150,6 +150,11 @@ def extract_subsection_number(title: object) -> str:
 
 
 def _canonical_number(value: object) -> str:
+    """排版归一（全角/括号/「第…题」后缀），但不做中文数字↔阿拉伯转换。
+
+    「二」和「2」是两套编号体系，同一本书里可以同时出现且互不相同；
+    括号（（二）→ 二）只是排版差异，仍然视为同一个号。
+    """
     text = re.sub(r"\s+", "", str(value or "")).translate(
         str.maketrans("０１２３４５６７８９", "0123456789")
     ).replace("（", "(").replace("）", ")").replace("【", "[").replace("】", "]")
@@ -159,9 +164,6 @@ def _canonical_number(value: object) -> str:
     while len(text) >= 2 and any(text.startswith(left) and text.endswith(right)
                                  for left, right in wrappers):
         text = text[1:-1].strip()
-    converted = chinese_number_to_int(text)
-    if converted is not None:
-        return str(converted)
     match = re.fullmatch(r"0*(\d+)(.*)", text)
     return f"{int(match.group(1))}{match.group(2)}" if match else text.lower()
 

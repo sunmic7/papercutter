@@ -768,7 +768,7 @@ class AnnotationApiTests(unittest.TestCase):
             "accepted": True,
             "records": [{
                 "id": "a-scoped", "bbox": [10, 10, 100, 100],
-                "number_path": ["7", "1", "1"], "match_scope_id": scope["id"],
+                "number_path": ["七", "1", "1"], "match_scope_id": scope["id"],
             }],
         })
         result = api._auto_match_scopes({"project_path": str(self.project_path)})
@@ -777,16 +777,20 @@ class AnnotationApiTests(unittest.TestCase):
         self.assertEqual(result["pairs"][0]["answer_ids"], ["a-scoped"])
 
     def test_scope_auto_match_pairs_duplicate_numbers_to_the_same_answer(self) -> None:
-        """新规则：同分组+同题号即自动配对；同号多题共用同一答案。"""
+        """新规则：同分组+同题号即自动配对；同号多题共用同一答案。
+
+        （2）与 2 只是括号排版差异，仍视为同一个号；中文「八」与阿拉伯 8
+        是不同编号体系，互不匹配。
+        """
         project = api.annotation_data.load_project(self.project_path)
         scope_id = "scope-duplicate"
         project["match_scopes"] = [{"id": scope_id, "name": "重复题号试卷"}]
         project["pages"][0].update(status="accepted", questions=[
             api.annotation_data.new_record([1, 1, 20, 20], number_path=["八", "2"], match_scope_id=scope_id),
-            api.annotation_data.new_record([30, 1, 50, 20], number_path=["8", "（二）"], match_scope_id=scope_id),
+            api.annotation_data.new_record([30, 1, 50, 20], number_path=["八", "（2）"], match_scope_id=scope_id),
         ])
         project["answer_pages"][0].update(status="accepted", answers=[
-            api.annotation_data.new_record([1, 1, 20, 20], answer=True, number_path=["8", "2"], match_scope_id=scope_id),
+            api.annotation_data.new_record([1, 1, 20, 20], answer=True, number_path=["八", "2"], match_scope_id=scope_id),
         ])
         api.annotation_data.save_project(project, self.project_path)
         result = api._auto_match_scopes({"project_path": str(self.project_path)})

@@ -40,16 +40,19 @@ class ManualAnnotationDataTests(unittest.TestCase):
         self.assertTrue(np.all(composed[2] == 40))
         self.assertTrue(np.all(composed[3] == 180))
 
-    def test_canonical_number_path_normalizes_chinese_wrappers_and_fullwidth_digits(self):
+    def test_canonical_number_normalizes_wrappers_and_fullwidth_but_keeps_chinese(self):
         self.assertEqual(
             data.canonical_number_path({"number_path": ["七", "1", "（1）"]}),
-            ("7", "1", "1"),
+            ("七", "1", "1"),
         )
         self.assertEqual(
             data.canonical_number_path({"number_path": ["第八题", "（二）"]}),
-            ("8", "2"),
+            ("八", "二"),
         )
         self.assertEqual(data._canonical_number("００７"), "7")
+        # 中文数字与阿拉伯数字是两套编号体系，不互相转换。
+        self.assertNotEqual(data._canonical_number("二"), "2")
+        self.assertNotEqual(data._canonical_number("（二）"), "2")
 
     def test_new_projects_initialize_match_scopes_and_page_scope_regions(self):
         with tempfile.TemporaryDirectory() as directory:

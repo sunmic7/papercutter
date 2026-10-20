@@ -1014,10 +1014,20 @@ if (run(legacyBreak) !== '第一行\n第二行') throw new Error('literal legacy
         for group in groups:
             positions = [html.index(value) for value in group]
             self.assertEqual(positions, sorted(positions), group)
-        # 一本书只设一次的配置和三个远端审核动作必须收在下拉菜单里，不再平铺。
-        self.assertIn('class="pf-menu" id="pfMenuBook"', html)
+        # 教材信息 / 页面分类 / 匹配分组三个高频按钮平铺在主界面（原「教材设置」下拉已删），
+        # 顺序：教材信息 → 页面分类 → 匹配分组 → 生成预标注。
+        self.assertNotIn('id="pfMenuBook"', html)
+        self.assertNotIn('data-pf-menu-target="pfMenuBook"', html)
+        book_order = [
+            'id="editBookMetadata"',
+            'id="managePaperFlowPages"',
+            'id="manageMatchScopes"',
+            'id="generatePrelabels"',
+        ]
+        positions = [html.index(value) for value in book_order]
+        self.assertEqual(positions, sorted(positions), book_order)
+        # 远端审核动作仍收在下拉菜单里。
         self.assertIn('class="pf-menu" id="pfMenuReview"', html)
-        self.assertIn('data-pf-menu-target="pfMenuBook"', html)
         self.assertIn('data-pf-menu-target="pfMenuReview"', html)
 
     def test_scope_auto_match_button_uses_the_requested_wording(self):
