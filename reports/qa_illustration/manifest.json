@@ -1,0 +1,310 @@
+{
+  "pages": [
+    {
+      "page": "20210126154119260707.jpg",
+      "size": [
+        4929,
+        3382
+      ],
+      "records": 6,
+      "regions": 8,
+      "candidates": 8,
+      "reject_reasons": {
+        "通过": 8
+      },
+      "owner_methods": {
+        "orphan": 1,
+        "contain": 7
+      }
+    },
+    {
+      "page": "image0002263B.jpg",
+      "size": [
+        2368,
+        3439
+      ],
+      "records": 3,
+      "regions": 4,
+      "candidates": 4,
+      "reject_reasons": {
+        "通过": 4
+      },
+      "owner_methods": {
+        "contain": 4
+      }
+    },
+    {
+      "page": "Scan_20-06-2022_1634_0039.jpg",
+      "size": [
+        2384,
+        3496
+      ],
+      "records": 2,
+      "regions": 11,
+      "candidates": 11,
+      "reject_reasons": {
+        "通过": 5,
+        "too_small": 3,
+        "formula_only": 3
+      },
+      "owner_methods": {
+        "contain": 11
+      }
+    }
+  ],
+  "crops": [
+    {
+      "page": "20210126154119260707.jpg",
+      "candidate": "ic-0-1",
+      "file": "F:\\papercutter\\reports\\qa_illustration\\20261020r4_20210126154119260707_ic-0-1_pass_review.png",
+      "bbox": [
+        239,
+        664,
+        2328,
+        910
+      ],
+      "label": "table",
+      "layout_score": 0.9762,
+      "area_ratio": 0.0308,
+      "page_area_ratio": 0.0308,
+      "reject_reason": "",
+      "needs_review": true,
+      "similarity_to_page": 0.5625,
+      "page_hamming": 448,
+      "owner": "/orphan",
+      "crop_sha1": "0d3008fedcff09de40cc8bdc4c76deae5616a629"
+    },
+    {
+      "page": "20210126154119260707.jpg",
+      "candidate": "ic-0-2",
+      "file": "F:\\papercutter\\reports\\qa_illustration\\20261020r4_20210126154119260707_ic-0-2_pass_auto.png",
+      "bbox": [
+        686,
+        2678,
+        1934,
+        2975
+      ],
+      "label": "image",
+      "layout_score": 0.9454,
+      "area_ratio": 0.0222,
+      "page_area_ratio": 0.0222,
+      "reject_reason": "",
+      "needs_review": false,
+      "similarity_to_page": 0.5254,
+      "page_hamming": 486,
+      "owner": "q3/contain",
+      "crop_sha1": "4cfdc63d79f6d73e29f9760a7f223aa764805315"
+    },
+    {
+      "page": "20210126154119260707.jpg",
+      "candidate": "ic-0-3",
+      "file": "F:\\papercutter\\reports\\qa_illustration\\20261020r4_20210126154119260707_ic-0-3_pass_auto.png",
+      "bbox": [
+        312,
+        1368,
+        2328,
+        2442
+      ],
+      "label": "image",
+      "layout_score": 0.9398,
+      "area_ratio": 0.13,
+      "page_area_ratio": 0.13,
+      "reject_reason": "",
+      "needs_review": false,
+      "similarity_to_page": 0.5996,
+      "page_hamming": 410,
+      "owner": "q2/contain",
+      "crop_sha1": "ad1f896bfd6d6302989cac58bbd104fedaee52ed"
+    },
+    {
+      "page": "20210126154119260707.jpg",
+      "candidate": "ic-0-4",
+      "file": "F:\\papercutter\\reports\\qa_illustration\\20261020r4_20210126154119260707_ic-0-4_pass_auto.png",
+      "bbox": [
+        2762,
+        218,
+        3517,
+        695
+      ],
+      "label": "image",
+      "layout_score": 0.9136,
+      "area_ratio": 0.0216,
+      "page_area_ratio": 0.0216,
+      "reject_reason": "",
+      "needs_review": false,
+      "similarity_to_page": 0.5977,
+      "page_hamming": 412,
+      "owner": "q4/contain",
+      "crop_sha1": "14e950eb13d2abaa15920d314eba6b00d2e61331"
+    },
+    {
+      "page": "image0002263B.jpg",
+      "candidate": "ic-0-1",
+      "file": "F:\\papercutter\\reports\\qa_illustration\\20261020r4_image0002263B_ic-0-1_pass_auto.png",
+      "bbox": [
+        1084,
+        1685,
+        1464,
+        2065
+      ],
+      "label": "image",
+      "layout_score": 0.9751,
+      "area_ratio": 0.0177,
+      "page_area_ratio": 0.0177,
+      "reject_reason": "",
+      "needs_review": false,
+      "similarity_to_page": 0.583,
+      "page_hamming": 427,
+      "owner": "q3/contain",
+      "crop_sha1": "d5969da6fa57b08722608b0d20d9db92acc38782"
+    },
+    {
+      "page": "image0002263B.jpg",
+      "candidate": "ic-0-2",
+      "file": "F:\\papercutter\\reports\\qa_illustration\\20261020r4_image0002263B_ic-0-2_pass_auto.png",
+      "bbox": [
+        1198,
+        434,
+        1551,
+        730
+      ],
+      "label": "image",
+      "layout_score": 0.9327,
+      "area_ratio": 0.0128,
+      "page_area_ratio": 0.0128,
+      "reject_reason": "",
+      "needs_review": false,
+      "similarity_to_page": 0.585,
+      "page_hamming": 425,
+      "owner": "q2/contain",
+      "crop_sha1": "89ea26800e94c6db3ca2a836e731e56279dbc1b5"
+    },
+    {
+      "page": "image0002263B.jpg",
+      "candidate": "ic-0-3",
+      "file": "F:\\papercutter\\reports\\qa_illustration\\20261020r4_image0002263B_ic-0-3_pass_auto.png",
+      "bbox": [
+        274,
+        465,
+        596,
+        716
+      ],
+      "label": "image",
+      "layout_score": 0.892,
+      "area_ratio": 0.0099,
+      "page_area_ratio": 0.0099,
+      "reject_reason": "",
+      "needs_review": false,
+      "similarity_to_page": 0.5381,
+      "page_hamming": 473,
+      "owner": "q2/contain",
+      "crop_sha1": "ed2c7fcff3848ce51eefa17205f48bb396008e4b"
+    },
+    {
+      "page": "image0002263B.jpg",
+      "candidate": "ic-0-4",
+      "file": "F:\\papercutter\\reports\\qa_illustration\\20261020r4_image0002263B_ic-0-4_pass_auto.png",
+      "bbox": [
+        200,
+        1333,
+        856,
+        1481
+      ],
+      "label": "image",
+      "layout_score": 0.8063,
+      "area_ratio": 0.0119,
+      "page_area_ratio": 0.0119,
+      "reject_reason": "",
+      "needs_review": false,
+      "similarity_to_page": 0.5342,
+      "page_hamming": 477,
+      "owner": "q2/contain",
+      "crop_sha1": "8ac48b389e5a115119c37c1f2cc48999a63540ce"
+    },
+    {
+      "page": "Scan_20-06-2022_1634_0039.jpg",
+      "candidate": "ic-0-1",
+      "file": "F:\\papercutter\\reports\\qa_illustration\\20261020r4_Scan_20-06-2022_1634_0039_ic-0-1_pass_review.png",
+      "bbox": [
+        156,
+        2113,
+        1115,
+        2416
+      ],
+      "label": "table",
+      "layout_score": 0.9672,
+      "area_ratio": 0.035,
+      "page_area_ratio": 0.035,
+      "reject_reason": "",
+      "needs_review": true,
+      "similarity_to_page": 0.5547,
+      "page_hamming": 456,
+      "owner": "q1/contain",
+      "crop_sha1": "7eba5dc9c097a755eecf8157652b52cd6962105d"
+    },
+    {
+      "page": "Scan_20-06-2022_1634_0039.jpg",
+      "candidate": "ic-0-2",
+      "file": "F:\\papercutter\\reports\\qa_illustration\\20261020r4_Scan_20-06-2022_1634_0039_ic-0-2_pass_auto.png",
+      "bbox": [
+        1890,
+        2340,
+        2148,
+        2579
+      ],
+      "label": "image",
+      "layout_score": 0.9135,
+      "area_ratio": 0.0074,
+      "page_area_ratio": 0.0074,
+      "reject_reason": "",
+      "needs_review": false,
+      "similarity_to_page": 0.4873,
+      "page_hamming": 525,
+      "owner": "q2/contain",
+      "crop_sha1": "07059cfae780feb83270166a37f89d21939f2943"
+    },
+    {
+      "page": "Scan_20-06-2022_1634_0039.jpg",
+      "candidate": "ic-0-3",
+      "file": "F:\\papercutter\\reports\\qa_illustration\\20261020r4_Scan_20-06-2022_1634_0039_ic-0-3_too_small_auto.png",
+      "bbox": [
+        1303,
+        653,
+        1426,
+        775
+      ],
+      "label": "image",
+      "layout_score": 0.6766,
+      "area_ratio": 0.0018,
+      "page_area_ratio": 0.0018,
+      "reject_reason": "too_small",
+      "needs_review": false,
+      "similarity_to_page": 0.5225,
+      "page_hamming": 489,
+      "owner": "q2/contain",
+      "crop_sha1": "913735c04ca3d10fd892b041adf8fd65fe381864"
+    },
+    {
+      "page": "Scan_20-06-2022_1634_0039.jpg",
+      "candidate": "ic-0-4",
+      "file": "F:\\papercutter\\reports\\qa_illustration\\20261020r4_Scan_20-06-2022_1634_0039_ic-0-4_formula_only_auto.png",
+      "bbox": [
+        244,
+        1463,
+        822,
+        1612
+      ],
+      "label": "formula",
+      "layout_score": 0.6609,
+      "area_ratio": 0.0104,
+      "page_area_ratio": 0.0104,
+      "reject_reason": "formula_only",
+      "needs_review": false,
+      "similarity_to_page": 0.4785,
+      "page_hamming": 534,
+      "owner": "q1/contain",
+      "crop_sha1": "8097598f6a7a7ed698daccb297fcf3bca3537d70"
+    }
+  ],
+  "concerns": []
+}
