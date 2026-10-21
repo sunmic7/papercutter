@@ -16,7 +16,7 @@
 | # | 断言 | 数据来源 | SKIP 条件 |
 |---|------|----------|-----------|
 | 1 | ``enabled == true``（补全开关已开） | enrich-status 响应 | 不跳过：关着就是 FAIL |
-| 2 | ``bridge_revision == 'enrich-snapshot-20261020'`` | 同上 | 不跳过 |
+| 2 | ``bridge_revision == 期望值``（默认 T03 签名版，可用 ``--expect-revision`` 覆盖） | 同上 | 不跳过 |
 | 3 | ``enrich_summary`` 存在，且 ``status_counts`` **不存在** | 同上 | 不跳过 |
 | 4 | ``review_summary.L0+L1+L2 == level_stats.total`` | 同上 | total 为 0 时 SKIP |
 | 5 | ``todo[*].enrich_status`` ∈ 6 种待办状态 | 同上 | todo 为空时 SKIP |
@@ -57,6 +57,11 @@ if str(ROOT) not in sys.path:
 os.environ.setdefault("PAPERFLOW_DISABLE_PROFILE_DETECT", "1")
 
 API_PATH = ROOT / "desktop_annotation" / "paperflow_annotation_api.py"
+# T03 签名时的桥版本。**不自动跟随**当前代码里的常量：断言 2 的意义是
+# "跑的桥确实是含 T03 接线的那个版本"，若拿代码常量当期望值，这条断言就永远自证。
+# 签名之后合入的桥版本（如 confident-auto-match-20261020、review-loop-import-push-20261021）
+# 属于已知后继版本，要在命令行用 ``--expect-revision`` 显式声明，输出里会原样打印被断言的
+# 那个字符串 —— 这样"换了期望值"这件事本身也留痕，不会被悄悄放过。
 EXPECTED_BRIDGE_REVISION = "enrich-snapshot-20261020"
 TODO_STATUSES = ("pending", "stale", "kp_stale", "analysis_stale", "failed", "rejected")
 
@@ -153,7 +158,8 @@ def _question_records(project: dict) -> list[dict]:
     return records
 
 
-def check_status_payload(payload: dict) -> list[Verdict]:
+def check_status_payload(payload: dict,
+                         expected_revision: str = EXPECTED_BRIDGE_REVISION) -> list[Verdict]:
     """断言 1~6：全部来自 ``enrich-status`` 响应体。"""
     out: list[Verdict] = []
 
@@ -167,8 +173,8 @@ def check_status_payload(payload: dict) -> list[Verdict]:
 
     revision = payload.get("bridge_revision")
     out.append(Verdict(
-        2, f"bridge_revision == {EXPECTED_BRIDGE_REVISION}",
-        PASS if revision == EXPECTED_BRIDGE_REVISION else FAIL,
+        2, f"bridge_revision == {expected_revision}",
+        PASS if revision == expected_revision else FAIL,
         f"bridge_revision={revision!r}",
     ))
 
@@ -281,6 +287,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="HUMAN-PENDING 机械核对（只读）")
     parser.add_argument("--project", required=True, help="PaperFlow标注项目.json 的路径")
     parser.add_argument("--base-url", default="", help="桥服务地址；留空则进程内调用只读路由")
+    parser.add_argument("--expect-revision", default=EXPECTED_BRIDGE_REVISION,
+                        help="断言 2 期望的 bridge_revision；T03 签名后合入的新桥版本用此参数显式声明")
     parser.add_argument("--json", default="", help="把结果写成 JSON，便于归档比对")
     args = parser.parse_args()
 
@@ -305,11 +313,12 @@ def main() -> int:
               "或教材目录下的 PaperFlow标注项目.json", file=sys.stderr)
         return 2
 
-    verdicts = check_status_payload(payload)
+    verdicts = check_status_payload(payload, args.expect_revision)
     verdicts += check_project_file(project)
 
     print(f"核对工程：{project_path}")
     print(f"响应来源：{args.base_url or '进程内调用 _enrich_status'}")
+    print(f"断言版本：{args.expect_revision}")
     print("-" * 78)
     for verdict in verdicts:
         print(verdict.line())

@@ -1142,6 +1142,35 @@ class EnrichBridgeTests(unittest.TestCase):
         self.assertIn("pair_fail", status["todo"][0]["review_reasons"])
         self.assertEqual(status["enrich_summary"], {"pending": 1})
 
+    def test_enrich_status_counts_readable_page_hash_as_ok(self) -> None:
+        """C1：源图读得到时，指纹状态记 ok，不产生"核不了"的告警数。"""
+        self._confirm_question_page()
+        status = api._enrich_status({"project_path": str(self.project_path)})
+        self.assertEqual(
+            status["snapshot_health"],
+            {"total": 1, "page_sha1_ok": 1, "page_sha1_unavailable": 0, "no_snapshot": 0},
+        )
+        self.assertEqual(
+            self._question()["snapshot"]["page_sha1_status"], "ok",
+            "夹具里的 question.png 真实存在，指纹必须算得出来",
+        )
+
+    def test_enrich_status_flags_records_whose_page_hash_is_unreadable(self) -> None:
+        """C1：源图没了（换机/拔盘/目录改名）时，必须能看见，而不是安静地当正常。"""
+        (self.book / "question.png").unlink()
+        api.enrich_snapshot.clear_page_hash_cache()
+        self._confirm_question_page()
+        status = api._enrich_status({"project_path": str(self.project_path)})
+        self.assertEqual(
+            status["snapshot_health"],
+            {"total": 1, "page_sha1_ok": 0, "page_sha1_unavailable": 1, "no_snapshot": 0},
+        )
+        record = self._question()
+        self.assertEqual(record["snapshot"]["page_sha1_status"], "unavailable")
+        # 只读诊断：图读不到**不能**把快照判成无效，否则离机审查会整本失效
+        self.assertTrue(api.enrich_snapshot.is_valid_snapshot(record["snapshot"]))
+        self.assertEqual(status["todo_count"], 1)
+
     def test_book_meta_suggest_never_writes_the_project(self) -> None:
         before = self.project_path.read_bytes()
         suggestion = api._book_meta_suggest({

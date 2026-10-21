@@ -2155,6 +2155,38 @@ def _enrich_prepare(payload: dict) -> dict:
     }
 
 
+def _snapshot_source_health(records: list[dict]) -> dict:
+    """C1 可见性：源图指纹核不出来的记录数（只读诊断，不参与门禁与分级）。
+
+    为什么单独数它：``snapshot['page_sha1_status']`` 是 §3.2 的非权威诊断位 ——
+    它区分"图没变"与"读不到图"，但**不进哈希**，因此没有任何门禁会因为它报警。
+    T04/T05 暂缓期间出包侧没有这道门，`unavailable` 会安静地变成"看起来一切正常"：
+    换机/拔盘/教材目录改名之后，整本快照的指纹都核不了，而界面毫无提示。
+
+    这里只做计数，不改 ``is_valid`` 的语义（那会让离机审查整本失效，
+    见 ``freeze_or_invalidate`` 里"读不到源图 ≠ 换了源图"的旧指纹保留分支）。
+    """
+    total = ok = unavailable = no_snapshot = 0
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        total += 1
+        snapshot = record.get("snapshot")
+        if not isinstance(snapshot, dict) or not snapshot:
+            no_snapshot += 1
+            continue
+        if str(snapshot.get("page_sha1_status") or "") == "ok":
+            ok += 1
+        else:
+            unavailable += 1
+    return {
+        "total": total,
+        "page_sha1_ok": ok,
+        "page_sha1_unavailable": unavailable,
+        "no_snapshot": no_snapshot,
+    }
+
+
 def _enrich_status(payload: dict) -> dict:
     """分级 / 待办统计（只读，不落盘）：给 UI 的"本页风险 N 条"与批量面板用。"""
     if not _enrich_enabled():
@@ -2246,6 +2278,8 @@ def _enrich_status(payload: dict) -> dict:
             "L2": level_stats.get("L2", 0),
         },
         "enrich_summary": status_counts,
+        # C1：源图指纹核不出来的记录数（只读诊断）。见 _snapshot_source_health。
+        "snapshot_health": _snapshot_source_health(records),
         "todo_count": len(todo),
         "todo": todo[:200],
         "blocked_count": len(blocked),
