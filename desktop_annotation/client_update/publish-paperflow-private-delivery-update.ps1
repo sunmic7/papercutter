@@ -3,7 +3,7 @@ param(
     [string]$ServerAddress = "192.168.1.204",
     [string]$ServerUser = "paperflow-deploy",
     [string]$KeyPath = "",
-    [string]$Version = "20261021-review-loop"
+    [string]$Version = "20261021-source-images"
 )
 
 $ErrorActionPreference = "Stop"
