@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from review_tools import manual_annotation_data as annotation_data
@@ -22,6 +23,8 @@ from review_tools import manual_annotation_data as annotation_data
 SCHEMA_VERSION = 1
 DEFAULT_MAX_PREVIEW_SIDE = 1600
 DECISIONS_FILENAME = "PaperFlow在线审核决定.json"
+SOURCE_IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff")
+SOURCE_IMAGE_MAX_BYTES = 48 * 1024 * 1024
 
 
 class ReviewConflictError(RuntimeError):
@@ -274,3 +277,148 @@ def push_project_snapshot(server_url: str, username: str, password: str, project
         "project_revision": int(result["project"].get("project_revision", 0) or 0),
         "server_relative_path": result["project"].get("server_relative_path", ""),
     }
+
+
+def _login(base_url: str, username: str, password: str) -> str:
+    return str(_request_json(base_url + "/api/login", "POST", {"username": username, "password": password}, timeout=30)["token"])
+
+
+def collect_project_source_images(project_path: str | Path) -> list[tuple[str, Path]]:
+    """Return ``(server_relative_path, absolute_path)`` for every page scan used.
+
+    Only the images the project actually references are collected, so a book
+    folder full of unrelated scans is not uploaded wholesale.
+    """
+    project_path = Path(project_path).resolve()
+    project = annotation_data.load_project(project_path)
+    roots = [
+        str(project.get("image_root") or ""),
+        str(project.get("book_root") or ""),
+        str(project.get("answer_image_root") or ""),
+    ]
+    collected: dict[str, Path] = {}
+    for pages_key in ("pages", "answer_pages", "ignored_pages"):
+        for page in project.get(pages_key) or []:
+            if not isinstance(page, dict):
+                continue
+            image = str(page.get("image") or "").strip()
+            if not image:
+                continue
+            relative = image.replace("\\", "/").lstrip("/")
+            if not relative or relative in collected:
+                continue
+            for root in roots:
+                if not root:
+                    continue
+                candidate = Path(root) / image
+                if candidate.is_file():
+                    collected[relative] = candidate
+                    break
+    return sorted(collected.items())
+
+
+def _source_inventory(base_url: str, token: str, book_id: str) -> list[dict]:
+    document = _request_json(base_url + f"/api/projects/{book_id}/source-files", token=token, timeout=120)
+    files = (document.get("source") or {}).get("files") or []
+    return [item for item in files if isinstance(item, dict)]
+
+
+def upload_project_source_images(
+    server_url: str,
+    username: str,
+    password: str,
+    project_path: str | Path,
+    progress=None,
+    force: bool = False,
+) -> dict:
+    """Upload the page scans a reviewer needs in order to redraw frames locally.
+
+    Files already present on the server with a matching size are skipped, so a
+    resubmit after a few changed pages only transfers what is missing.
+    """
+    base_url = _base_url(server_url)
+    project_path = Path(project_path).resolve()
+    project = annotation_data.load_project(project_path)
+    book_id = str(project.get("delivery_book_id", "")).strip()
+    if not book_id:
+        raise ValueError("本地工程缺少公司教材编号，不能上传原书图片。")
+    pairs = collect_project_source_images(project_path)
+    if not pairs:
+        return {"book_id": book_id, "total": 0, "uploaded": 0, "skipped": 0, "bytes": 0}
+    token = _login(base_url, username, password)
+    existing = {} if force else {str(item.get("path", "")): int(item.get("bytes", 0) or 0)
+                                 for item in _source_inventory(base_url, token, book_id)}
+    uploaded = skipped = total_bytes = 0
+    for index, (relative, absolute) in enumerate(pairs, start=1):
+        if progress:
+            progress(index, len(pairs), relative)
+        size = absolute.stat().st_size
+        if size > SOURCE_IMAGE_MAX_BYTES:
+            raise ValueError(f"原书图片超过 {SOURCE_IMAGE_MAX_BYTES // (1024 * 1024)} MB，不能上传：{absolute.name}")
+        if existing.get(relative) == size:
+            skipped += 1
+            continue
+        content = absolute.read_bytes()
+        _request_json(
+            base_url + f"/api/projects/{book_id}/source-files",
+            "POST",
+            {
+                "relative_path": relative,
+                "content_base64": base64.b64encode(content).decode("ascii"),
+                "sha256": hashlib.sha256(content).hexdigest(),
+            },
+            token,
+            timeout=600,
+        )
+        uploaded += 1
+        total_bytes += size
+    return {"book_id": book_id, "total": len(pairs), "uploaded": uploaded, "skipped": skipped, "bytes": total_bytes}
+
+
+def fetch_project_source_images(
+    server_url: str,
+    username: str,
+    password: str,
+    book_id: str,
+    local_root: str | Path,
+    progress=None,
+) -> dict:
+    """Download the page scans of one textbook into a local folder."""
+    base_url = _base_url(server_url)
+    safe_book_id = str(book_id or "").strip()
+    if not safe_book_id or "/" in safe_book_id or "\\" in safe_book_id:
+        raise ValueError("教材编号无效。")
+    local_root = Path(local_root).expanduser().resolve()
+    local_root.mkdir(parents=True, exist_ok=True)
+    token = _login(base_url, username, password)
+    inventory = _source_inventory(base_url, token, safe_book_id)
+    downloaded = skipped = total_bytes = 0
+    for index, item in enumerate(inventory, start=1):
+        relative = str(item.get("path", "")).strip()
+        if not relative:
+            continue
+        if progress:
+            progress(index, len(inventory), relative)
+        target = local_root / relative
+        size = int(item.get("bytes", 0) or 0)
+        if target.is_file() and target.stat().st_size == size:
+            skipped += 1
+            continue
+        request = Request(
+            base_url + f"/api/projects/{safe_book_id}/source-file?path={quote(relative, safe='/')}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        try:
+            with urlopen(request, timeout=600) as response:
+                content = response.read()
+        except HTTPError as error:
+            raise RuntimeError(f"下载原书图片失败（{relative}）：{error.code}") from error
+        except URLError as error:
+            raise RuntimeError(f"无法连接审核中心：{error.reason}") from error
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(target.name + ".downloading")
+        temporary.write_bytes(content)
+        os.replace(temporary, target)
+        downloaded += 1
+        total_bytes += len(content)
+    return {"book_id": safe_book_id, "total": len(inventory), "downloaded": downloaded, "skipped": skipped, "bytes": total_bytes, "local_root": str(local_root)}

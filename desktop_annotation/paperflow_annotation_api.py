@@ -44,12 +44,14 @@ from review_tools.workspace_store import database_path, page_snapshot, sync_proj
 from review_tools.online_review_sync import (
     DECISIONS_FILENAME,
     ReviewConflictError,
+    fetch_project_source_images,
+    list_remote_projects,
     pull_project_snapshot,
     pull_review_decisions,
     push_project_snapshot,
-    list_remote_projects,
     submit_review_snapshot,
     upload_final_delivery,
+    upload_project_source_images,
 )
 from cut_questions_v4 import (
     BOOK_PROFILE_CHOICES,
@@ -72,7 +74,7 @@ PRELABEL_INFERENCE_LOCK = threading.Lock()
 PRELABEL_INFLIGHT_LOCK = threading.Lock()
 PRELABEL_INFLIGHT: dict[tuple, "_PrelabelFlight"] = {}
 ANSWER_PRELABEL_REVIEW_THRESHOLD = 120
-PAPERFLOW_BRIDGE_REVISION = "review-loop-import-push-20261021"
+PAPERFLOW_BRIDGE_REVISION = "review-loop-source-images-20261021"
 # 总开关：置 0/false/no/off 时 _save_page 不冻结不分级、三条 enrich 路由直接返回
 # {"ok": false, "disabled": true}，主流程行为与接入前完全一致。
 ENRICH_DISABLED_VALUES = {"0", "false", "no", "off"}
@@ -96,6 +98,7 @@ MUTATING_ROUTES = {
     "/api/review/pull-decisions",
     "/api/review/import-project",
     "/api/review/push-project",
+    "/api/review/upload-source-images",
 }
 
 
@@ -1831,7 +1834,12 @@ def _export_match_scope(payload: dict) -> dict:
 
 
 def _review_submit(payload: dict) -> dict:
-    """Submit a review-only snapshot; the delivery exporter is never invoked."""
+    """Submit a review-only snapshot; the delivery exporter is never invoked.
+
+    The page scans referenced by the project are uploaded alongside the snapshot
+    so a reviewer can import the book into their own workstation and redraw
+    frames without asking the annotator for a copy of the textbook folder.
+    """
     project_path, _project = _load_project(payload)
     result = submit_review_snapshot(
         str(payload.get("server_url", "")),
@@ -1840,10 +1848,39 @@ def _review_submit(payload: dict) -> dict:
         project_path,
         int(payload.get("max_preview_side", 1600)),
     )
+    source: dict = {"total": 0, "uploaded": 0, "skipped": 0, "bytes": 0}
+    notice = "已按审核中心账号同步个人工程并提交审核快照；最终裁图和最终 JSON 仍只会在本机由“生成裁切图片和JSON”生成。"
+    if payload.get("upload_source_images", True):
+        try:
+            source = upload_project_source_images(
+                str(payload.get("server_url", "")),
+                str(payload.get("username", "")),
+                str(payload.get("password", "")),
+                project_path,
+            )
+            if source.get("total"):
+                notice += f"原书图片已同步 {source['uploaded']} 张（{source['skipped']} 张此前已上传），审核员导入时不必再找你要教材目录。"
+        except Exception as error:  # a failed image sync must not hide a good submission
+            source = {"error": str(error)}
+            notice += f"注意：原书图片同步未完成（{error}）。审核员导入时需要你提供教材目录。"
+    return {"ok": True, **result, "source_images": source, "notice": notice}
+
+
+def _review_upload_source_images(payload: dict) -> dict:
+    """Upload only the page scans, e.g. after an earlier submit skipped them."""
+    project_path, _project = _load_project(payload)
+    result = upload_project_source_images(
+        str(payload.get("server_url", "")),
+        str(payload.get("username", "")),
+        str(payload.get("password", "")),
+        project_path,
+        force=bool(payload.get("force", False)),
+    )
     return {
         "ok": True,
         **result,
-        "notice": "已按审核中心账号同步个人工程并提交审核快照；最终裁图和最终 JSON 仍只会在本机由“生成裁切图片和JSON”生成。",
+        "notice": f"原书图片同步完成：共 {result['total']} 张，本次上传 {result['uploaded']} 张，"
+                  f"此前已存在 {result['skipped']} 张。",
     }
 
 
@@ -1890,12 +1927,25 @@ def _review_import_project(payload: dict) -> dict:
     annotator made, but no local paths.  We re-anchor book/image roots to the
     chosen local textbook directory so the exact same open-book flow works.
     """
-    book_root = Path(str(payload.get("book_root", ""))).expanduser().resolve()
-    if not book_root.is_dir():
-        raise ValueError("请先选择本地教材目录（存放扫描页图的文件夹）。")
+    raw_root = str(payload.get("book_root", "")).strip()
+    if not raw_root:
+        raise ValueError("请先选择本地教材目录（存放扫描页图的文件夹，可以选一个空文件夹）。")
+    book_root = Path(raw_root).expanduser().resolve()
+    if book_root.is_file():
+        raise ValueError("选择的路径是文件，请选择一个文件夹。")
+    book_root.mkdir(parents=True, exist_ok=True)
     book_id = str(payload.get("book_id", "")).strip()
     if not book_id or "/" in book_id or "\\" in book_id:
         raise ValueError("教材编号无效。")
+    # Pull the page scans first: the snapshot re-anchors image paths to this
+    # folder, so the files must exist before the project is written.
+    source = fetch_project_source_images(
+        str(payload.get("server_url", "")),
+        str(payload.get("username", "")),
+        str(payload.get("password", "")),
+        book_id,
+        book_root,
+    )
     snapshot = pull_project_snapshot(
         str(payload.get("server_url", "")),
         str(payload.get("username", "")),
@@ -1926,7 +1976,14 @@ def _review_import_project(payload: dict) -> dict:
         "project_revision": snapshot.get("project_revision", project.get("project_revision", 0)),
         "backup_path": str(backup_path) if backup_path else "",
         "book_name": snapshot.get("book_name", ""),
-        "notice": "服务器工程已导入本地；可以在工作台上直接查看和修改。",
+        "source_images": source,
+        "notice": (
+            f"服务器工程已导入本地；原书图片已就位 {source.get('downloaded', 0)} 张"
+            f"（{source.get('skipped', 0)} 张本机已有），可以在工作台上直接查看和修改。"
+            if source.get("total")
+            else "服务器工程已导入本地，但服务器上还没有这本教材的原书图片——"
+                 "请让标注员重新点一次“提交审核”（会自动上传原书图片），或手工把教材目录放进这个文件夹。"
+        ),
     }
 
 
@@ -2450,6 +2507,7 @@ ROUTES = {
     "/api/review/list-projects": _review_list_projects,
     "/api/review/import-project": _review_import_project,
     "/api/review/push-project": _review_push_project,
+    "/api/review/upload-source-images": _review_upload_source_images,
     "/api/project/enrich-prepare": _enrich_prepare,
     "/api/project/enrich-status": _enrich_status,
     "/api/project/book-meta-suggest": _book_meta_suggest,

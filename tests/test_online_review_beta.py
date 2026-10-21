@@ -270,6 +270,51 @@ class OnlineReviewBetaTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.store.sync_project_snapshot(self.reviewer, {**book, "project": {"delivery_book_id": "BNOREV", "project_revision": 1}})
 
+    def _seed_source_book(self, book_id: str = "BSRC") -> str:
+        self.store.staff_data_root = Path(self.temp.name) / "private" / "staff_projects"
+        self.store.projects_root = (Path(self.temp.name) / "Projects").resolve()
+        self.store.projects_root.mkdir(parents=True, exist_ok=True)
+        self.store.sync_project_snapshot(self.annotator, {
+            "book": {"id": book_id, "name": "原书图片教材"},
+            "project": {"delivery_book_id": book_id, "project_revision": 1},
+        })
+        return book_id
+
+    def test_source_images_travel_with_the_snapshot_for_reviewers(self):
+        book_id = self._seed_source_book()
+        content = b"\xff\xd8" + b"page-scan" * 40
+        uploaded = self.store.upload_source_file(self.annotator, book_id, {
+            "relative_path": "教材/1/题目/1.jpg",
+            "content_base64": base64.b64encode(content).decode("ascii"),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        })
+        self.assertEqual(uploaded["path"], "教材/1/题目/1.jpg")
+        self.assertEqual(uploaded["bytes"], len(content))
+        # 审核员能列出并逐张取回，导入本地工作台时才能画框。
+        listed = self.store.source_files(self.reviewer, book_id)
+        self.assertEqual(len(listed["files"]), 1)
+        stored = self.store.source_file_path(self.reviewer, book_id, "教材/1/题目/1.jpg")
+        self.assertEqual(stored.read_bytes(), content)
+
+    def test_source_image_upload_rejects_unsafe_paths_types_and_foreign_books(self):
+        book_id = self._seed_source_book("BSAFE")
+        content = b"\xff\xd8" + b"x" * 140
+        encoded = base64.b64encode(content).decode("ascii")
+        for bad_path in ("../outside.jpg", "/absolute.jpg", "notes.txt"):
+            with self.assertRaises(ValueError):
+                self.store.upload_source_file(self.annotator, book_id, {"relative_path": bad_path, "content_base64": encoded})
+        with self.assertRaises(ValueError):
+            self.store.upload_source_file(self.annotator, book_id, {
+                "relative_path": "1.jpg", "content_base64": encoded, "sha256": "0" * 64,
+            })
+        # 未分配的教材、以及别组标注员，都看不到也传不了。
+        with self.assertRaises(LookupError):
+            self.store.upload_source_file(self.annotator, "BOTHER", {"relative_path": "1.jpg", "content_base64": encoded})
+        other_admin = self.store.create_managed_user(self.super_admin, "other-admin", "very-secret-password", "admin")
+        other_annotator = self.store.create_managed_user(other_admin, "other-marker", "very-secret-password", "annotator")
+        with self.assertRaises(LookupError):
+            self.store.source_files(other_annotator, book_id)
+
     def test_account_hierarchy_keeps_super_admin_separate(self):
         created_admin = self.store.create_managed_user(self.super_admin, "owner2", "very-secret-password", "admin")
         self.assertEqual(created_admin["role"], "admin")

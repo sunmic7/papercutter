@@ -916,3 +916,28 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\ops\deploy-local-test.ps1
 - 标注进度仪表盘读取的是服务器本地 `F:\PaperFlowData\Projects` 下的 `PaperFlow标注项目.json`，因此只能看到已通过 SMB 写入的教材。标注员本机尚未保存到服务器的教材不可见。
 - 页面预览图暂不可用（源图片在标注电脑上，不在服务器端）。
 - 仪表盘仅展示只读进度，不能直接修改标注数据。最终裁图和 JSON 仍须由本地 PaperFlow 生成。
+
+---
+
+## 19. 审核闭环改造（2026-10-21 完成并验收）
+
+**流程变更**：标注员完成后只往服务器传审核用工程快照，甲方要求的最终 K12 数据在审核员逐页放行之后才生成并上传。老板（超级管理员）全局可见。
+
+**服务器环境变更**：数据机系统盘被重装过，数据盘盘符由 `F:` 变为 `G:`，本次统一迁到 **`J:/PaperFlowData`**（908GB，空间充足）。所有服务、计划任务、SMB 共享、ops 脚本均已指向 J 盘。SSH 通道改用便携版 OpenSSH（Windows 可选功能在离线环境装不上）。
+
+**本次改造**
+- `online_review_beta/server.py`：`GET /api/projects/<book_id>/snapshot` 完整快照下载；`POST /api/projects/sync` 放开审核员回传并加 `base_revision` 版本保护（不符返回 409）；`_ensure_book_review_approved` 服务端强制交付门禁
+- `review_tools/online_review_sync.py`：`list_remote_projects` / `pull_project_snapshot` / `push_project_snapshot`
+- `desktop_annotation/paperflow_annotation_api.py`：新增 `/api/review/list-projects`、`/api/review/import-project`、`/api/review/push-project`；`_sync_delivery` 补门禁
+- 桌面端：审核菜单新增「导入服务器工程」「回传修改到服务器」（前端不在 git 内，随更新包分发）
+- 客户端更新包：`\\192.168.1.204\PaperFlowTest\System\ClientTools\PaperFlowClientUpdates\20261021-review-loop`
+
+**验收**：单元测试 708 项全通过；真机闭环 11/11 通过（详见 `reports/审核闭环改造验收_20261021.md`）。
+
+**原书图片自动同步**（同日追加，解决上面待办①）：标注员提交审核时，把工程引用到的页面原图一并传到服务器 `Public\SourceImages\<教材编号>\`；审核员导入工程时按需自动下载到本地教材目录（目录可以是空的）。不再需要人工拷教材目录。新增 `/api/projects/<id>/source-files`（上传/列举）与 `/api/projects/<id>/source-file?path=`（下载），单张上限 48MB，按角色限定权限。
+
+**主站决策**：192.168.1.204 定为公司主站，ECS 云端站降为备份（代码同源，数据各自独立）。两个仓库已推送 GitHub。
+
+**提交**：`online_review_beta` a3730bd + 0ef7a35、主仓库 5b6aa81 + 原书图片提交。均已推送。
+
+**待办**：① `paperflow-deploy` 账号降权（目前仍在 Administrators 组）；② 真实标注电脑 SMB 写入验证；③ 数据机开关机自启验收；④ `J:\PaperFlowData` 定期备份任务尚未建立；⑤ `question_detector.onnx` 模型改动（11.5MB）暂未提交，等确认模型版本稳定。
