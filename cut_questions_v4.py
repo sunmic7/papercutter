@@ -1720,6 +1720,28 @@ def is_paper_start(page_info, profile='general'):
     return bool(paper_start_reason(page_info, profile))
 
 
+# D7-a：整条文本（去空白后）就是一道算式的字符集。只有"数字 / 小数点 / 括号 /
+# 运算符 / 等号"这几类，任何一个汉字或字母出现就立刻不匹配。
+_ARITHMETIC_ONLY_RE = re.compile(r'^[\d.()（）+\-*/×÷=＝<>≤≥−－]+$')
+# `−`(U+2212) 与 `－`(U+FF0D) 是排版里真正的减号，OCR 常输出它们而不是 ASCII '-'
+_ARITHMETIC_OPERATORS = '+-*/×÷=＝<>≤≥−－'
+
+
+def looks_like_arithmetic_expression(text):
+    """整段文字是否就是一道算式（`2.7+0.2=`、`10.67−4.07=`、`4.75×0.98`）。
+
+    D7-a 的**双条件**：①归一化全文匹配算式字符集 ②至少含一个运算符或等号。
+    两个条件缺一不可：只有数字和点的是小数（`2.7`），有运算符没数字的是噪声。
+
+    **含汉字或字母的一律不判为算式**——"2.0.42的计数单位是" 这种"真题号被 OCR
+    粘成小数"的形态必须继续走疑似题号救援，否则密排填空题会塌缩成一道题。
+    """
+    compact = re.sub(r'\s+', '', str(text or ''))
+    if not compact or not _ARITHMETIC_ONLY_RE.match(compact):
+        return False
+    return any(operator in compact for operator in _ARITHMETIC_OPERATORS)
+
+
 def find_minor_boundaries(ocr_items, crop_width, crop_height):
     """从 OCR 结果中找可信小题号。
 
@@ -1769,7 +1791,17 @@ def find_minor_boundaries(ocr_items, crop_width, crop_height):
             # 会被当成小数 2.0，题号整批丢失——密排填空题因此塌缩成一道题。
             # 这里只登记为疑似，因为正文里的“4.75×0.98”“10.01×0.11”形状相同。
             leading = re.match(r'^([0-9]{1,2})[\.．]\s*\S', text)
-            if leading and item.get('conf', 1.0) >= MIN_OCR_CONFIDENCE:
+            # D7-a：点后**紧邻**非空白、且整段就是一道算式时（`2.7+0.2=`），
+            # 这是正文里的算式碎片，不能登记成疑似题号。否则它会被下面"正好补上
+            # 已确认序列空缺"的通道救成编号，既把 `10.67−4.07=` 截断，又凭空多
+            # 切一道题（minor_extra）。`2. 计算`（点后有空格）与含汉字的粘连题号
+            # （`2.0.42的计数单位是`）都不满足这两个条件，救援通道照旧生效。
+            arithmetic_fragment = (
+                re.match(r'^[0-9]{1,2}[\.．][^\s]', text) is not None
+                and looks_like_arithmetic_expression(text)
+            )
+            if (leading and not arithmetic_fragment
+                    and item.get('conf', 1.0) >= MIN_OCR_CONFIDENCE):
                 suspect_num = int(leading.group(1))
                 if 1 <= suspect_num <= 150:
                     suspects.append({

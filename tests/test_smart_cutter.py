@@ -2420,5 +2420,51 @@ class MissedMinorRecoveryTests(unittest.TestCase):
         self.assertEqual(cuts[2]['num'], 3)
 
 
+class ArithmeticFragmentTests(unittest.TestCase):
+    """D7-a：正文里的算式碎片不能被"正好补缺"救成小题号。
+
+    真实病历（`reports/切分算法改造设计_20261020.md` F-1）：`1. 直接写得数` 的 8 个
+    口算排成两列，`2.7+0.2=` 被 suspects 通道当成第 2 题，边界插在算式中间，
+    既把 `10.67−4.07=` 截断，又让 `minor_extra` 凭空多一道。
+    """
+
+    def test_arithmetic_expression_is_not_rescued_as_minor_number(self):
+        items = [
+            item('1. 直接写得数', 20, 100),
+            item('2.7+0.2=', 20, 300),
+        ]
+        boundaries = cutter.find_minor_boundaries(items, 600, 700)
+        self.assertEqual([boundary['num'] for boundary in boundaries], [1],
+                         '算式碎片被救成了第 2 题，会切在算式中间')
+
+    def test_chinese_glued_number_still_rescued(self):
+        """含汉字的粘连题号必须继续走救援，否则密排填空题会塌缩成一道题。"""
+        items = [
+            item('1. 填空', 20, 100),
+            item('2.0.42的计数单位是', 20, 300, width=380),
+        ]
+        boundaries = cutter.find_minor_boundaries(items, 600, 700)
+        self.assertEqual([boundary['num'] for boundary in boundaries], [1, 2])
+
+    def test_spaced_number_followed_by_expression_is_kept(self):
+        """`2. 7+5=` 是"题号 + 空格 + 算式"，点后不是紧邻，不能被拦。"""
+        items = [
+            item('1. 直接写得数', 20, 100),
+            item('2. 7+5=', 20, 300),
+        ]
+        boundaries = cutter.find_minor_boundaries(items, 600, 700)
+        self.assertEqual([boundary['num'] for boundary in boundaries], [1, 2])
+
+    def test_expression_detector_requires_operator_and_pure_charset(self):
+        self.assertTrue(cutter.looks_like_arithmetic_expression('2.7+0.2='))
+        self.assertTrue(cutter.looks_like_arithmetic_expression('10.67−4.07='))
+        self.assertTrue(cutter.looks_like_arithmetic_expression('4.75×0.98'))
+        # 只有数字和点 = 小数，不是算式
+        self.assertFalse(cutter.looks_like_arithmetic_expression('2.7'))
+        # 含汉字/字母一律不判为算式（救援通道的护栏）
+        self.assertFalse(cutter.looks_like_arithmetic_expression('2.0.42的计数单位是'))
+        self.assertFalse(cutter.looks_like_arithmetic_expression('1.6路公共汽车'))
+
+
 if __name__ == '__main__':
     unittest.main()
