@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -9,7 +10,7 @@ from pathlib import Path
 from http.server import ThreadingHTTPServer
 from urllib.request import Request, urlopen
 
-from online_review_beta.server import ReviewHandler, ReviewStore
+from online_review_beta.server import ConflictError, ReviewHandler, ReviewStore
 
 
 def snapshot() -> dict:
@@ -174,6 +175,18 @@ class OnlineReviewBetaTests(unittest.TestCase):
             self.store.sync_project_snapshot(other, document)
 
     def test_annotator_can_upload_only_own_final_delivery_file(self):
+        # 该用例验证“归档隔离”本身，与审核放行门禁正交，因此临时关门禁。
+        previous = os.environ.get("PAPERFLOW_DELIVERY_REQUIRE_APPROVAL")
+        os.environ["PAPERFLOW_DELIVERY_REQUIRE_APPROVAL"] = "0"
+        try:
+            self._annotator_delivery_archive_checks()
+        finally:
+            if previous is None:
+                os.environ.pop("PAPERFLOW_DELIVERY_REQUIRE_APPROVAL", None)
+            else:
+                os.environ["PAPERFLOW_DELIVERY_REQUIRE_APPROVAL"] = previous
+
+    def _annotator_delivery_archive_checks(self):
         self.store.staff_data_root = Path(self.temp.name) / "private" / "staff_projects"
         self.store.sync_project_snapshot(self.annotator, {"book": {"id": "BFINAL", "name": "交付教材"}, "project": {"delivery_book_id": "BFINAL"}})
         content = b'{"ok":true}'
@@ -200,6 +213,62 @@ class OnlineReviewBetaTests(unittest.TestCase):
             "content_base64": base64.b64encode(b"{}").decode("ascii"),
         })
         self.assertEqual(manager_upload["sha256"], hashlib.sha256(b"{}").hexdigest())
+
+    def test_final_delivery_requires_full_review_approval(self):
+        self.store.staff_data_root = Path(self.temp.name) / "private" / "staff_projects"
+        self.store.sync_project_snapshot(self.annotator, {"book": {"id": "BGATE", "name": "门禁教材"}, "project": {"delivery_book_id": "BGATE"}})
+        content = b'{"k12":true}'
+        payload = {
+            "book": {"id": "BGATE"}, "relative_path": "k12_dataset/dataset.jsonl",
+            "content_base64": base64.b64encode(content).decode("ascii"), "sha256": hashlib.sha256(content).hexdigest(),
+        }
+        # 1) 从未提交审核：拒绝。
+        with self.assertRaises(PermissionError):
+            self.store.upload_delivery_file(self.annotator, payload)
+        # 2) 已提交但审核未放行：拒绝。
+        document = snapshot()
+        document["book"] = {"id": "BGATE", "name": "门禁教材"}
+        created = self.store.create_submission(self.annotator, document)
+        with self.assertRaises(PermissionError):
+            self.store.upload_delivery_file(self.annotator, payload)
+        # 3) 审核员逐页放行后：允许。
+        self.store.decide_page(self.reviewer, created["id"], "question-0", "approved", "")
+        uploaded = self.store.upload_delivery_file(self.annotator, payload)
+        self.assertEqual(uploaded["bytes"], len(content))
+        # 4) 退回新页面后再次上传：重新被拒（最新提交必须全放行）。
+        second = self.store.create_submission(self.annotator, document)
+        with self.assertRaises(PermissionError):
+            self.store.upload_delivery_file(self.annotator, payload)
+        self.store.decide_page(self.reviewer, second["id"], "question-0", "approved", "")
+        self.store.upload_delivery_file(self.annotator, payload)
+
+    def test_reviewer_can_pull_snapshot_and_push_back_with_conflict_guard(self):
+        self.store.staff_data_root = Path(self.temp.name) / "private" / "staff_projects"
+        book = {"book": {"id": "BLOOP", "name": "循环教材"}}
+        self.store.sync_project_snapshot(self.annotator, {**book, "project": {"delivery_book_id": "BLOOP", "project_revision": 5}})
+        # 审核员可以完整下载员工的工程快照。
+        snapshot_downloaded = self.store.project_snapshot(self.reviewer, "BLOOP")
+        self.assertEqual(snapshot_downloaded["project_revision"], 5)
+        self.assertEqual(snapshot_downloaded["assigned_annotator_id"], self.annotator["id"])
+        # 基于旧版本的回传必须被 409 拒绝。
+        with self.assertRaises(ConflictError):
+            self.store.sync_project_snapshot(self.reviewer, {**book, "project": {"delivery_book_id": "BLOOP", "project_revision": 5}, "base_revision": 4})
+        # 基于正确版本的回传成为下一版。
+        pushed = self.store.sync_project_snapshot(self.reviewer, {**book, "project": {"delivery_book_id": "BLOOP", "project_revision": 5}, "base_revision": 5})
+        self.assertEqual(pushed["project_revision"], 6)
+        # 标注员拿旧版本覆盖会被拒；导入新版（revision 6）后可以继续同步。
+        with self.assertRaises(ConflictError):
+            self.store.sync_project_snapshot(self.annotator, {**book, "project": {"delivery_book_id": "BLOOP", "project_revision": 5}})
+        merged = self.store.sync_project_snapshot(self.annotator, {**book, "project": {"delivery_book_id": "BLOOP", "project_revision": 6}})
+        self.assertEqual(merged["project_revision"], 6)
+
+    def test_annotator_cannot_push_without_base_revision_for_reviewer_role(self):
+        # 审核员必须带 base_revision；缺失时按参数错误拒绝而不是覆盖。
+        self.store.staff_data_root = Path(self.temp.name) / "private" / "staff_projects"
+        book = {"book": {"id": "BNOREV", "name": "无版本教材"}}
+        self.store.sync_project_snapshot(self.annotator, {**book, "project": {"delivery_book_id": "BNOREV", "project_revision": 1}})
+        with self.assertRaises(ValueError):
+            self.store.sync_project_snapshot(self.reviewer, {**book, "project": {"delivery_book_id": "BNOREV", "project_revision": 1}})
 
     def test_account_hierarchy_keeps_super_admin_separate(self):
         created_admin = self.store.create_managed_user(self.super_admin, "owner2", "very-secret-password", "admin")

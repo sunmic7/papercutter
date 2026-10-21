@@ -41,7 +41,16 @@ from review_tools.export_manual_annotations import export_project
 from review_tools.delivery_workspace import delivery_root, sync_delivery_workspace
 from review_tools.group_delivery import export_scope, preflight_scope
 from review_tools.workspace_store import database_path, page_snapshot, sync_project
-from review_tools.online_review_sync import DECISIONS_FILENAME, pull_review_decisions, submit_review_snapshot, upload_final_delivery
+from review_tools.online_review_sync import (
+    DECISIONS_FILENAME,
+    ReviewConflictError,
+    pull_project_snapshot,
+    pull_review_decisions,
+    push_project_snapshot,
+    list_remote_projects,
+    submit_review_snapshot,
+    upload_final_delivery,
+)
 from cut_questions_v4 import (
     BOOK_PROFILE_CHOICES,
     BOOK_PROFILE_LABELS,
@@ -63,7 +72,7 @@ PRELABEL_INFERENCE_LOCK = threading.Lock()
 PRELABEL_INFLIGHT_LOCK = threading.Lock()
 PRELABEL_INFLIGHT: dict[tuple, "_PrelabelFlight"] = {}
 ANSWER_PRELABEL_REVIEW_THRESHOLD = 120
-PAPERFLOW_BRIDGE_REVISION = "confident-auto-match-20261020"
+PAPERFLOW_BRIDGE_REVISION = "review-loop-import-push-20261021"
 # 总开关：置 0/false/no/off 时 _save_page 不冻结不分级、三条 enrich 路由直接返回
 # {"ok": false, "disabled": true}，主流程行为与接入前完全一致。
 ENRICH_DISABLED_VALUES = {"0", "false", "no", "off"}
@@ -85,6 +94,8 @@ MUTATING_ROUTES = {
     "/api/project/export-match-scope",
     "/api/project/enrich-prepare",
     "/api/review/pull-decisions",
+    "/api/review/import-project",
+    "/api/review/push-project",
 }
 
 
@@ -1787,6 +1798,8 @@ def _export_project(payload: dict) -> dict:
 
 def _sync_delivery(payload: dict) -> dict:
     project_path, project = _load_project(payload)
+    # 与 export 路径同一道闸：审核未全放行的教材不允许把最终裁图/JSON 落到交付工作区。
+    _ensure_review_delivery_clear(project_path)
     result = sync_delivery_workspace(project_path, ROOT / "runtime", materialize_all=True)
     return {"ok": True, "project_revision": project.get("project_revision", 0), **result}
 
@@ -1858,6 +1871,86 @@ def _review_upload_delivery(payload: dict) -> dict:
     project_path, _project = _load_project(payload)
     result = upload_final_delivery(str(payload.get("server_url", "")), str(payload.get("username", "")), str(payload.get("password", "")), project_path, str(payload.get("delivery_path", "")))
     return {"ok": True, **result, "notice": "最终交付已按账号上传到服务器私有目录。"}
+
+
+def _review_list_projects(payload: dict) -> dict:
+    """List textbooks visible to this review-center account (import dialog)."""
+    projects = list_remote_projects(
+        str(payload.get("server_url", "")),
+        str(payload.get("username", "")),
+        str(payload.get("password", "")),
+    )
+    return {"ok": True, "projects": projects}
+
+
+def _review_import_project(payload: dict) -> dict:
+    """Download a server snapshot into a local textbook dir and open it.
+
+    Reviewer-side counterpart of submit: the snapshot carries every frame the
+    annotator made, but no local paths.  We re-anchor book/image roots to the
+    chosen local textbook directory so the exact same open-book flow works.
+    """
+    book_root = Path(str(payload.get("book_root", ""))).expanduser().resolve()
+    if not book_root.is_dir():
+        raise ValueError("请先选择本地教材目录（存放扫描页图的文件夹）。")
+    book_id = str(payload.get("book_id", "")).strip()
+    if not book_id or "/" in book_id or "\\" in book_id:
+        raise ValueError("教材编号无效。")
+    snapshot = pull_project_snapshot(
+        str(payload.get("server_url", "")),
+        str(payload.get("username", "")),
+        str(payload.get("password", "")),
+        book_id,
+    )
+    project = snapshot["project"]
+    for root_key in ("book_root", "image_root", "answer_image_root"):
+        project[root_key] = str(book_root)
+    for pages_key in ("pages", "answer_pages", "ignored_pages"):
+        for page in project.get(pages_key) or []:
+            if isinstance(page, dict):
+                page.pop("source_path", None)
+    project["delivery_book_id"] = book_id
+    project_path = annotation_data.default_book_project_path(str(book_root), ROOT / "runtime")
+    backup_path = None
+    if project_path.is_file():
+        backup_path = project_path.with_name(project_path.stem + ".导入前备份.json")
+        shutil.copy2(project_path, backup_path)
+    temporary = project_path.with_name(project_path.name + ".importing.tmp")
+    temporary.write_text(json.dumps(project, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary, project_path)
+    return {
+        "ok": True,
+        "book_id": book_id,
+        "book_root": str(book_root),
+        "project_path": str(project_path),
+        "project_revision": snapshot.get("project_revision", project.get("project_revision", 0)),
+        "backup_path": str(backup_path) if backup_path else "",
+        "book_name": snapshot.get("book_name", ""),
+        "notice": "服务器工程已导入本地；可以在工作台上直接查看和修改。",
+    }
+
+
+def _review_push_project(payload: dict) -> dict:
+    """Push the locally edited project back as the next server revision."""
+    project_path, project = _load_project(payload)
+    try:
+        result = push_project_snapshot(
+            str(payload.get("server_url", "")),
+            str(payload.get("username", "")),
+            str(payload.get("password", "")),
+            project_path,
+        )
+    except ReviewConflictError as error:
+        raise ValueError(f"版本冲突，未回传：{error}") from error
+    # Reconcile the local revision with the server's stored revision so the
+    # next push compares against the revision this push created, not a stale one.
+    project["project_revision"] = int(result.get("project_revision", project.get("project_revision", 0)) or 0)
+    annotation_data.save_project(project, project_path)
+    return {
+        "ok": True,
+        **result,
+        "notice": f"修改已回传服务器（第 {result.get('project_revision', '?')} 版）。",
+    }
 
 
 def _normalize_ocr_text(text: str) -> str:
@@ -2354,6 +2447,9 @@ ROUTES = {
     "/api/review/submit": _review_submit,
     "/api/review/pull-decisions": _review_pull_decisions,
     "/api/review/upload-delivery": _review_upload_delivery,
+    "/api/review/list-projects": _review_list_projects,
+    "/api/review/import-project": _review_import_project,
+    "/api/review/push-project": _review_push_project,
     "/api/project/enrich-prepare": _enrich_prepare,
     "/api/project/enrich-status": _enrich_status,
     "/api/project/book-meta-suggest": _book_meta_suggest,

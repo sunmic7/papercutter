@@ -24,6 +24,10 @@ DEFAULT_MAX_PREVIEW_SIDE = 1600
 DECISIONS_FILENAME = "PaperFlow在线审核决定.json"
 
 
+class ReviewConflictError(RuntimeError):
+    """The server rejected an upload because a newer snapshot revision exists."""
+
+
 def _canonical_json(value: object) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
@@ -131,6 +135,8 @@ def _request_json(url: str, method: str = "GET", payload: dict | None = None, to
             detail = json.loads(detail).get("error", detail)
         except json.JSONDecodeError:
             pass
+        if error.code == 409:
+            raise ReviewConflictError(detail) from error
         raise RuntimeError(f"审核中心拒绝请求：{detail}") from error
     except URLError as error:
         raise RuntimeError(f"无法连接审核中心：{error.reason}") from error
@@ -224,3 +230,47 @@ def pull_review_decisions(server_url: str, username: str, password: str, submiss
     temporary.write_text(json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(temporary, target)
     return {"decision_path": str(target), "decision_count": len(document.get("decisions", [])), "submission_id": submission_id}
+
+
+def list_remote_projects(server_url: str, username: str, password: str) -> list[dict]:
+    """List textbooks visible to this review-center account (for the import dialog)."""
+    base_url = _base_url(server_url)
+    token = _request_json(base_url + "/api/login", "POST", {"username": username, "password": password}, timeout=30)["token"]
+    document = _request_json(base_url + "/api/projects", token=token, timeout=60)
+    projects = document.get("projects") or []
+    return [item for item in projects if isinstance(item, dict)]
+
+
+def pull_project_snapshot(server_url: str, username: str, password: str, book_id: str) -> dict:
+    """Download one full annotation snapshot for local import/edit."""
+    base_url = _base_url(server_url)
+    token = _request_json(base_url + "/api/login", "POST", {"username": username, "password": password}, timeout=30)["token"]
+    safe_book_id = str(book_id or "").strip()
+    if not safe_book_id or "/" in safe_book_id or "\\" in safe_book_id:
+        raise ValueError("教材编号无效。")
+    document = _request_json(base_url + f"/api/projects/{safe_book_id}/snapshot", token=token, timeout=300)
+    snapshot = document.get("snapshot") or {}
+    if not isinstance(snapshot.get("project"), dict):
+        raise RuntimeError("审核中心返回的工程快照无效。")
+    return snapshot
+
+
+def push_project_snapshot(server_url: str, username: str, password: str, project_path: str | Path) -> dict:
+    """Push the locally edited project back as the next server revision.
+
+    The local ``project_revision`` is the base the edits were made on; the
+    server stores ``stored + 1`` and returns it so the caller can reconcile.
+    """
+    project_path = Path(project_path).resolve()
+    base_revision = int(annotation_data.load_project(project_path).get("project_revision", 0) or 0)
+    document = build_project_sync_snapshot(project_path)
+    document["base_revision"] = base_revision
+    base_url = _base_url(server_url)
+    token = _request_json(base_url + "/api/login", "POST", {"username": username, "password": password}, timeout=30)["token"]
+    result = _request_json(base_url + "/api/projects/sync", "POST", document, token, timeout=300)
+    return {
+        "book_id": result["project"].get("book_id", document["book"]["id"]),
+        "base_revision": base_revision,
+        "project_revision": int(result["project"].get("project_revision", 0) or 0),
+        "server_relative_path": result["project"].get("server_relative_path", ""),
+    }
