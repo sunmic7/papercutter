@@ -222,3 +222,32 @@ class ReviewConcurrencyTests(unittest.TestCase):
         self.assertEqual(set(ACTIVE_SUBMISSION_STATUSES),
                          {"pending", "assigned", "in_review", "reviewed",
                           "returned", "needs_fix"})
+
+    def test_reviewer_delivery_workspace_matches_json_menu_scope(self):
+        """A book listed by ``scope=all`` must also open its delivery detail.
+
+        The reviewer is not accountable for ``marker2``; previously the row was
+        visible in the JSON menu but the artifact/batch endpoints returned 404.
+        """
+        outsider = self.store.create_managed_user(
+            self.admin, "marker2", "very-secret-password", "annotator")
+        self.store.sync_project_snapshot(outsider, {
+            "book": {"id": "BOOK-B", "name": "教材 BOOK-B"},
+            "project": {"delivery_book_id": "BOOK-B", "project_revision": 1},
+        })
+        listing = self.store.delivery_files(self.reviewer, "BOOK-B")
+        self.assertEqual(listing["book_id"], "BOOK-B")
+        self.assertEqual(listing["files"], [])
+        # Annotators still cannot inspect somebody else's private delivery.
+        with self.assertRaises((PermissionError, LookupError)):
+            self.store.delivery_files(self.annotator, "BOOK-B")
+        # The reviewer passes the role check and is stopped only by the review
+        # approval gate, which must stay intact for every delivery write.
+        with self.assertRaises(PermissionError) as caught:
+            self.store.begin_delivery_batch(self.reviewer, {
+                "book": {"id": "BOOK-B"},
+                "files": [{"relative_path": "images/a.json", "bytes": 2,
+                           "sha256": hashlib.sha256(b"{}").hexdigest()}],
+            })
+        self.assertIn("审核", str(caught.exception))
+        self.assertNotIn("无权上传最终交付", str(caught.exception))
