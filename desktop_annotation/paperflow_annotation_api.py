@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -23,23 +24,53 @@ from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs, urlencode
+from urllib.request import Request, urlopen
 
-import numpy as np
+class _LazyModule:
+    """Keep native libraries off the authentication server's cold-start path."""
+    def __init__(self, name):
+        self._name = name
+
+    def __getattr__(self, attribute):
+        return getattr(importlib.import_module(self._name), attribute)
+
+
+def _lazy_function(module, name):
+    def call(*args, **kwargs):
+        return getattr(importlib.import_module(module), name)(*args, **kwargs)
+    call.__name__ = name
+    return call
+
+
+np = _LazyModule('numpy')
+_core = _LazyModule('cut_questions_v4')
+
+
+def __getattr__(name):
+    # Preserve callers that import these public constants from the bridge.
+    if name in {'BOOK_PROFILE_CHOICES', 'BOOK_PROFILE_LABELS'}:
+        return getattr(_core, name)
+    raise AttributeError(name)
 
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from review_tools.manual_annotation_workspace import _answer_suggestions, _question_suggestions
+_answer_suggestions = _lazy_function('review_tools.manual_annotation_workspace', '_answer_suggestions')
+_question_suggestions = _lazy_function('review_tools.manual_annotation_workspace', '_question_suggestions')
 from review_tools import book_meta
 from review_tools import enrich_snapshot
 from review_tools import manual_annotation_data as annotation_data
 from review_tools import review_levels
-from review_tools.export_manual_annotations import export_project
-from review_tools.delivery_workspace import delivery_root, sync_delivery_workspace
-from review_tools.group_delivery import export_scope, preflight_scope
+from review_tools.review_session import ReviewSession, REVIEWERS
+from review_tools import online_review_sync as review_sync
+export_project = _lazy_function('review_tools.export_manual_annotations', 'export_project')
+delivery_root = _lazy_function('review_tools.delivery_workspace', 'delivery_root')
+sync_delivery_workspace = _lazy_function('review_tools.delivery_workspace', 'sync_delivery_workspace')
+export_scope = _lazy_function('review_tools.group_delivery', 'export_scope')
+preflight_scope = _lazy_function('review_tools.group_delivery', 'preflight_scope')
 from review_tools.workspace_store import database_path, page_snapshot, sync_project
 from review_tools.online_review_sync import (
     DECISIONS_FILENAME,
@@ -53,15 +84,11 @@ from review_tools.online_review_sync import (
     upload_final_delivery,
     upload_project_source_images,
 )
-from cut_questions_v4 import (
-    BOOK_PROFILE_CHOICES,
-    BOOK_PROFILE_LABELS,
-    auto_book_profile,
-    detect_book_profile,
-    infer_book_profile,
-    ocr_image,
-    read_book_profile_cache,
-)
+auto_book_profile = _lazy_function('cut_questions_v4', 'auto_book_profile')
+detect_book_profile = _lazy_function('cut_questions_v4', 'detect_book_profile')
+infer_book_profile = _lazy_function('cut_questions_v4', 'infer_book_profile')
+ocr_image = _lazy_function('cut_questions_v4', 'ocr_image')
+read_book_profile_cache = _lazy_function('cut_questions_v4', 'read_book_profile_cache')
 from layout_strategy import describe_profile
 
 
@@ -74,7 +101,78 @@ PRELABEL_INFERENCE_LOCK = threading.Lock()
 PRELABEL_INFLIGHT_LOCK = threading.Lock()
 PRELABEL_INFLIGHT: dict[tuple, "_PrelabelFlight"] = {}
 ANSWER_PRELABEL_REVIEW_THRESHOLD = 120
-PAPERFLOW_BRIDGE_REVISION = "review-loop-source-images-20261021"
+PAPERFLOW_BRIDGE_REVISION = "column-prefix-20261029"
+REVIEW_SESSION = ReviewSession()
+_configured_client_id = os.environ.get('PAPERFLOW_CLIENT_ID', '')
+LIBRARY_CLIENT_ID = _configured_client_id if re.fullmatch(r'[a-f0-9]{32}', _configured_client_id) else uuid.uuid4().hex
+MODEL_WARMUP_READY = threading.Event()
+
+
+def _review_login(payload):
+    result = REVIEW_SESSION.login(payload)
+    MODEL_WARMUP_READY.set()
+    return result
+
+
+def _library_request(payload: dict) -> dict:
+    recovery_target = None
+    if payload.get("operation") == "/api/project/save-cache":
+        status = REVIEW_SESSION.status()
+        username = str(status.get("user", {}).get("username", "unknown"))
+        recovery = ROOT / "runtime" / "server_recovery_drafts" / hashlib.sha256(username.encode()).hexdigest()[:16]
+        recovery.mkdir(parents=True, exist_ok=True)
+        book_id = str(payload.get("book_id") or "")
+        if re.fullmatch(r"B[A-F0-9]{32}", book_id):
+            target = recovery / (book_id + ".json")
+            recovery_target = target
+            temporary = target.with_suffix(".tmp")
+            # No credentials or full textbook images are stored in recovery drafts.
+            temporary.write_text(json.dumps({"book_id": book_id, "base_revision": payload.get("base_revision"),
+                "project": (payload.get("payload") or {}).get("project")}, ensure_ascii=False), encoding="utf-8")
+            os.replace(temporary, target)
+    credentials = REVIEW_SESSION.credentials()
+    base, token = credentials["server_url"], credentials["_review_token"]
+    action = payload.get("action", "list")
+    if action == "list":
+        suffix = '?view=catalog' if payload.get('view') == 'catalog' else ''
+        return review_sync._request_json(base + "/api/library" + suffix, token=token)
+    if action == "assign":
+        return review_sync._request_json(base + "/api/library/assign", "POST", {
+            'book_ids': payload.get('book_ids') or [payload.get('book_id')],
+            'annotator_id': payload.get('annotator_id'),
+        }, token)
+    if action == "scan":
+        return review_sync._request_json(base + "/api/library/scan", "POST", {}, token)
+    if action == "annotators":
+        return review_sync._request_json(base + "/api/library/annotators", token=token)
+    if action == "open":
+        result = review_sync._request_json(base + "/api/library/open", "POST", {
+            "book_id": payload["book_id"], "annotator_id": payload.get("annotator_id"),
+            "client_id": LIBRARY_CLIENT_ID,
+        }, token, timeout=300)
+        username = credentials["username"]
+        recovery = ROOT / "runtime" / "server_recovery_drafts" / hashlib.sha256(username.encode()).hexdigest()[:16]
+        target = recovery / (str(payload["book_id"]) + ".json")
+        if target.is_file():
+            draft = json.loads(target.read_text(encoding="utf-8"))
+            if not draft.get("synced"):
+                if int(draft.get("base_revision", -1)) == int(result["project"].get("project_revision", 0)):
+                    result["recovery_project"] = draft.get("project")
+                else:
+                    result["recovery_conflict"] = True
+        return result
+    result = review_sync._request_json(base + "/api/library/operate", "POST", {
+        "book_id": payload["book_id"], "operation": payload["operation"],
+        "payload": payload.get("payload") or {}, "client_id": LIBRARY_CLIENT_ID,
+        "base_revision": payload.get("base_revision", -1),
+    }, token, timeout=1800)
+    if recovery_target and recovery_target.is_file():
+        draft = json.loads(recovery_target.read_text(encoding="utf-8"))
+        draft["synced"] = True
+        temporary = recovery_target.with_suffix(".tmp")
+        temporary.write_text(json.dumps(draft, ensure_ascii=False), encoding="utf-8")
+        os.replace(temporary, recovery_target)
+    return result
 # 总开关：置 0/false/no/off 时 _save_page 不冻结不分级、三条 enrich 路由直接返回
 # {"ok": false, "disabled": true}，主流程行为与接入前完全一致。
 ENRICH_DISABLED_VALUES = {"0", "false", "no", "off"}
@@ -223,6 +321,7 @@ def _sync_page_profiles(project: dict, profile: str, previous: str = "") -> bool
 def _store_book_profile(project: dict, profile: str, source: str, reason: str,
                         locked: bool | None = None) -> bool:
     previous = str(project.get("profile", "") or "").strip()
+    previous_metadata = (project.get('profile_source'),project.get('profile_reason'))
     project["profile"] = profile
     project["profile_source"] = source
     project["profile_reason"] = reason
@@ -230,7 +329,7 @@ def _store_book_profile(project: dict, profile: str, source: str, reason: str,
         project["profile_locked"] = True
     elif locked is False:
         project.pop("profile_locked", None)
-    changed = profile != previous
+    changed = profile != previous or previous_metadata != (source,reason)
     return _sync_page_profiles(project, profile, previous) or changed
 
 
@@ -250,12 +349,12 @@ def _apply_book_profile(project: dict, requested: str, book_root: Path,
     if requested == "auto":
         if (
             respect_lock and project.get("profile_locked")
-            and str(project.get("profile") or "") in BOOK_PROFILE_CHOICES
+            and str(project.get("profile") or "") in _core.BOOK_PROFILE_CHOICES
         ):
             return False
         profile, source, reason = _auto_book_profile(book_root)
         return _store_book_profile(project, profile, source, reason, locked=False)
-    if requested not in BOOK_PROFILE_CHOICES:
+    if requested not in _core.BOOK_PROFILE_CHOICES:
         raise ValueError("教材版式填写无效。")
     return _store_book_profile(project, requested, "manual", "人工指定", locked=True)
 
@@ -263,15 +362,15 @@ def _apply_book_profile(project: dict, requested: str, book_root: Path,
 def _resolve_book_profile(project: dict, image_path: Path) -> str:
     """预标注实际使用的版式：项目落盘值优先，其次磁盘缓存，最后按书名兜底。"""
     stored = str(project.get("profile", "") or "").strip()
-    if project.get("profile_locked") and stored in BOOK_PROFILE_CHOICES:
+    if project.get("profile_locked") and stored in _core.BOOK_PROFILE_CHOICES:
         return stored
-    if stored in BOOK_PROFILE_CHOICES and stored != "general":
+    if stored in _core.BOOK_PROFILE_CHOICES and stored != "general":
         return stored
     book_root = Path(str(project.get("book_root") or project.get("image_root") or image_path.parent))
     cached = read_book_profile_cache(str(book_root), str(ROOT / "runtime"))
-    if cached and cached.get("profile") in BOOK_PROFILE_CHOICES and cached["profile"] != "general":
+    if cached and cached.get("profile") in _core.BOOK_PROFILE_CHOICES and cached["profile"] != "general":
         return cached["profile"]
-    if stored in BOOK_PROFILE_CHOICES:
+    if stored in _core.BOOK_PROFILE_CHOICES:
         return stored
     return infer_book_profile(str(book_root))
 
@@ -304,15 +403,18 @@ def _profile_detect_job(book_root: Path) -> None:
     if not project_path.is_file():
         return
     try:
-        project = annotation_data.load_project(project_path)
-        if project.get("profile_locked"):
-            return
-        if str(project.get("profile") or "") != "general":
-            return
-        _store_book_profile(
-            project, result["profile"], "auto_text", str(result.get("reason", "") or ""), locked=None,
-        )
-        annotation_data.save_project(project, project_path, increment_revision=False)
+        with PROJECT_WRITE_LOCK:
+            project = annotation_data.load_project(project_path)
+            if project.get("profile_locked"):
+                return
+            if (str(project.get("profile") or "") != "general"
+                    and not (project.get('profile_source') in {'auto_name','default'}
+                             and _core.book_profile_needs_confirmation(str(book_root)))):
+                return
+            _store_book_profile(
+                project, result["profile"], "auto_text", str(result.get("reason", "") or ""), locked=None,
+            )
+            annotation_data.save_project(project, project_path, increment_revision=False)
         print(f"[版式] 抽样正文判定为 {result['profile']}：{result.get('reason', '')}", flush=True)
     except Exception as error:  # noqa: BLE001 - 结果落盘失败不影响预标注
         print(f"[版式] 判定结果落盘失败（不影响切题）：{error}", flush=True)
@@ -436,10 +538,12 @@ def _prelabel(payload: dict) -> dict:
 
 def _project_response(project_path: Path, project: dict) -> dict:
     snapshot = json.loads(json.dumps(project, ensure_ascii=False))
-    for page in snapshot.get("pages", []):
-        page["source_path"] = annotation_data.source_path(project, page)
-    for page in snapshot.get("answer_pages", []):
-        page["source_path"] = annotation_data.source_path(project, page, True)
+    for pages_key, root_key in (("pages", "image_root"), ("answer_pages", "answer_image_root")):
+        pages = snapshot.get(pages_key, [])
+        if pages:
+            resolved_root = Path(str(project.get(root_key, ""))).resolve()
+            for page in pages:
+                page["source_path"] = annotation_data._source_path_in_root(resolved_root, page)
     for page in snapshot.get("ignored_pages", []):
         page["source_path"] = str(Path(str(project.get("book_root") or project.get("image_root", ""))) / page.get("image", ""))
     return {
@@ -448,12 +552,12 @@ def _project_response(project_path: Path, project: dict) -> dict:
         "project": snapshot,
         # 版式中文名只在这里维护一份，界面按它渲染下拉框，避免前端另抄一套。
         "book_profiles": [
-            {"value": value, "label": label} for value, label in BOOK_PROFILE_LABELS.items()
+            {"value": value, "label": label} for value, label in _core.BOOK_PROFILE_LABELS.items()
         ],
         # 每个版式实际启用了哪些特殊处理，界面在选版式时直接显示，
         # 让人知道“改成试卷”到底会改变什么。
         "book_profile_notes": {
-            value: describe_profile(value)["notes"] for value in BOOK_PROFILE_LABELS
+            value: describe_profile(value)["notes"] for value in _core.BOOK_PROFILE_LABELS
         },
     }
 
@@ -538,9 +642,12 @@ def _open_book(payload: dict) -> dict:
         changed = bool(project.pop("_paperflow_scope_migration_pending", False))
         ocr_settings = project.get("ocr_settings")
         if not isinstance(ocr_settings, dict):
+            # 确认页面只处理尚未识别或已改框的区域，未改过的已有文字不会
+            # 再调用云端模型，因此可以安全地作为标注流程的一步。
             project["ocr_settings"] = {"auto_page_ocr_on_confirm": True}
             changed = True
-        elif "auto_page_ocr_on_confirm" not in ocr_settings:
+        elif ocr_settings.get("auto_page_ocr_on_confirm") is not True:
+            # 迁移旧工程：确认页面现在只识别待处理框。
             ocr_settings["auto_page_ocr_on_confirm"] = True
             changed = True
         # Old clients stored the company SMB share as a delivery root.  It is
@@ -571,7 +678,8 @@ def _open_book(payload: dict) -> dict:
         _apply_book_profile(project, "auto", book_root)
         annotation_data.save_project(project, project_path)
     if (
-        str(project.get("profile") or "general") == "general"
+        (str(project.get("profile") or "general") == "general"
+         or _core.book_profile_needs_confirmation(str(book_root)))
         and not project.get("profile_locked")
     ):
         # 书名判不出具体版式时后台抽样正文补判；判出结果只落缓存与版式字段。
@@ -591,7 +699,9 @@ def _load_project(payload: dict) -> tuple[Path, dict]:
     central_root = (ROOT / "runtime" / "manual_annotation_projects").resolve()
     is_central = project_path.parent == central_root
     is_beside_book = project_path.name == "PaperFlow标注项目.json" and project_path.parent == book_root
-    if not is_central and not is_beside_book:
+    server_root = os.environ.get("PAPERFLOW_CENTRAL_PROJECT_ROOT", "")
+    is_server = bool(server_root and Path(server_root).resolve() in project_path.parents)
+    if not is_central and not is_beside_book and not is_server:
         raise ValueError("标注项目路径与教材目录不匹配。")
     return project_path, project
 
@@ -1604,6 +1714,8 @@ def _set_delivery_output(payload: dict) -> dict:
     selected_root = Path(str(payload.get("output_root", ""))).expanduser()
     if not selected_root.is_absolute():
         raise ValueError("交付输出位置必须是本机文件夹。")
+    if annotation_data.is_company_public_delivery_root(selected_root):
+        raise ValueError("公司公共共享盘不再用于最终交付。请选本机文件夹，生成后使用“上传最终交付”。")
     selected_root = selected_root.resolve()
     if annotation_data.is_company_public_delivery_root(selected_root):
         raise ValueError("公司公共共享盘不再用于最终交付。请选本机文件夹，生成后使用“上传最终交付”。")
@@ -1833,6 +1945,74 @@ def _export_match_scope(payload: dict) -> dict:
     return {"ok": True, **result}
 
 
+def _review_token_kwargs(payload: dict) -> dict:
+    return {"token": payload["_review_token"]} if payload.get("_review_token") else {}
+
+
+def _review_status(payload: dict) -> dict:
+    project_path, project = _load_project(payload)
+    base = str(payload["server_url"])
+    token = payload["_review_token"]
+    rows = review_sync._request_json(base + "/api/submissions", token=token, timeout=30)["submissions"]
+    latest = next((row for row in rows if row["book_id"] == project.get("delivery_book_id")), None)
+    if not latest:
+        return {"ok": True, "status": "not_submitted", "can_deliver": False, "decisions": []}
+    document = review_sync._request_json(base + f"/api/submissions/{latest['id']}/decisions", token=token, timeout=30)["document"]
+    try:
+        current = review_sync.build_review_snapshot(project_path, include_previews=False)
+        matches = current["snapshot_fingerprint"] == document["snapshot_fingerprint"]
+    except ValueError:
+        matches = False
+    result = {"ok": True, "status": document.get("submission_status", latest["status"]),
+              "submission_id": latest["id"], "matches_local": matches,
+              "decisions": document.get("decisions", []), "can_deliver": False}
+    result["can_deliver"] = bool(matches and result["status"] == "reviewed" and result["decisions"]
+        and all(item["review_status"] == "approved" for item in result["decisions"]))
+    if matches:
+        target = project_path.resolve().with_name(DECISIONS_FILENAME)
+        temporary = target.with_name(target.name + "." + uuid.uuid4().hex + ".tmp")
+        temporary.write_text(json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, target)
+    return result
+
+
+def _review_generate_delivery(payload: dict) -> dict:
+    status = _review_status(payload)
+    if not status["can_deliver"]:
+        raise ValueError("当前本地版本尚未全部审核通过。请更新服务器工程、提交对应版本并完成审核。")
+    # The same authenticated actor and approved local snapshot generate AND upload.
+    result = _export_match_scope(payload)
+    quality_path = Path(result["delivery_output_path"]) / "k12_dataset" / "quality_report.json"
+    try:
+        quality = json.loads(quality_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("无法读取本次最终交付质量报告，未上传任何文件。") from error
+    eligible = int(quality.get("eligible_count", 0) or 0)
+    if eligible <= 0:
+        failures: dict[str, int] = {}
+        for item in quality.get("items", []):
+            for reason in item.get("errors", []):
+                failures[str(reason)] = failures.get(str(reason), 0) + 1
+        summary = "、".join(f"{name} {count} 题" for name, count in
+                            sorted(failures.items(), key=lambda row: (-row[1], row[0]))[:5])
+        raise ValueError(
+            "本次没有符合客户交付规范的题目，未上传任何文件。"
+            f"请先补全教材元数据和题目字段，再生成；质量报告：{quality_path}"
+            + (f"；主要缺项：{summary}" if summary else "")
+        )
+    uploaded = _review_upload_delivery({**payload, "delivery_path": result["delivery_output_path"]})
+    _, project = _load_project(payload)
+    return {**result, "upload": uploaded, "project_revision": project["project_revision"]}
+
+
+def _authenticated_review_route(handler, roles=None):
+    def run(payload):
+        # Session credentials override all caller-supplied server/account fields.
+        credentials = REVIEW_SESSION.credentials(roles)
+        return handler({**payload, **credentials})
+    return run
+
+
 def _review_submit(payload: dict) -> dict:
     """Submit a review-only snapshot; the delivery exporter is never invoked.
 
@@ -1847,7 +2027,12 @@ def _review_submit(payload: dict) -> dict:
         str(payload.get("password", "")),
         project_path,
         int(payload.get("max_preview_side", 1600)),
+        **_review_token_kwargs(payload),
     )
+    # Keep the remote CAS base separate from local autosave revisions.
+    _project["online_review_base_revision"] = int(result["project"]["project_revision"])
+    annotation_data.save_project(_project, project_path)
+    result["project_revision"] = _project["project_revision"]
     source: dict = {"total": 0, "uploaded": 0, "skipped": 0, "bytes": 0}
     notice = "已按审核中心账号同步个人工程并提交审核快照；最终裁图和最终 JSON 仍只会在本机由“生成裁切图片和JSON”生成。"
     if payload.get("upload_source_images", True):
@@ -1857,6 +2042,7 @@ def _review_submit(payload: dict) -> dict:
                 str(payload.get("username", "")),
                 str(payload.get("password", "")),
                 project_path,
+                **_review_token_kwargs(payload),
             )
             if source.get("total"):
                 notice += f"原书图片已同步 {source['uploaded']} 张（{source['skipped']} 张此前已上传），审核员导入时不必再找你要教材目录。"
@@ -1875,6 +2061,7 @@ def _review_upload_source_images(payload: dict) -> dict:
         str(payload.get("password", "")),
         project_path,
         force=bool(payload.get("force", False)),
+        **_review_token_kwargs(payload),
     )
     return {
         "ok": True,
@@ -1896,6 +2083,7 @@ def _review_pull_decisions(payload: dict) -> dict:
         str(payload.get("password", "")),
         submission_id,
         project_path,
+        **_review_token_kwargs(payload),
     )
     return {
         "ok": True,
@@ -1906,7 +2094,7 @@ def _review_pull_decisions(payload: dict) -> dict:
 
 def _review_upload_delivery(payload: dict) -> dict:
     project_path, _project = _load_project(payload)
-    result = upload_final_delivery(str(payload.get("server_url", "")), str(payload.get("username", "")), str(payload.get("password", "")), project_path, str(payload.get("delivery_path", "")))
+    result = upload_final_delivery(str(payload.get("server_url", "")), str(payload.get("username", "")), str(payload.get("password", "")), project_path, str(payload.get("delivery_path", "")), **_review_token_kwargs(payload))
     return {"ok": True, **result, "notice": "最终交付已按账号上传到服务器私有目录。"}
 
 
@@ -1916,6 +2104,7 @@ def _review_list_projects(payload: dict) -> dict:
         str(payload.get("server_url", "")),
         str(payload.get("username", "")),
         str(payload.get("password", "")),
+        **_review_token_kwargs(payload),
     )
     return {"ok": True, "projects": projects}
 
@@ -1945,12 +2134,14 @@ def _review_import_project(payload: dict) -> dict:
         str(payload.get("password", "")),
         book_id,
         book_root,
+        **_review_token_kwargs(payload),
     )
     snapshot = pull_project_snapshot(
         str(payload.get("server_url", "")),
         str(payload.get("username", "")),
         str(payload.get("password", "")),
         book_id,
+        **_review_token_kwargs(payload),
     )
     project = snapshot["project"]
     for root_key in ("book_root", "image_root", "answer_image_root"):
@@ -1960,6 +2151,7 @@ def _review_import_project(payload: dict) -> dict:
             if isinstance(page, dict):
                 page.pop("source_path", None)
     project["delivery_book_id"] = book_id
+    project["online_review_base_revision"] = int(snapshot.get("project_revision", project.get("project_revision", 0)))
     project_path = annotation_data.default_book_project_path(str(book_root), ROOT / "runtime")
     backup_path = None
     if project_path.is_file():
@@ -1988,25 +2180,58 @@ def _review_import_project(payload: dict) -> dict:
 
 
 def _review_push_project(payload: dict) -> dict:
-    """Push the locally edited project back as the next server revision."""
+    """Push the locally edited project back as the next server revision.
+
+    The review snapshot travels with the push so the server can create the
+    replacement review task (and freeze its project) in the same transaction.
+    The old standalone refresh call is kept only as a fallback for older
+    servers; it is idempotent there, so a retry cannot duplicate the task.
+    """
     project_path, project = _load_project(payload)
+    review_snapshot = None
+    if payload.get("_review_token"):
+        try:
+            review_snapshot = review_sync.build_review_snapshot(project_path)
+        except Exception:
+            review_snapshot = None
     try:
         result = push_project_snapshot(
             str(payload.get("server_url", "")),
             str(payload.get("username", "")),
             str(payload.get("password", "")),
             project_path,
+            review_snapshot=review_snapshot,
+            **_review_token_kwargs(payload),
         )
     except ReviewConflictError as error:
         raise ValueError(f"版本冲突，未回传：{error}") from error
     # Reconcile the local revision with the server's stored revision so the
     # next push compares against the revision this push created, not a stale one.
-    project["project_revision"] = int(result.get("project_revision", project.get("project_revision", 0)) or 0)
+    remote_revision = int(result["project_revision"])
+    project["online_review_base_revision"] = remote_revision
     annotation_data.save_project(project, project_path)
+    notice = f"修改已回传服务器（第 {remote_revision} 版），旧版审核已作废。"
+    if payload.get("_review_token"):
+        if result.get("submission"):
+            notice += "网站审核预览已更新，请逐页放行新版本。"
+        else:
+            try:
+                snapshot = dict(review_snapshot or review_sync.build_review_snapshot(project_path))
+                snapshot["project_revision"] = remote_revision
+                frozen = dict(project)
+                frozen["project_revision"] = remote_revision
+                snapshot["project_document"] = frozen
+                review_sync._request_json(str(payload["server_url"]) + "/api/review-refresh", "POST", snapshot,
+                                          payload["_review_token"], timeout=300)
+                notice += "网站审核预览已更新，请逐页放行新版本。"
+            except Exception as error:
+                notice += f"审核预览更新失败，请重试「回传修改」：{error}"
     return {
         "ok": True,
         **result,
-        "notice": f"修改已回传服务器（第 {result.get('project_revision', '?')} 版）。",
+        "server_revision": remote_revision,
+        "project_revision": project["project_revision"],
+        "notice": notice,
     }
 
 
@@ -2514,6 +2739,25 @@ ROUTES = {
     "/api/project/page-ocr": _page_ocr,
 }
 
+# Existing implementations remain callable by batch tools; the HTTP desk always
+# uses a validated, process-local company session instead of per-action passwords.
+for _path in tuple(ROUTES):
+    if _path.startswith("/api/review/"):
+        _roles = ({"annotator", "admin"} if _path.endswith("/submit") else
+                  REVIEWERS if _path.endswith("/push-project") or _path.endswith("/upload-delivery")
+                  or _path.endswith("/import-project") else None)
+        ROUTES[_path] = _authenticated_review_route(ROUTES[_path], _roles)
+ROUTES.update({
+    "/api/library": _library_request,
+    "/api/review/login": _review_login,
+    "/api/review/session": lambda payload: REVIEW_SESSION.validated_status(),
+    "/api/review/logout": lambda payload: REVIEW_SESSION.logout(),
+    "/api/review/forget-on-exit": lambda payload: REVIEW_SESSION.forget_on_exit(),
+    "/api/review/status": _authenticated_review_route(_review_status),
+    "/api/review/generate-delivery": _authenticated_review_route(_review_generate_delivery, REVIEWERS),
+})
+MUTATING_ROUTES.update({"/api/review/submit", "/api/review/generate-delivery"})
+
 
 class PaperFlowHandler(BaseHTTPRequestHandler):
     server_version = "PaperFlowLocal/1.0"
@@ -2538,6 +2782,24 @@ class PaperFlowHandler(BaseHTTPRequestHandler):
         self._respond(HTTPStatus.NO_CONTENT, {})
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib request handler API
+        if urlparse(self.path).path == "/api/library/image":
+            try:
+                credentials = REVIEW_SESSION.credentials()
+                query = parse_qs(urlparse(self.path).query)
+                values = {key: query.get(key, [""])[0] for key in ("book_id", "kind", "page_index")}
+                request = Request(credentials["server_url"] + "/api/library/image?" + urlencode(values),
+                                  headers={"Authorization": "Bearer " + credentials["_review_token"]})
+                with urlopen(request, timeout=60) as response:
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", response.headers.get("Content-Type", "image/jpeg"))
+                    if response.headers.get("Content-Length") is not None:
+                        self.send_header("Content-Length", response.headers["Content-Length"])
+                    self.send_header("Access-Control-Allow-Origin", "null")
+                    self.end_headers()
+                    shutil.copyfileobj(response, self.wfile, length=256 * 1024)
+            except Exception as error:
+                self._respond(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(error)})
+            return
         if urlparse(self.path).path == "/api/health":
             self._respond(HTTPStatus.OK, {
                 "ok": True,
@@ -2563,11 +2825,28 @@ class PaperFlowHandler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("请求数据格式错误。")
+            if route_path not in {"/api/review/login", "/api/review/session", "/api/review/logout", "/api/review/forget-on-exit"}:
+                REVIEW_SESSION.require_login()
+            project_ref = str(payload.get("project_path") or "")
+            if project_ref.startswith("server://"):
+                result = _library_request({"action": "operate", "book_id": project_ref[9:],
+                    "operation": route_path, "payload": payload,
+                    "base_revision": payload.get("_server_revision", -1)})
+                self._respond(HTTPStatus.OK, result)
+                return
+            if route_path == "/api/project/open-book" and str(payload.get("book_root", "")).startswith("server://"):
+                result = _library_request({"action": "open", "book_id": payload["book_root"][9:],
+                                           "annotator_id": payload.get("annotator_id")})
+                self._respond(HTTPStatus.OK, result)
+                return
             if route_path in MUTATING_ROUTES:
                 with PROJECT_WRITE_LOCK:
                     result = route(payload)
             else:
                 result = route(payload)
+        except PermissionError as error:
+            self._respond(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": str(error), "auth_required": True})
+            return
         except ValueError as error:
             self._respond(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(error)})
             return
@@ -2694,6 +2973,7 @@ def _start_prewarm_thread() -> None:
         return
 
     def runner() -> None:
+        MODEL_WARMUP_READY.wait()
         # 先让 Electron 的健康检查完成握手，再占用 CPU 加载模型，
         # 否则启动瞬间的模型加载可能让健康检查超时。
         time.sleep(PREWARM_DELAY_SECONDS)

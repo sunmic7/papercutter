@@ -84,6 +84,7 @@ def _page_entries(project: dict, max_preview_side: int, include_previews: bool) 
                 "image_name": str(page.get("image", Path(source).name)),
                 "width": int(width),
                 "height": int(height),
+                "source_sha256": hashlib.sha256(Path(source).read_bytes()).hexdigest(),
                 "regions": regions,
             }
             if include_previews:
@@ -98,6 +99,42 @@ def _page_entries(project: dict, max_preview_side: int, include_previews: bool) 
     return entries
 
 
+def _review_content(project: dict) -> dict:
+    """Approval binds to deliverable content, independent of local roots/autosaves."""
+    book_keys = ("language", "stage", "grade", "subject", "answer_mode", "difficulty_scheme")
+    record_keys = (
+        "id", "bbox", "text", "question", "answer", "analysis", "options",
+        "question_type", "difficulty", "knowledge_points", "number_path",
+        "major_number", "minor_number", "subsection_number", "number_levels",
+        "major_title", "subsection_title", "region_role", "continuation_of",
+        "context", "context_ref", "shared_context", "shared_context_ids",
+        "shared_context_boxes", "shared_context_segments", "parent_id", "continuations", "illustrations", "illustration_boxes",
+        "image_areas", "match_scope_id", "answer_slots", "answer_granularity",
+    )
+    result = {key: project.get(key) for key in book_keys}
+    result["pairs"] = [{key: pair.get(key) for key in ("question_id", "answer_ids", "status")}
+                       for pair in project.get("pairs", [])]
+    for pages_key, records_key in (("pages", "questions"), ("answer_pages", "answers")):
+        result[pages_key] = [
+            {"image": page.get("image"), "status": page.get("status"), "rotation": page.get("rotation", 0),
+             "records": [{key: record.get(key) for key in record_keys} for record in page.get(records_key, [])]}
+            for page in project.get(pages_key, [])
+        ]
+    return result
+
+
+def project_book_name(project: dict, project_path: str | Path) -> str:
+    """Retain the original title when a project is stored under its generated ID."""
+    from pathlib import PureWindowsPath
+    metadata = project.get("book_metadata") if isinstance(project.get("book_metadata"), dict) else {}
+    book_id = str(project.get("delivery_book_id") or project.get("server_book_id") or "")
+    roots = [project.get("book_root"), project.get("image_root"), str(Path(project_path).parent)]
+    candidates = [metadata.get("book_name"), project.get("source_book_name"), project.get("book_name"),
+                  *[PureWindowsPath(str(root)).name for root in roots if root]]
+    return next((str(name).strip() for name in candidates if str(name or "").strip()
+                 and str(name).strip().casefold() != book_id.casefold()), book_id)
+
+
 def build_review_snapshot(project_path: str | Path, max_preview_side: int = DEFAULT_MAX_PREVIEW_SIDE, *, include_previews: bool = True) -> dict:
     """Build a review-only document without touching any delivery output."""
     project_path = Path(project_path).resolve()
@@ -105,14 +142,14 @@ def build_review_snapshot(project_path: str | Path, max_preview_side: int = DEFA
     pages = _page_entries(project, max(480, int(max_preview_side)), include_previews)
     if not pages:
         raise ValueError("没有包含题框的已确认页面，无法提交审核。")
-    book_root = Path(str(project.get("book_root") or project.get("image_root") or project_path.parent))
     book_id = str(project.get("delivery_book_id", "")).strip() or hashlib.sha256(str(project_path).encode("utf-8")).hexdigest()[:20]
     identity_pages = [{key: value for key, value in page.items() if key != "preview"} for page in pages]
-    fingerprint = hashlib.sha256(_canonical_json({"book_id": book_id, "pages": identity_pages})).hexdigest()
+    fingerprint = hashlib.sha256(_canonical_json({"book_id": book_id, "pages": identity_pages,
+                                                 "content": _review_content(project)})).hexdigest()
     return {
         "schema_version": SCHEMA_VERSION,
         "kind": "paperflow_page_review_snapshot",
-        "book": {"id": book_id, "name": book_root.name or project_path.parent.name},
+        "book": {"id": book_id, "name": project_book_name(project, project_path)},
         "project_revision": int(project.get("project_revision", 0)),
         "snapshot_fingerprint": fingerprint,
         "pages": pages,
@@ -171,24 +208,33 @@ def build_project_sync_snapshot(project_path: str | Path) -> dict:
     book_id = str(portable.get("delivery_book_id", "")).strip()
     if not book_id:
         raise ValueError("本地工程缺少公司教材编号，不能同步到员工目录。")
-    metadata = portable.get("book_metadata") if isinstance(portable.get("book_metadata"), dict) else {}
-    book_name = str(metadata.get("book_name") or project_path.parent.name).strip()
-    return {
+    book_name = project_book_name(project, project_path)
+    portable["source_book_name"] = book_name
+    document = {
         "schema_version": SCHEMA_VERSION,
         "kind": "paperflow_project_sync",
         "book": {"id": book_id, "name": book_name},
         "project": portable,
     }
+    if "online_review_base_revision" in project:
+        document["base_revision"] = int(project["online_review_base_revision"])
+    return document
 
 
-def submit_review_snapshot(server_url: str, username: str, password: str, project_path: str | Path, max_preview_side: int = DEFAULT_MAX_PREVIEW_SIDE) -> dict:
+def submit_review_snapshot(server_url: str, username: str, password: str, project_path: str | Path, max_preview_side: int = DEFAULT_MAX_PREVIEW_SIDE, *, token: str = "") -> dict:
     """Sync the employee project, then upload review evidence; never final outputs."""
     base_url = _base_url(server_url)
-    login = _request_json(base_url + "/api/login", "POST", {"username": username, "password": password}, timeout=30)
+    login = {"token": _login(base_url, username, password, token=token)}
+    # Validate/read local evidence before advancing the remote project version.
+    snapshot = build_review_snapshot(project_path, max_preview_side, include_previews=True)
     project_sync = _request_json(
         base_url + "/api/projects/sync", "POST", build_project_sync_snapshot(project_path), login["token"], timeout=300
     )
-    snapshot = build_review_snapshot(project_path, max_preview_side, include_previews=True)
+    # A later submission/image request can fail independently. Remember the
+    # successful sync immediately so retry does not conflict with our own write.
+    local = annotation_data.load_project(project_path)
+    local["online_review_base_revision"] = int(project_sync["project"]["project_revision"])
+    annotation_data.save_project(local, project_path, increment_revision=False)
     result = _request_json(base_url + "/api/submissions", "POST", snapshot, login["token"], timeout=300)
     return {
         "submission": result["submission"],
@@ -198,8 +244,13 @@ def submit_review_snapshot(server_url: str, username: str, password: str, projec
     }
 
 
-def upload_final_delivery(server_url: str, username: str, password: str, project_path: str | Path, delivery_path: str | Path) -> dict:
-    """Upload a locally generated final package file-by-file under the account."""
+def upload_final_delivery(server_url: str, username: str, password: str, project_path: str | Path, delivery_path: str | Path, *, token: str = "") -> dict:
+    """Atomically publish a locally generated final package.
+
+    The complete manifest is accepted before any content is uploaded.  Content
+    goes to a server-side staging folder and becomes visible only after every
+    file passes its byte and SHA-256 checks.
+    """
     project = annotation_data.load_project(Path(project_path).resolve())
     book_id = str(project.get("delivery_book_id", "")).strip()
     root = Path(delivery_path).resolve()
@@ -208,22 +259,35 @@ def upload_final_delivery(server_url: str, username: str, password: str, project
     files = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".json", ".jsonl"}]
     if not files:
         raise ValueError("最终交付目录中没有可上传文件。")
-    base_url = _base_url(server_url)
-    token = _request_json(base_url + "/api/login", "POST", {"username": username, "password": password}, timeout=30)["token"]
+    prepared = []
     total = 0
     for path in sorted(files):
         content = path.read_bytes()
+        if not content:
+            raise ValueError(f"最终交付包含空文件，未上传任何文件：{path.relative_to(root).as_posix()}")
         if len(content) > 64 * 1024 * 1024:
             raise ValueError(f"单文件超过 64 MB：{path.name}")
-        _request_json(base_url + "/api/deliveries/files", "POST", {"book": {"id": book_id}, "relative_path": path.relative_to(root).as_posix(), "content_base64": base64.b64encode(content).decode("ascii"), "sha256": hashlib.sha256(content).hexdigest()}, token, timeout=300)
+        prepared.append((path, content, hashlib.sha256(content).hexdigest()))
         total += len(content)
-    return {"book_id": book_id, "file_count": len(files), "bytes": total}
+    base_url = _base_url(server_url)
+    token = _login(base_url, username, password, token=token)
+    manifest = [{"relative_path": path.relative_to(root).as_posix(), "bytes": len(content), "sha256": digest}
+                for path, content, digest in prepared]
+    batch = _request_json(base_url + "/api/deliveries/batches", "POST", {"book": {"id": book_id}, "files": manifest}, token, timeout=300)["batch"]
+    batch_id = str(batch["batch_id"])
+    for path, content, _digest in prepared:
+        _request_json(base_url + f"/api/deliveries/batches/{batch_id}/files", "POST", {
+            "relative_path": path.relative_to(root).as_posix(),
+            "content_base64": base64.b64encode(content).decode("ascii"),
+        }, token, timeout=300)
+    committed = _request_json(base_url + f"/api/deliveries/batches/{batch_id}/commit", "POST", {}, token, timeout=300)["delivery"]
+    return {"book_id": book_id, "file_count": int(committed["file_count"]), "bytes": total, "batch_id": batch_id}
 
 
-def pull_review_decisions(server_url: str, username: str, password: str, submission_id: str, project_path: str | Path) -> dict:
+def pull_review_decisions(server_url: str, username: str, password: str, submission_id: str, project_path: str | Path, *, token: str = "") -> dict:
     """Fetch decisions only when they belong to the unchanged local snapshot."""
     base_url = _base_url(server_url)
-    login = _request_json(base_url + "/api/login", "POST", {"username": username, "password": password}, timeout=30)
+    login = {"token": _login(base_url, username, password, token=token)}
     document = _request_json(base_url + f"/api/submissions/{submission_id}/decisions", token=login["token"], timeout=30)["document"]
     current = build_review_snapshot(project_path, include_previews=False)
     if document.get("snapshot_fingerprint") != current["snapshot_fingerprint"]:
@@ -235,19 +299,19 @@ def pull_review_decisions(server_url: str, username: str, password: str, submiss
     return {"decision_path": str(target), "decision_count": len(document.get("decisions", [])), "submission_id": submission_id}
 
 
-def list_remote_projects(server_url: str, username: str, password: str) -> list[dict]:
+def list_remote_projects(server_url: str, username: str, password: str, *, token: str = "") -> list[dict]:
     """List textbooks visible to this review-center account (for the import dialog)."""
     base_url = _base_url(server_url)
-    token = _request_json(base_url + "/api/login", "POST", {"username": username, "password": password}, timeout=30)["token"]
+    token = _login(base_url, username, password, token=token)
     document = _request_json(base_url + "/api/projects", token=token, timeout=60)
     projects = document.get("projects") or []
     return [item for item in projects if isinstance(item, dict)]
 
 
-def pull_project_snapshot(server_url: str, username: str, password: str, book_id: str) -> dict:
+def pull_project_snapshot(server_url: str, username: str, password: str, book_id: str, *, token: str = "") -> dict:
     """Download one full annotation snapshot for local import/edit."""
     base_url = _base_url(server_url)
-    token = _request_json(base_url + "/api/login", "POST", {"username": username, "password": password}, timeout=30)["token"]
+    token = _login(base_url, username, password, token=token)
     safe_book_id = str(book_id or "").strip()
     if not safe_book_id or "/" in safe_book_id or "\\" in safe_book_id:
         raise ValueError("教材编号无效。")
@@ -258,28 +322,38 @@ def pull_project_snapshot(server_url: str, username: str, password: str, book_id
     return snapshot
 
 
-def push_project_snapshot(server_url: str, username: str, password: str, project_path: str | Path) -> dict:
+def push_project_snapshot(server_url: str, username: str, password: str, project_path: str | Path,
+                          *, token: str = "", review_snapshot: dict | None = None) -> dict:
     """Push the locally edited project back as the next server revision.
 
     The local ``project_revision`` is the base the edits were made on; the
     server stores ``stored + 1`` and returns it so the caller can reconcile.
+    When ``review_snapshot`` is supplied the server creates the replacement
+    review task (with its frozen project) inside the very same transaction, so
+    a dropped connection can never leave the book without a live task.
     """
     project_path = Path(project_path).resolve()
-    base_revision = int(annotation_data.load_project(project_path).get("project_revision", 0) or 0)
+    project = annotation_data.load_project(project_path)
+    base_revision = int(project.get("online_review_base_revision", project.get("project_revision", 0)) or 0)
     document = build_project_sync_snapshot(project_path)
     document["base_revision"] = base_revision
+    if isinstance(review_snapshot, dict):
+        document["review_snapshot"] = review_snapshot
     base_url = _base_url(server_url)
-    token = _request_json(base_url + "/api/login", "POST", {"username": username, "password": password}, timeout=30)["token"]
+    token = _login(base_url, username, password, token=token)
     result = _request_json(base_url + "/api/projects/sync", "POST", document, token, timeout=300)
     return {
         "book_id": result["project"].get("book_id", document["book"]["id"]),
         "base_revision": base_revision,
         "project_revision": int(result["project"].get("project_revision", 0) or 0),
         "server_relative_path": result["project"].get("server_relative_path", ""),
+        "submission": result["project"].get("submission"),
     }
 
 
-def _login(base_url: str, username: str, password: str) -> str:
+def _login(base_url: str, username: str, password: str, *, token: str = "") -> str:
+    if token:
+        return token
     return str(_request_json(base_url + "/api/login", "POST", {"username": username, "password": password}, timeout=30)["token"])
 
 
@@ -330,6 +404,7 @@ def upload_project_source_images(
     project_path: str | Path,
     progress=None,
     force: bool = False,
+    token: str = "",
 ) -> dict:
     """Upload the page scans a reviewer needs in order to redraw frames locally.
 
@@ -345,7 +420,7 @@ def upload_project_source_images(
     pairs = collect_project_source_images(project_path)
     if not pairs:
         return {"book_id": book_id, "total": 0, "uploaded": 0, "skipped": 0, "bytes": 0}
-    token = _login(base_url, username, password)
+    token = _login(base_url, username, password, token=token)
     existing = {} if force else {str(item.get("path", "")): int(item.get("bytes", 0) or 0)
                                  for item in _source_inventory(base_url, token, book_id)}
     uploaded = skipped = total_bytes = 0
@@ -382,6 +457,7 @@ def fetch_project_source_images(
     book_id: str,
     local_root: str | Path,
     progress=None,
+    token: str = "",
 ) -> dict:
     """Download the page scans of one textbook into a local folder."""
     base_url = _base_url(server_url)
@@ -390,7 +466,7 @@ def fetch_project_source_images(
         raise ValueError("教材编号无效。")
     local_root = Path(local_root).expanduser().resolve()
     local_root.mkdir(parents=True, exist_ok=True)
-    token = _login(base_url, username, password)
+    token = _login(base_url, username, password, token=token)
     inventory = _source_inventory(base_url, token, safe_book_id)
     downloaded = skipped = total_bytes = 0
     for index, item in enumerate(inventory, start=1):

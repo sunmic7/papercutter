@@ -3,7 +3,7 @@ param(
     [string]$ServerAddress = "192.168.1.204",
     [string]$ServerUser = "paperflow-deploy",
     [string]$KeyPath = "",
-    [string]$Version = "20261021-source-images"
+    [string]$Version = "20261105-review-concurrency"
 )
 
 $ErrorActionPreference = "Stop"
@@ -27,10 +27,23 @@ try {
     $files = @(
         'desktop_annotation\paperflow_annotation_api.py',
         'desktop_annotation\PaperFlow-Annotation\resources\app\index.html',
-        'desktop_annotation\PaperFlow-Annotation\resources\app\config.json',
+        'desktop_annotation\PaperFlow-Annotation\resources\app\logo.png',
+        'desktop_annotation\PaperFlow-Annotation\resources\app\assets\paperflow-icon.png',
+        'desktop_annotation\PaperFlow-Annotation\resources\app\assets\paperflow-icon.ico',
         'desktop_annotation\PaperFlow-Annotation\resources\app\js\main.js',
+        'desktop_annotation\PaperFlow-Annotation\resources\app\js\company-review.js',
+        'desktop_annotation\PaperFlow-Annotation\resources\app\js\image-manager.js',
+        'desktop_annotation\PaperFlow-Annotation\resources\app\js\utils.js',
+        'desktop_annotation\PaperFlow-Annotation\resources\app\js\ui-manager.js',
+        'desktop_annotation\PaperFlow-Annotation\resources\app\js\latex-renderer.js',
+        'desktop_annotation\PaperFlow-Annotation\resources\app\js\ocr-service.js',
+        'desktop_annotation\PaperFlow-Annotation\resources\app\js\employee-workbench.js',
+        'desktop_annotation\PaperFlow-Annotation\resources\app\css\employee-workbench.css',
+        'desktop_annotation\PaperFlow-Annotation\resources\app\css\components.css',
         'desktop_annotation\PaperFlow-Annotation\resources\app\electron\main.js',
+        'desktop_annotation\PaperFlow-Annotation\resources\app\electron\preload.js',
         'review_tools\online_review_sync.py',
+        'review_tools\review_session.py',
         'review_tools\manual_annotation_data.py'
     )
     $payload = Join-Path $stage 'payload'
@@ -43,18 +56,28 @@ try {
     }
     Copy-Item -LiteralPath (Join-Path $templateRoot 'Install-PaperFlow-PrivateDelivery.ps1') -Destination $stage -Force
     Copy-Item -LiteralPath (Join-Path $templateRoot 'Install-PaperFlow-PrivateDelivery.cmd') -Destination $stage -Force
+    Copy-Item -LiteralPath (Join-Path $templateRoot 'README-central-library.md') -Destination (Join-Path $stage 'README.md') -Force
     $manifestFiles = foreach ($relative in $files) {
         [pscustomobject]@{ path = $relative; sha256 = (Get-FileHash -LiteralPath (Join-Path $payload $relative) -Algorithm SHA256).Hash.ToLowerInvariant() }
     }
     [pscustomobject]@{ version = $Version; files = @($manifestFiles) } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stage 'manifest.json') -Encoding UTF8
 
+    # Keep a reviewable local package as well as the LAN distribution copy.
+    $localRelease = Join-Path $sourceRoot ('release\' + $Version)
+    New-Item -ItemType Directory -Force -Path $localRelease | Out-Null
+    Copy-Item -Path (Join-Path $stage '*') -Destination $localRelease -Recurse -Force
+
     & $ssh @options $target 'cmd.exe /d /c "if not exist J:\PaperFlowData\Public\System\ClientTools\PaperFlowClientUpdates mkdir J:\PaperFlowData\Public\System\ClientTools\PaperFlowClientUpdates"'
     if ($LASTEXITCODE -ne 0) { throw 'Could not create the client-update directory on the server.' }
     & $scp @options -r $stage "${target}:J:/PaperFlowData/Public/System/ClientTools/PaperFlowClientUpdates/"
     if ($LASTEXITCODE -ne 0) { throw 'Client update package upload failed.' }
-    Write-Host "Published: \\$ServerAddress\PaperFlowTest\System\ClientTools\PaperFlowClientUpdates\$Version" -ForegroundColor Green
+    Write-Host "Published: \\$ServerAddress\PaperFlowTest\Public\System\ClientTools\PaperFlowClientUpdates\$Version" -ForegroundColor Green
+    Write-Host "Local package: $localRelease" -ForegroundColor Green
 } finally {
-    if (Test-Path -LiteralPath $stageParent) { Remove-Item -LiteralPath $stageParent -Recurse -Force }
+    $resolvedStageParent = [IO.Path]::GetFullPath($stageParent)
+    $resolvedTemp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+    if (-not $resolvedStageParent.StartsWith($resolvedTemp, [StringComparison]::OrdinalIgnoreCase)) { throw 'Invalid package staging cleanup target.' }
+    if (Test-Path -LiteralPath $resolvedStageParent) { Remove-Item -LiteralPath $resolvedStageParent -Recurse -Force }
     if (Test-Path -LiteralPath $temporaryKey) {
         # Copying a key can preserve a different owner. Grant the invoking user
         # full control only after SSH has finished, so the disposable key is
