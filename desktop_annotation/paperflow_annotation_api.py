@@ -2034,7 +2034,7 @@ def _review_submit(payload: dict) -> dict:
     annotation_data.save_project(_project, project_path)
     result["project_revision"] = _project["project_revision"]
     source: dict = {"total": 0, "uploaded": 0, "skipped": 0, "bytes": 0}
-    notice = "已按审核中心账号同步个人工程并提交审核快照；最终裁图和最终 JSON 仍只会在本机由“生成裁切图片和JSON”生成。"
+    notice = "已按审核中心账号同步个人工程并提交审核快照；最终裁图和最终 JSON 由服务器在逐页审核通过后统一生成，无需在本机导出版。"
     if payload.get("upload_source_images", True):
         try:
             source = upload_project_source_images(

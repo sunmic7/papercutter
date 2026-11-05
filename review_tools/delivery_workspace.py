@@ -20,11 +20,27 @@ K12_QUESTION_TYPES = {
 }
 
 
+def _wide_path(path: Path) -> str:
+    """Windows delivery trees are deep; opt into the extended-length path form.
+
+    A server generation writes under
+    ``<root>/exports/<version>/staging/<book_id>/images/questions/P0001/...``.
+    On the data machine that can exceed the classic 260-character MAX_PATH,
+    where directory creation still succeeds but opening the final file fails
+    with a bare FileNotFoundError.
+    """
+    text = str(path.resolve())
+    if os.name == "nt" and len(text) >= 240 and not text.startswith("\\\\?\\"):
+        return "\\\\?\\" + text
+    return text
+
+
 def _atomic_json(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
+    with open(_wide_path(temporary), "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False, indent=2))
+    os.replace(_wide_path(temporary), _wide_path(path))
 
 
 def _atomic_image(path: Path, image) -> None:
@@ -35,8 +51,12 @@ def _atomic_image(path: Path, image) -> None:
     if not ok:
         raise ValueError("交付图片编码失败")
     temporary = path.with_suffix(path.suffix + ".tmp")
-    encoded.tofile(str(temporary))
-    os.replace(temporary, path)
+    # ndarray.tofile() goes through the C runtime's fopen, which cannot use
+    # long paths and mishandles non-ASCII folders.  Python IO honours the
+    # wide-path prefix, matching how PaperFlow reads scans (fromfile/imdecode).
+    with open(_wide_path(temporary), "wb") as handle:
+        handle.write(encoded.tobytes())
+    os.replace(_wide_path(temporary), _wide_path(path))
 
 
 def _delivery_artifact_path(root: Path, value: object) -> Path | None:

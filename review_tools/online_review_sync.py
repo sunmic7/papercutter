@@ -153,7 +153,7 @@ def build_review_snapshot(project_path: str | Path, max_preview_side: int = DEFA
         "project_revision": int(project.get("project_revision", 0)),
         "snapshot_fingerprint": fingerprint,
         "pages": pages,
-        "notice": "仅为审核预览；最终裁图和最终 JSON 未上传，且必须在本地生成。",
+        "notice": "仅为审核预览，不含最终交付物；最终裁图和最终 JSON 由服务器在逐页审核通过后统一生成。",
     }
 
 
@@ -375,19 +375,24 @@ def collect_project_source_images(project_path: str | Path) -> list[tuple[str, P
         for page in project.get(pages_key) or []:
             if not isinstance(page, dict):
                 continue
-            image = str(page.get("image") or "").strip()
-            if not image:
-                continue
-            relative = image.replace("\\", "/").lstrip("/")
-            if not relative or relative in collected:
-                continue
-            for root in roots:
-                if not root:
+            # A rotated page is read from ``rotated_image`` instead of
+            # ``image`` by the review fingerprint and by the final cropper.
+            # It must travel with the scans too, otherwise the server can
+            # reproduce neither of them for that page.
+            for field in ("image", "rotated_image"):
+                image = str(page.get(field) or "").strip()
+                if not image:
                     continue
-                candidate = Path(root) / image
-                if candidate.is_file():
-                    collected[relative] = candidate
-                    break
+                relative = image.replace("\\", "/").lstrip("/")
+                if not relative or relative in collected:
+                    continue
+                for root in roots:
+                    if not root:
+                        continue
+                    candidate = Path(root) / image
+                    if candidate.is_file():
+                        collected[relative] = candidate
+                        break
     return sorted(collected.items())
 
 
@@ -406,10 +411,14 @@ def upload_project_source_images(
     force: bool = False,
     token: str = "",
 ) -> dict:
-    """Upload the page scans a reviewer needs in order to redraw frames locally.
+    """Upload the page scans the SERVER needs for review and final cropping.
 
-    Files already present on the server with a matching size are skipped, so a
-    resubmit after a few changed pages only transfers what is missing.
+    A reviewer also downloads these scans to redraw frames locally, but they
+    are equally the source of the final delivery crops: employee workstations
+    strip their local ``image_root`` before syncing, so the server can only
+    reproduce the review fingerprint and render illustrations from this copy.
+    Files already present with a matching size are skipped, so a resubmit after
+    a few changed pages only transfers what is missing.
     """
     base_url = _base_url(server_url)
     project_path = Path(project_path).resolve()
