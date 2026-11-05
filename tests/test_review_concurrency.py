@@ -7,13 +7,14 @@ so a missing frozen project is caught here rather than only in production.
 import base64
 import hashlib
 import json
+import os
 import tempfile
 import threading
 import unittest
 from contextlib import closing
 from pathlib import Path
 
-from online_review_beta.central_library import MANAGERS
+from online_review_beta.central_library import CentralLibrary, MANAGERS
 from online_review_beta.server import (
     ACTIVE_SUBMISSION_STATUSES, ConflictError, DELIVERY_ROLES, ReviewStore,
 )
@@ -251,3 +252,208 @@ class ReviewConcurrencyTests(unittest.TestCase):
             })
         self.assertIn("审核", str(caught.exception))
         self.assertNotIn("无权上传最终交付", str(caught.exception))
+
+
+class _DeliveryIndexShim:
+    """Minimal stand-in for CentralLibrary when testing the version index."""
+    @staticmethod
+    def _atomic_json(path, document):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+
+
+class DeliveryTaskAdminTests(unittest.TestCase):
+    """Administrator cleanup, batch management and delivery ownership guards."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.store = ReviewStore(root / "data", staff_data_root=root / "staff")
+        self.super_admin = self.store.create_user("superadmin", "very-secret-password", "super_admin")
+        self.admin = self.store.create_managed_user(self.super_admin, "admin", "very-secret-password", "admin")
+        self.annotator = self.store.create_managed_user(self.admin, "marker", "very-secret-password", "annotator")
+        self.reviewer = self.store.create_managed_user(self.admin, "reviewer", "very-secret-password", "reviewer")
+        self.store.set_responsible_person(self.super_admin, self.annotator["id"], self.reviewer["id"])
+        self._saved_gate = os.environ.get("PAPERFLOW_DELIVERY_REQUIRE_APPROVAL")
+        # These cases exercise storage ownership, not the review-approval gate.
+        os.environ["PAPERFLOW_DELIVERY_REQUIRE_APPROVAL"] = "0"
+
+    def tearDown(self):
+        if self._saved_gate is None:
+            os.environ.pop("PAPERFLOW_DELIVERY_REQUIRE_APPROVAL", None)
+        else:
+            os.environ["PAPERFLOW_DELIVERY_REQUIRE_APPROVAL"] = self._saved_gate
+        self.temp.cleanup()
+
+    def _submit(self, book_id="BOOK-A", revision=1):
+        document, frozen = review_document(book_id, revision)
+        return self.store.create_submission(self.annotator, document, project_document=frozen)
+
+    def _approve(self, submission_id):
+        self.store.decide_page(self.reviewer, submission_id, "question-0", "approved", "")
+
+    def _job_status(self, submission_id):
+        with closing(self.store._connect()) as db:
+            row = db.execute("SELECT status FROM delivery_jobs WHERE submission_id=?",
+                             (submission_id,)).fetchone()
+        return row["status"] if row else None
+
+    def _delete(self, submission_ids, actor=None, reason="历史测试任务"):
+        return self.store.manage_delivery_tasks(actor or self.admin, {
+            "action": "delete", "submission_ids": submission_ids, "reason": reason})
+
+    def test_admin_soft_delete_hides_task_but_keeps_frozen_project(self):
+        first = self._submit()
+        frozen = self.store.preview_root / first["id"] / "project.json"
+        self.assertTrue(frozen.is_file())
+        result = self._delete([first["id"]])
+        self.assertEqual((result["succeeded"], result["failed"]), (1, 0))
+        self.assertNotIn(first["id"],
+                         [row["id"] for row in self.store.list_submissions(self.super_admin)])
+        trash = self.store.list_submissions(self.super_admin, scope="trash")
+        self.assertEqual([row["id"] for row in trash], [first["id"]])
+        self.assertEqual(trash[0]["delete_reason"], "历史测试任务")
+        self.assertTrue(frozen.is_file(), "删除任务不能物理删除冻结工程")
+        restored = self.store.manage_delivery_tasks(self.admin, {
+            "action": "restore", "submission_ids": [first["id"]]})
+        self.assertEqual(restored["succeeded"], 1)
+        self.assertIn(first["id"],
+                      [row["id"] for row in self.store.list_submissions(self.super_admin)])
+
+    def test_only_administrators_can_delete_or_open_recycle_bin(self):
+        first = self._submit()
+        for action in ("delete", "restore", "cancel"):
+            with self.assertRaises(PermissionError):
+                self.store.manage_delivery_tasks(self.reviewer, {
+                    "action": action, "submission_ids": [first["id"]]})
+        with self.assertRaises(PermissionError):
+            self.store.list_submissions(self.reviewer, scope="trash")
+
+    def test_delete_cancels_queued_job_and_blocks_retry_or_approval(self):
+        first = self._submit()
+        self._approve(first["id"])
+        self.assertEqual(self._job_status(first["id"]), "queued")
+        self.assertEqual(self._delete([first["id"]])["succeeded"], 1)
+        self.assertEqual(self._job_status(first["id"]), "obsolete")
+        self.assertFalse(self.store.delivery_preflight(first["id"])["ok"])
+        with self.assertRaises(ConflictError):
+            self.store.retry_delivery(self.admin, "BOOK-A")
+        os.environ.pop("PAPERFLOW_DELIVERY_REQUIRE_APPROVAL", None)
+        with closing(self.store._connect()) as db:
+            with self.assertRaises(PermissionError):
+                self.store._ensure_book_review_approved(db, "BOOK-A")
+
+    def test_running_generation_cannot_be_deleted(self):
+        first = self._submit()
+        self._approve(first["id"])
+        with closing(self.store._connect()) as db:
+            db.execute("UPDATE delivery_jobs SET status='running' WHERE submission_id=?",
+                       (first["id"],))
+            db.commit()
+        result = self._delete([first["id"]])
+        self.assertEqual((result["succeeded"], result["failed"]), (0, 1))
+        self.assertIn("正在生成中", result["results"][0]["error"])
+
+    def test_batch_reports_each_row_and_delete_is_idempotent(self):
+        first = self._submit()
+        result = self._delete([first["id"], "sub-missing", first["id"]])
+        self.assertEqual((result["succeeded"], result["failed"]), (1, 1))
+        self.assertIn("不存在", result["results"][1]["error"])
+        again = self._delete([first["id"]])
+        self.assertEqual(again["succeeded"], 1)
+        self.assertTrue(again["results"][0]["already_deleted"])
+
+    def test_batch_retry_and_cancel_permissions(self):
+        first = self._submit()
+        self._approve(first["id"])
+        retried = self.store.manage_delivery_tasks(self.reviewer, {
+            "action": "retry", "submission_ids": [first["id"]]})
+        self.assertEqual(retried["succeeded"], 1)
+        cancelled = self.store.manage_delivery_tasks(self.admin, {
+            "action": "cancel", "submission_ids": [first["id"]]})
+        self.assertEqual(cancelled["succeeded"], 1)
+        self.assertEqual(self._job_status(first["id"]), "obsolete")
+
+    def test_restore_refuses_to_create_a_second_live_task(self):
+        first = self._submit(revision=1)
+        self._delete([first["id"]])
+        self._submit(revision=2)
+        restored = self.store.manage_delivery_tasks(self.admin, {
+            "action": "restore", "submission_ids": [first["id"]]})
+        self.assertEqual(restored["failed"], 1)
+        self.assertIn("已有活动任务", restored["results"][0]["error"])
+
+    def _assign_book(self):
+        self.store.sync_project_snapshot(self.annotator, {
+            "book": {"id": "BOOK-A", "name": "教材 BOOK-A"},
+            "project": {"delivery_book_id": "BOOK-A", "project_revision": 1},
+        })
+        with closing(self.store._connect()) as db:
+            return dict(db.execute("SELECT * FROM project_assignments WHERE book_id='BOOK-A'").fetchone())
+
+    def _delivery_root(self):
+        assignment = self._assign_book()
+        return self.store._delivery_root(assignment, "BOOK-A")
+
+    def test_upload_cannot_overwrite_version_pointer_or_history(self):
+        root = self._delivery_root()
+        content = base64.b64encode(b"{}").decode("ascii")
+        for path in ("current.json", "versions/r1/k12_dataset/dataset.jsonl"):
+            with self.assertRaises(ValueError):
+                self.store.upload_delivery_file(self.reviewer, {
+                    "book": {"id": "BOOK-A"}, "relative_path": path,
+                    "content_base64": content, "sha256": hashlib.sha256(b"{}").hexdigest()})
+        with self.assertRaises(ValueError):
+            self.store.begin_delivery_batch(self.reviewer, {
+                "book": {"id": "BOOK-A"},
+                "files": [{"relative_path": "current.json", "bytes": 2,
+                           "sha256": hashlib.sha256(b"{}").hexdigest()}]})
+        self.assertFalse((root / "current.json").exists())
+        # A normal K12 path is still accepted.
+        self.store.upload_delivery_file(self.reviewer, {
+            "book": {"id": "BOOK-A"}, "relative_path": "k12_dataset/dataset.jsonl",
+            "content_base64": content, "sha256": hashlib.sha256(b"{}").hexdigest()})
+        self.assertTrue((root / "k12_dataset" / "dataset.jsonl").is_file())
+
+    def test_legacy_batch_commit_preserves_server_versions(self):
+        root = self._delivery_root()
+        versions = root / "versions" / "r1-server"
+        versions.mkdir(parents=True, exist_ok=True)
+        (versions / "k12_dataset").mkdir()
+        (versions / "k12_dataset" / "dataset.jsonl").write_text("SERVER", encoding="utf-8")
+        (root / "current.json").write_text('{"version":"r1-server"}', encoding="utf-8")
+        payload = b'{"uploaded":true}'
+        digest = hashlib.sha256(payload).hexdigest()
+        batch = self.store.begin_delivery_batch(self.reviewer, {
+            "book": {"id": "BOOK-A"},
+            "files": [{"relative_path": "k12_dataset/dataset.jsonl",
+                       "bytes": len(payload), "sha256": digest}]})
+        self.store.upload_delivery_batch_file(self.reviewer, batch["batch_id"], {
+            "relative_path": "k12_dataset/dataset.jsonl",
+            "content_base64": base64.b64encode(payload).decode("ascii")})
+        self.store.commit_delivery_batch(self.reviewer, batch["batch_id"])
+        self.assertEqual((root / "k12_dataset" / "dataset.jsonl").read_bytes(), payload)
+        self.assertEqual((versions / "k12_dataset" / "dataset.jsonl").read_text(encoding="utf-8"),
+                         "SERVER", "旧批次上传不能抹掉服务器已发布的版本")
+        self.assertEqual(json.loads((root / "current.json").read_text(encoding="utf-8"))["version"],
+                         "r1-server")
+
+    def test_version_index_records_submission_ownership(self):
+        root = Path(self.temp.name) / "index-root"
+        submission = {"id": "sub-own-1", "project_revision": 7,
+                      "snapshot_fingerprint": "a" * 64}
+        actor = {"username": "reviewer", "role": "reviewer"}
+        for version in ("r7-aaa", "r7-bbb"):
+            CentralLibrary._record_delivery_version(
+                _DeliveryIndexShim(), root, "BOOK-A", submission, actor, version,
+                "2026-11-05T00:00:00Z")
+        index = json.loads((root / "versions" / "index.json").read_text(encoding="utf-8"))
+        self.assertEqual([item["version"] for item in index["versions"]], ["r7-aaa", "r7-bbb"])
+        self.assertEqual(index["versions"][0]["submission_id"], "sub-own-1")
+        self.assertEqual(index["versions"][0]["snapshot_fingerprint"], "a" * 64)
+        # Re-publishing the same version replaces rather than duplicates it.
+        CentralLibrary._record_delivery_version(
+            _DeliveryIndexShim(), root, "BOOK-A", submission, actor, "r7-aaa",
+            "2026-11-05T01:00:00Z")
+        refreshed = json.loads((root / "versions" / "index.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(refreshed["versions"]), 2)
