@@ -314,6 +314,76 @@ class CentralLibraryTests(unittest.TestCase):
         self.assertEqual(regenerated['submission_id'], submission['id'])
 
     # ------------------------------------------------------------------
+    # 部分放行：没审完也能出包，但没放行的页面绝不进包
+    # ------------------------------------------------------------------
+    def _two_page_submission(self):
+        opened = self.library.open(self.marker, {'book_id': self.book_id, 'client_id': 'marker-desk'})
+        project = copy.deepcopy(opened['project'])
+        project.update(language='zh', stage='小学', grade='六年级', subject='数学')
+        pages = project['pages']
+        self.assertGreaterEqual(len(pages), 2)
+        answer_page = copy.deepcopy(pages[1])
+        answer_page.pop('questions', None)
+        questions, answers = [], []
+        for index, page in enumerate(pages[:2]):
+            question = data.new_record([0, 0, 500, 240], major_number='一', text=f'第{index + 1}题',
+                                       question_type='填空题', difficulty='基础', knowledge_points=['几何'],
+                                       illustrations=[{'bbox': [20, 20, 220, 220],
+                                                       'image_kind': 'question_image'}])
+            answer = data.new_record([0, 0, 500, 240], answer=True, major_number='一', analysis='解析')
+            answer['answer'] = str(index + 1)
+            page.update(status='accepted', questions=[question])
+            questions.append(question)
+            answers.append(answer)
+        answer_page.update(status='accepted', answers=answers)
+        project['answer_pages'] = [answer_page]
+        for question, answer in zip(questions, answers):
+            data.set_pair(project, question['id'], [answer['id']])
+        # 直接落盘：这两页测试要复用第 2 张扫描件做答案页，走 save-cache 会被
+        # "原教材页面清单不能由客户端更换" 挡下来（那是防止客户端偷换原图）。
+        data.save_project(project, self.library.project_file(self.book_id))
+        self.operate(self.marker, '/api/review/submit')
+        return self.store.list_submissions(self.reviewer)[0]
+
+    def test_partial_approval_ships_only_approved_pages_and_overwrites_on_regenerate(self):
+        submission = self._two_page_submission()
+        detail = self.store.submission(self.reviewer, submission['id'])
+        for page in detail['pages']:
+            if page['kind'] == 'answer' or page['page_index'] == 0:
+                self.store.decide_page(self.reviewer, submission['id'], page['page_key'], 'approved', '')
+        # 只放行第 1 页，仍然可以生成——这正是"不必等整本审完"。
+        self.store.retry_delivery(self.reviewer, self.book_id, force=True)
+        first = self.store.run_next_delivery_job()
+        self.assertEqual(first['status'], 'succeeded', first.get('error'))
+        self.assertTrue(first['partial'])
+        self.assertEqual((first['approved_pages'], first['total_pages']), (1, 2))
+        output = Path(first['output_path'])
+        rows = [json.loads(line) for line in
+                (output / 'k12_dataset' / 'dataset.jsonl').read_text(encoding='utf-8').splitlines() if line.strip()]
+        self.assertEqual([row['data']['question'] for row in rows], ['第1题'])
+        generation = json.loads((output / 'generation.json').read_text(encoding='utf-8'))
+        self.assertTrue(generation['partial'])
+        first_ids = {row['source']['internal_question_id']: row['id'] for row in rows}
+
+        # 整本放行后自动补一版完整的；同一道题沿用同一个 sample id，旧版本目录被清掉。
+        for page in detail['pages']:
+            if page['review_status'] != 'approved':
+                self.store.decide_page(self.reviewer, submission['id'], page['page_key'], 'approved', '')
+        second = self.store.run_next_delivery_job()
+        self.assertEqual(second['status'], 'succeeded', second.get('error'))
+        self.assertFalse(second['partial'])
+        self.assertEqual(second['approved_pages'], 2)
+        final = Path(second['output_path'])
+        rows = [json.loads(line) for line in
+                (final / 'k12_dataset' / 'dataset.jsonl').read_text(encoding='utf-8').splitlines() if line.strip()]
+        self.assertEqual([row['data']['question'] for row in rows], ['第1题', '第2题'])
+        self.assertEqual(rows[0]['id'], first_ids[rows[0]['source']['internal_question_id']])
+        versions = self.root / 'final-output' / self.book_id / 'versions'
+        self.assertEqual([path.name for path in versions.iterdir() if path.is_dir()], [second['version']])
+        current = json.loads((self.root / 'final-output' / self.book_id / 'current.json').read_text(encoding='utf-8'))
+        self.assertFalse(current['partial'])
+
+    # ------------------------------------------------------------------
     # 实时样例题库：单题够格就产出，不需要整本审核
     # ------------------------------------------------------------------
     def _ready_project(self, difficulty='基础'):

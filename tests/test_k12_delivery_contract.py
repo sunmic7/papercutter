@@ -7,6 +7,7 @@ N3 备注给出 13 个核心字段与六个字段的枚举词表，H3 是 15 条
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +17,7 @@ import numpy as np
 
 from review_tools import manual_annotation_data as data
 from review_tools.delivery_workspace import (
+    _DeliveryIdentity,
     _k12_text,
     _mask_pii,
     _strip_noise,
@@ -61,8 +63,8 @@ def build_project(root: Path, *, texts: list[str], difficulty: str = "中等",
     return path
 
 
-def deliver(project_path: Path, runtime: Path) -> tuple[list[dict], Path]:
-    result = sync_delivery_workspace(project_path, runtime, materialize_all=True)
+def deliver(project_path: Path, runtime: Path, **kwargs) -> tuple[list[dict], Path]:
+    result = sync_delivery_workspace(project_path, runtime, materialize_all=True, **kwargs)
     delivery = Path(result["output_path"])
     text = (delivery / "k12_dataset" / "dataset.jsonl").read_text(encoding="utf-8")
     return [json.loads(line) for line in text.splitlines() if line.strip()], delivery
@@ -270,6 +272,77 @@ class DeliveryDiagnosisTests(unittest.TestCase):
                                 .read_text(encoding="utf-8"))
             self.assertTrue(report["reason_summary"])
             self.assertEqual(report["reason_summary"][0]["count"], 1)
+
+
+class IdentityOverwriteTests(unittest.TestCase):
+    """同一道题重出就顶掉旧的：一个题目只对应一条样本、一个 id。"""
+
+    def test_same_question_updates_in_place_and_retires_old_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            identity = _DeliveryIdentity(Path(directory) / "identity.sqlite3")
+            try:
+                first = identity.claim("B1#Q1", "B1", "hash-a")
+                self.assertEqual(first["status"], "new")
+                self.assertEqual(identity.claim("B1#Q1", "B1", "hash-a"),
+                                 {"status": "kept", "id": first["id"]})
+                changed = identity.claim("B1#Q1", "B1", "hash-b")
+                self.assertEqual(changed["status"], "updated")
+                self.assertEqual(changed["id"], first["id"])
+                # 旧内容已经被顶掉，别的书再用同一段内容不算重复；
+                # 新内容已经属于 B1，别的书撞上才算跨批次重复。
+                self.assertEqual(identity.claim("B2#Q1", "B2", "hash-a")["status"], "new")
+                self.assertEqual(identity.claim("B2#Q2", "B2", "hash-b")["status"], "conflict")
+            finally:
+                identity.close()
+
+    def test_regenerating_after_editing_the_answer_keeps_one_sample(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = build_project(root, texts=["同一道题"])
+            rows, delivery = deliver(path, root / "runtime")
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["data"]["answer"], "42")
+            project = data.load_project(path)
+            project["answer_pages"][0]["answers"][0]["answer"] = "43"
+            data.save_project(project, path, increment_revision=False)
+            rows2, _delivery = deliver(path, root / "runtime")
+            self.assertEqual(len(rows2), 1, "改答案后不能变成两条样本")
+            self.assertEqual(rows2[0]["id"], rows[0]["id"], "同一道题必须沿用同一个 id")
+            self.assertEqual(rows2[0]["data"]["answer"], "43")
+            database = next(delivery.parent.glob("delivery_identity.sqlite3"))
+            connection = sqlite3.connect(str(database))
+            try:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM samples").fetchone()[0], 1)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM questions").fetchone()[0], 1)
+            finally:
+                connection.close()
+
+
+class PartialApprovalTests(unittest.TestCase):
+    """部分放行：只收录"题目页和答案页都放行"的题，页号按 (种类, 序号) 判。"""
+
+    def test_only_pages_approved_in_both_lists_reach_the_package(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = build_project(root, texts=["题一"])
+            self.assertEqual(deliver(path, root / "runtime", allowed_pages=set())[0], [])
+            # 只放行题目页：答案还没复核，这一题不能进包。
+            self.assertEqual(
+                deliver(path, root / "runtime", allowed_pages={("question", 0)})[0], [])
+            rows, _delivery = deliver(
+                path, root / "runtime",
+                allowed_pages={("question", 0), ("answer", 0)})
+            self.assertEqual(len(rows), 1)
+
+    def test_unapproved_question_is_reported_not_silently_dropped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = build_project(root, texts=["题一"])
+            _rows, delivery = deliver(path, root / "runtime", allowed_pages=set())
+            report = json.loads((delivery / "k12_dataset" / "quality_report.json")
+                                .read_text(encoding="utf-8"))
+            reasons = {row["reason"] for row in report["reason_summary"]}
+            self.assertIn("该题所在页面尚未审核放行", reasons)
 
 
 if __name__ == "__main__":

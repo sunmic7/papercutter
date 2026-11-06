@@ -120,12 +120,23 @@ def _content_signature(sample: dict) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-class _DeliveryIdentity:
-    """跨批次样本身份库（sqlite）：全局发号 + 内容指纹去重。
+def _stamp() -> str:
+    return datetime.now().isoformat(timespec="seconds")
 
-    甲方备注第 2 条要求首批 1000 万组、后续增量不得重复，H3⑩ 又要求重复率
-    ≤0.1%。包内序号 ``0000001`` 在不同批次必然撞车，所以样本 id 必须由一个
-    跨批次单调递增的发号器给出；内容指纹同样要跨批次留存。
+
+class _DeliveryIdentity:
+    """跨批次样本身份库（sqlite）：题目身份 → 样本 id，外加内容指纹去重。
+
+    两张表回答两个不同的问题，混用会出错：
+
+    * ``questions``（``<教材>#<题目持久 id>``）回答"这是不是同一道题"。同一道题
+      重出——哪怕答案改过——都复用同一个 sample_id，新的 JSON 直接覆盖旧的，
+      旧内容不会作为另一条样本留在包里。
+    * ``samples``（内容指纹）回答"这段内容有没有在别的书里交付过"，对应甲方
+      备注第 2 条与 H3⑩。
+
+    两者分开的直接后果：改答案不再等于"又一道新题"。以前按内容指纹发号，
+    改一个字就是新 id，旧 id 那条错数据还留在身份库里。
 
     存 sqlite 而不是 JSON：1000 万条指纹的 JSON 全量读写在每次出包时都不可行。
     """
@@ -136,12 +147,17 @@ class _DeliveryIdentity:
         if self.path is None:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(str(self.path), timeout=30)
+        self.connection = sqlite3.connect(str(self.path), timeout=60)
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.executescript(
             "CREATE TABLE IF NOT EXISTS samples ("
             " content_hash TEXT PRIMARY KEY, book_id TEXT NOT NULL,"
             " sample_id TEXT NOT NULL, created_at TEXT NOT NULL);"
+            "CREATE TABLE IF NOT EXISTS questions ("
+            " question_key TEXT PRIMARY KEY, book_id TEXT NOT NULL,"
+            " sample_id TEXT NOT NULL, content_hash TEXT NOT NULL,"
+            " updated_at TEXT NOT NULL);"
+            "CREATE INDEX IF NOT EXISTS idx_questions_hash ON questions(content_hash);"
             "CREATE TABLE IF NOT EXISTS counter ("
             " name TEXT PRIMARY KEY, value INTEGER NOT NULL);"
             "INSERT OR IGNORE INTO counter(name, value) VALUES ('sample_id', 1);"
@@ -149,6 +165,7 @@ class _DeliveryIdentity:
         self.connection.commit()
 
     def lookup(self, content_hash: str) -> dict | None:
+        """Content-level owner (read-only). Used by the dry-run diagnosis."""
         if self.connection is None:
             return None
         row = self.connection.execute(
@@ -156,27 +173,72 @@ class _DeliveryIdentity:
         ).fetchone()
         return None if row is None else {"book_id": row[0], "id": row[1]}
 
-    def allocate(self, content_hash: str, book_id: str) -> str:
-        """Reserve the next global sample id and record the fingerprint atomically."""
+    def claim(self, question_key: str, book_id: str, content_hash: str) -> dict:
+        """Resolve one question to its stable sample id, inside a single transaction.
+
+        Returns ``{"status": ..., "id": ...}`` where status is:
+
+        ``kept``      同一道题、内容没变，沿用原 id；
+        ``updated``   同一道题、内容改过，沿用原 id 并顶掉旧内容指纹（旧 JSON 作废）；
+        ``reused``    同书同内容的历史样本（升级前的库没有题目身份），复用其 id；
+        ``new``       新题，发新号；
+        ``conflict``  同内容已在别的书交付过，按甲方备注第 2 条拒收。
+        """
         if self.connection is None:
-            return "0000001"
+            return {"status": "new", "id": "0000001"}
         cursor = self.connection.cursor()
         try:
             cursor.execute("BEGIN IMMEDIATE")
-            value = cursor.execute(
-                "SELECT value FROM counter WHERE name = 'sample_id'").fetchone()[0]
-            cursor.execute("UPDATE counter SET value = value + 1 WHERE name = 'sample_id'")
-            sample_id = f"{int(value):07d}"
+            row = cursor.execute(
+                "SELECT sample_id, content_hash FROM questions WHERE question_key = ?",
+                (question_key,)).fetchone()
+            if row is not None:
+                sample_id, previous = str(row[0]), str(row[1])
+                if previous == content_hash:
+                    self.connection.commit()
+                    return {"status": "kept", "id": sample_id}
+                # 同一道题改了内容：旧指纹如果是别的题目共用的就留着，
+                # 否则删掉——被顶掉的那条 JSON 不再算作已交付内容。
+                cursor.execute(
+                    "DELETE FROM samples WHERE content_hash = ?"
+                    " AND NOT EXISTS (SELECT 1 FROM questions"
+                    "                 WHERE content_hash = ? AND question_key <> ?)",
+                    (previous, previous, question_key))
+                cursor.execute(
+                    "INSERT OR REPLACE INTO samples(content_hash, book_id, sample_id, created_at)"
+                    " VALUES (?, ?, ?, ?)", (content_hash, book_id, sample_id, _stamp()))
+                cursor.execute(
+                    "UPDATE questions SET content_hash = ?, updated_at = ? WHERE question_key = ?",
+                    (content_hash, _stamp(), question_key))
+                self.connection.commit()
+                return {"status": "updated", "id": sample_id}
+            owner = cursor.execute(
+                "SELECT book_id, sample_id FROM samples WHERE content_hash = ?",
+                (content_hash,)).fetchone()
+            if owner is not None and str(owner[0]) != book_id:
+                self.connection.commit()
+                return {"status": "conflict", "id": "", "book_id": str(owner[0])}
+            if owner is not None:
+                sample_id, status = str(owner[1]), "reused"
+            else:
+                value = cursor.execute(
+                    "SELECT value FROM counter WHERE name = 'sample_id'").fetchone()[0]
+                cursor.execute("UPDATE counter SET value = value + 1 WHERE name = 'sample_id'")
+                sample_id = f"{int(value):07d}"
+                cursor.execute(
+                    "INSERT OR REPLACE INTO samples(content_hash, book_id, sample_id, created_at)"
+                    " VALUES (?, ?, ?, ?)", (content_hash, book_id, sample_id, _stamp()))
+                status = "new"
             cursor.execute(
-                "INSERT OR REPLACE INTO samples(content_hash, book_id, sample_id, created_at)"
-                " VALUES (?, ?, ?, ?)",
-                (content_hash, book_id, sample_id, datetime.now().isoformat(timespec="seconds")),
-            )
+                "INSERT OR REPLACE INTO questions"
+                "(question_key, book_id, sample_id, content_hash, updated_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (question_key, book_id, sample_id, content_hash, _stamp()))
             self.connection.commit()
+            return {"status": status, "id": sample_id}
         except Exception:
             self.connection.rollback()
             raise
-        return sample_id
 
     def close(self) -> None:
         if self.connection is not None:
@@ -438,11 +500,17 @@ def _k12_validation(sample: dict, image_sizes: list[tuple[int, int]]) -> list[st
 
 def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_rows: list,
                         question_relations: dict[str, dict], *, changed_page_index: int | None,
-                        materialize_all: bool, identity_path: Path | None = None) -> dict:
+                        materialize_all: bool, identity_path: Path | None = None,
+                        allowed_pages: set[tuple[str, int]] | None = None) -> dict:
     """Build the customer-facing UTF-8 JSONL and meaningful illustration crops.
 
     Internal Q/A crops remain available for audit, but answer screenshots and whole-question
     screenshots are deliberately not referenced by this formal dataset.
+
+    ``allowed_pages`` restricts the package to pages whose review decision is
+    "approved", tagged as ``("question", index)`` / ``("answer", index)`` — the two
+    lists are numbered independently, so a bare index cannot tell them apart.
+    ``None`` means the caller already gated the whole book.
     """
     k12_root = root / "k12_dataset"
     pages_root = k12_root / "pages"
@@ -475,6 +543,7 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
     identity = _DeliveryIdentity(identity_path)
     book_id = str(project["delivery_book_id"])
     claimed_signatures: dict[str, str] = {}
+    identity_counts: dict[str, int] = {}
     for global_order, (page_index, page, question) in enumerate(ordered_questions, 1):
         page_number = page_index + 1
         page_folder = f"P{page_number:04d}"
@@ -577,26 +646,36 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
             errors.append("题目尚未匹配答案")
         elif any(str(item[1].get("status", "")) != "accepted" for item in answer_infos):
             errors.append("答案页尚未确认")
+        # 部分放行时，一道题只有在题干页和答案页都审核放行后才进包；
+        # 否则会把没复核过的答案交付出去。
+        if allowed_pages is not None:
+            if ("question", page_index) not in allowed_pages or any(
+                    ("answer", int(item[0])) not in allowed_pages for item in answer_infos):
+                errors.append("该题所在页面尚未审核放行")
         eligible = (str(page.get("status", "")) == "accepted"
                     and relation.get("status") == "accepted"
                     and bool(answer_infos) and all(str(item[1].get("status", "")) == "accepted" for item in answer_infos)
                     and not errors)
         sample_id = f"{global_order:07d}"
+        identity_status = ""
         if eligible:
-            # 跨批次身份：同一内容在别的书里交付过就是重复（备注第 2 条），
-            # 同一本书重出则复用旧 id，保证样本 id 跨版本稳定。
-            owner = identity.lookup(signature)
-            if owner and str(owner.get("book_id", "")) != book_id:
-                errors.append(f"与教材 {owner.get('book_id')} 已交付样本内容重复（备注2）")
+            # 同一道题只保留一条样本：题目身份（教材 + 题目持久 id）决定 sample_id，
+            # 重出时不论谁点的生成，都沿用同一个 id 并顶掉旧内容——旧 JSON 作废。
+            # 内容指纹只用于跨书查重（甲方备注第 2 条 / H3⑩）。
+            question_key = f"{book_id}#{question.get('delivery_id') or question.get('id') or global_order}"
+            claim = identity.claim(question_key, book_id, signature)
+            if claim["status"] == "conflict":
+                errors.append(f"与教材 {claim.get('book_id')} 已交付样本内容重复（备注2）")
                 eligible = False
-            elif owner:
-                sample_id = str(owner.get("id") or sample_id)
             else:
-                sample_id = identity.allocate(signature, book_id)
-            claimed_signatures[signature] = sample_id
+                sample_id = str(claim.get("id") or sample_id)
+                identity_status = claim["status"]
+                claimed_signatures[signature] = sample_id
+                identity_counts[identity_status] = identity_counts.get(identity_status, 0) + 1
         report_items.append({"id": sample_id, "page": page_index + 1,
                              "question_number": data.display_number(question),
-                             "eligible": eligible, "errors": errors})
+                             "eligible": eligible, "errors": errors,
+                             "identity": identity_status})
         if eligible:
             sample, image_targets = build_sample(sample_id)
             for target, box in image_targets:
@@ -623,6 +702,8 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
     # operators can audit the book page-by-page without gaps.
     active_page_indexes = ({index for index in range(len(project.get("pages", [])))}
                            if materialize_all else ({changed_page_index} if changed_page_index is not None else set()))
+    if allowed_pages is not None:
+        active_page_indexes &= {index for kind, index in allowed_pages if kind == "question"}
     active_page_indexes.update(
         int(path.name[1:]) - 1 for path in pages_root.glob("P[0-9][0-9][0-9][0-9]")
         if path.is_dir()
@@ -643,11 +724,13 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
     report = {"schema_version": 1, "total_questions": len(ordered_questions),
               "eligible_count": len(lines), "rejected_count": len(ordered_questions) - len(lines),
               "reason_summary": _reason_summary(report_items),
+              "identity_summary": identity_counts,
               "items": report_items}
     _atomic_json(k12_root / "quality_report.json", report)
     _atomic_json(k12_root / "coverage_report.json", _coverage_summary(lines))
     return {"dataset_file": str(dataset_path), "eligible_count": len(lines),
-            "rejected_count": report["rejected_count"]}
+            "rejected_count": report["rejected_count"],
+            "identity_summary": identity_counts}
 
 
 def _reason_summary(items: list[dict], limit: int = 40) -> list[dict]:
@@ -1044,7 +1127,8 @@ def sync_delivery_workspace(project_path: str | Path, runtime_root: str | Path,
                             materialize_all: bool = False,
                             changed_record_ids: list[str] | None = None,
                             identity_path: str | Path | None = None,
-                            output_root: str | Path | None = None) -> dict:
+                            output_root: str | Path | None = None,
+                            allowed_pages: set[tuple[str, int]] | None = None) -> dict:
     """Sync edited delivery artifacts and rebuild the small authoritative indexes.
 
     Crops are rewritten only when their source signature changes. JSON is cheap and is
@@ -1053,6 +1137,9 @@ def sync_delivery_workspace(project_path: str | Path, runtime_root: str | Path,
     ``output_root`` overrides where the package is written.  The incremental
     "ready samples" view of a book keeps its own root so that un-reviewed work
     can never overwrite a published delivery version.
+
+    ``allowed_pages`` limits the package to pages already approved in review, so a
+    book can be generated before the whole book has been signed off.
     """
     project_file = Path(project_path).resolve()
     project = data.load_project(project_file)
@@ -1232,6 +1319,7 @@ def sync_delivery_workspace(project_path: str | Path, runtime_root: str | Path,
         # 交付根级路径，否则会变成"每个版本一份空库"、跨批次去重形同虚设。
         identity_path=Path(identity_path) if identity_path is not None
         else root.parent / "delivery_identity.sqlite3",
+        allowed_pages=(set(allowed_pages) if allowed_pages is not None else None),
     )
     # Delivery generation may assign missing public IDs, but it is part of the
     # caller's logical mutation and must not advance the renderer CAS revision
