@@ -11,7 +11,8 @@ import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 
 import cv2
 import numpy as np
@@ -363,6 +364,20 @@ class CentralLibraryTests(unittest.TestCase):
         self.assertEqual([row['data']['question'] for row in rows], ['第1题'])
         generation = json.loads((output / 'generation.json').read_text(encoding='utf-8'))
         self.assertTrue(generation['partial'])
+        # 逐页结果必须和包里的实际内容对得上：第 1 页收录，第 2 页没放行。
+        coverage = json.loads((output / 'page_coverage.json').read_text(encoding='utf-8'))
+        self.assertEqual(coverage['summary']['question_pages'], 2)
+        self.assertEqual(coverage['summary']['delivered_pages'], 1)
+        self.assertEqual(coverage['summary']['skipped_pages'], 1)
+        self.assertEqual(coverage['summary']['answer_skipped_pages'], 0)
+        question_rows = {row['page']: row for row in coverage['pages'] if row['kind'] == 'question'}
+        self.assertEqual(question_rows[1]['status'], 'delivered')
+        self.assertEqual(question_rows[1]['delivered'], 1)
+        self.assertEqual(question_rows[2]['status'], 'skipped')
+        self.assertIn('未审核放行', ' '.join(question_rows[2]['reasons']))
+        served = self.library.delivery_page_coverage(self.reviewer, self.book_id)
+        self.assertTrue(served['available'])
+        self.assertEqual(served['summary']['delivered_pages'], 1)
         first_ids = {row['source']['internal_question_id']: row['id'] for row in rows}
 
         # 整本放行后自动补一版完整的；同一道题沿用同一个 sample id，旧版本目录被清掉。
@@ -382,6 +397,27 @@ class CentralLibraryTests(unittest.TestCase):
         self.assertEqual([path.name for path in versions.iterdir() if path.is_dir()], [second['version']])
         current = json.loads((self.root / 'final-output' / self.book_id / 'current.json').read_text(encoding='utf-8'))
         self.assertFalse(current['partial'])
+
+        # 网页上的「页面明细」走的是这个 HTTP 路由，不能只验 store 方法。
+        handler = type('PageCoverageReview', (ReviewHandler,),
+                       {'store': self.store, 'log_message': lambda *args: None})
+        server = ThreadingHTTPServer(('127.0.0.1', 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            _actor, token = self.session_actor(self.reviewer)
+            url = (f"http://127.0.0.1:{server.server_port}"
+                   f"/api/deliveries/{self.book_id}/pages")
+            with urlopen(Request(url, headers={'Authorization': f'Bearer {token}'}), timeout=5) as response:
+                payload = json.loads(response.read().decode('utf-8'))
+            self.assertTrue(payload['available'])
+            self.assertEqual(payload['summary']['delivered_pages'], 2)
+            _marker, marker_token = self.session_actor(self.marker)
+            with self.assertRaises(HTTPError) as denied:
+                urlopen(Request(url, headers={'Authorization': f'Bearer {marker_token}'}), timeout=5)
+            self.assertEqual(denied.exception.code, 403)
+        finally:
+            server.shutdown()
+            server.server_close()
 
     # ------------------------------------------------------------------
     # 实时样例题库：单题够格就产出，不需要整本审核
@@ -692,6 +728,49 @@ class DistributedServerCroppingTests(unittest.TestCase):
         self.assertIn('缺少难度', reasons)
         self.assertIn('缺少知识点', reasons)
         self.assertTrue(report['items'])
+
+
+class PageCoverageTests(unittest.TestCase):
+    """生成后的逐页结果：一页到底进包了没有，必须能一眼看懂。"""
+
+    def test_page_status_classification_and_reason_cleanup(self):
+        from online_review_beta.central_library import build_page_coverage
+        decisions = {("question", 0): "approved", ("question", 1): "approved",
+                     ("question", 2): "approved", ("question", 3): "pending",
+                     ("question", 4): "approved",
+                     ("answer", 0): "approved", ("answer", 1): "pending"}
+        items = [
+            {"page": 1, "eligible": True, "errors": []},
+            {"page": 1, "eligible": True, "errors": []},
+            {"page": 2, "eligible": True, "errors": []},
+            {"page": 2, "eligible": False, "errors": ["缺少标准答案"]},
+            {"page": 3, "eligible": False, "errors": ["缺少题目文本", "缺少有效题图"]},
+            {"page": 4, "eligible": False, "errors": ["该题所在页面尚未审核放行"]},
+        ]
+        report = build_page_coverage(book_id='b1', version='v1', partial=True,
+                                     decisions=decisions, items=items, generated_at='now')
+        summary = report['summary']
+        self.assertEqual(summary['question_pages'], 5)
+        self.assertEqual(summary['delivered_pages'], 1)
+        self.assertEqual(summary['partial_pages'], 1)
+        self.assertEqual(summary['failed_pages'], 1)
+        self.assertEqual(summary['skipped_pages'], 1)
+        self.assertEqual(summary['no_question_pages'], 1)
+        self.assertEqual(summary['answer_pages'], 2)
+        self.assertEqual(summary['answer_skipped_pages'], 1)
+        rows = {row['page']: row for row in report['pages'] if row['kind'] == 'question'}
+        self.assertEqual(rows[2]['status'], 'partial')
+        self.assertEqual(rows[2]['reasons'], ['缺少标准答案'])
+        self.assertEqual(rows[3]['status'], 'failed')
+        self.assertEqual(len(rows[3]['reasons']), 2)
+        # 页级已经说明"未放行"了，题级那句重复原因不该再出现。
+        self.assertEqual(rows[4]['reasons'], ['页面未审核放行，整页未进包'])
+        self.assertEqual(rows[5]['status'], 'no_question')
+        answer = [row for row in report['pages'] if row['kind'] == 'answer']
+        self.assertEqual([row['status'] for row in answer], ['delivered', 'skipped'])
+        self.assertTrue(report['partial'])
+        self.assertEqual(report['generated_at'], 'now')
+
 
 if __name__ == '__main__':
     unittest.main()

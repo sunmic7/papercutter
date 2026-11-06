@@ -741,7 +741,10 @@ def _reason_summary(items: list[dict], limit: int = 40) -> list[dict]:
             bucket = buckets.setdefault(
                 reason, {"reason": reason, "count": 0, "questions": []})
             bucket["count"] += 1
-            label = str(item.get("question_number") or "")
+            number = str(item.get("question_number") or "").strip()
+            page = item.get("page")
+            # 只写题号时操作员还得回逐题明细里找页码，直接给出"第几页 题号"。
+            label = f"第{page}页 {number}" if number and page else number
             if label and len(bucket["questions"]) < 5 and label not in bucket["questions"]:
                 bucket["questions"].append(label)
     return sorted(buckets.values(), key=lambda row: (-row["count"], row["reason"]))[:limit]

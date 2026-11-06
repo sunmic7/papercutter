@@ -59,9 +59,14 @@ class ReviewHandlerAttributeTests(unittest.TestCase):
         self.assertIn("self.store.library.diagnose_delivery(", source)
         self.assertNotIn("self.library.diagnose_delivery(", source)
 
+    def test_page_coverage_route_uses_store_library(self):
+        source = SERVER.read_text(encoding="utf-8")
+        self.assertIn("self.store.library.delivery_page_coverage(", source)
+        self.assertNotIn("self.library.delivery_page_coverage(", source)
+
     def test_delivery_preview_routes_exist(self):
         source = SERVER.read_text(encoding="utf-8")
-        for route in ('"diagnosis"', '"dataset"', '"samples"', '"sample-image"', '"notes"'):
+        for route in ('"diagnosis"', '"dataset"', '"samples"', '"sample-image"', '"notes"', '"pages"'):
             self.assertIn(route, source)
 
 
