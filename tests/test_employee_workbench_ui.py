@@ -523,7 +523,8 @@ class EmployeeWorkbenchInteractionTests(unittest.TestCase):
         self.assertIn('id="pfMatchSearch"', source)
         self.assertIn("paperFlowMatchingRequestToken", source)
         self.assertIn("requestToken !== this.paperFlowMatchingRequestToken", source)
-        self.assertIn("paperFlowPageOrderCache", source)
+        # 页码按「所在页签内的序号」算，不再用合并排序的全书序号（见 test_annotation_page_numbers）
+        self.assertIn("paperFlowSourcePageNumber(page, pageIndex, kind = this.paperFlowKind)", source)
         self.assertIn("paperflow-answer-candidate", css)
 
     def test_matching_filters_unfinished_work_and_supports_safe_batch_accept(self):
