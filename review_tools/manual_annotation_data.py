@@ -23,6 +23,16 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
 REGION_ROLES = {"question", "group", "continuation", "shared_material"}
 ANSWER_MODES = {"textbook", "generate_later", "mixed"}
 DELIVERY_ID_PATTERN = re.compile(r"^[A-Za-z0-9]+$")
+# 新教材预置的分组数量。标注员按「第几组」组织题目（一本书通常 8~12 组），
+# 先备好下拉项比每本书都手工点「创建分组」省事；没用到的分组不会进交付。
+DEFAULT_MATCH_SCOPE_COUNT = 10
+
+
+def default_match_scopes(count: int = DEFAULT_MATCH_SCOPE_COUNT) -> list[dict]:
+    """Build the ready-to-use match scopes every new textbook starts with."""
+    return [{"id": "scope-" + uuid.uuid4().hex, "name": str(index)}
+            for index in range(1, max(0, int(count)) + 1)]
+
 GENERATED_DELIVERY_MARKERS = {"manifest.json", "database_import.json", "quality_report.json"}
 # 记录级"后端独占"字段：渲染层从不写它们，整工程 autosave 时必须原样接住。
 # 这是 R2 的唯一防线 —— 少了它，员工用旧版 Electron 打开工程点一次保存，
@@ -136,25 +146,21 @@ def extract_major_number(title: object, fallback: object = "") -> str:
     for pattern in patterns:
         match = re.match(pattern, text)
         if match:
-            return int_to_chinese(match.group(1))
+            return str(chinese_number_to_int(match.group(1)))
     if text and text[:1] in _CIRCLED_NUMBERS:
-        return int_to_chinese(_CIRCLED_NUMBERS.index(text[0]) + 1)
-    return int_to_chinese(fallback) if str(fallback or "").strip() else ""
+        return str(_CIRCLED_NUMBERS.index(text[0]) + 1)
+    return _canonical_number(fallback) if str(fallback or "").strip() else ""
 
 
 def extract_subsection_number(title: object) -> str:
     """Return ordinals from group headings such as '（二）课外阅读'."""
     text = re.sub(r"\s+", "", str(title or ""))
     match = re.match(r"^[（(]([一二三四五六七八九十百千〇零两]+|\d{1,3})[）)]", text)
-    return int_to_chinese(match.group(1)) if match else ""
+    return str(chinese_number_to_int(match.group(1))) if match else ""
 
 
 def _canonical_number(value: object) -> str:
-    """排版归一（全角/括号/「第…题」后缀），但不做中文数字↔阿拉伯转换。
-
-    「二」和「2」是两套编号体系，同一本书里可以同时出现且互不相同；
-    括号（（二）→ 二）只是排版差异，仍然视为同一个号。
-    """
+    """统一题号为阿拉伯数字，保留非数字标签与正文标题原文。"""
     text = re.sub(r"\s+", "", str(value or "")).translate(
         str.maketrans("０１２３４５６７８９", "0123456789")
     ).replace("（", "(").replace("）", ")").replace("【", "[").replace("】", "]")
@@ -164,6 +170,9 @@ def _canonical_number(value: object) -> str:
     while len(text) >= 2 and any(text.startswith(left) and text.endswith(right)
                                  for left, right in wrappers):
         text = text[1:-1].strip()
+    ordinal = chinese_number_to_int(text)
+    if ordinal is not None:
+        return str(ordinal)
     match = re.fullmatch(r"0*(\d+)(.*)", text)
     return f"{int(match.group(1))}{match.group(2)}" if match else text.lower()
 
@@ -171,7 +180,7 @@ def _canonical_number(value: object) -> str:
 def _normalize_number_path(value: object) -> list[str]:
     if not isinstance(value, (list, tuple)):
         return []
-    return [str(item or "").strip() for item in value if str(item or "").strip()][:8]
+    return [_canonical_number(item) for item in value if str(item or "").strip()][:8]
 
 
 def number_path(record: dict) -> list[str]:
@@ -279,7 +288,7 @@ def normalize_record(record: dict) -> dict:
         region_role = "group"
     path = _normalize_number_path(record.get("number_path", []))
     if not path:
-        path = [part for part in (major_number, subsection_number, minor) if part]
+        path = [_canonical_number(part) for part in (major_number, subsection_number, minor) if part]
     if path:
         major_number = path[0]
         minor = path[-1] if region_role == "question" and len(path) >= 2 else ""
@@ -347,6 +356,8 @@ def apply_enrich_defaults(record: dict) -> dict:
 def _clone(value):
     """深拷贝一个 JSON 值；用于把默认值/权威字段接进另一条记录。"""
     if isinstance(value, (dict, list)):
+        if not value:
+            return value.copy()
         return json.loads(json.dumps(value, ensure_ascii=False))
     return value
 
@@ -510,7 +521,7 @@ def create_project(question_root: str, answer_root: str = "", profile: str = "ge
         "answer_image_root": a_root,
         "answer_pages": _page_records(Path(a_root), "answers", profile) if a_root else [],
         "ignored_pages": [],
-        "match_scopes": [],
+        "match_scopes": default_match_scopes(),
         "answer_mode": "textbook",
         "ocr_settings": {"auto_page_ocr_on_confirm": True},
         "pairs": [],
@@ -540,7 +551,7 @@ def create_book_project(book_root: str, profile: str = "general") -> dict:
         "answer_image_root": "",
         "answer_pages": [],
         "ignored_pages": [],
-        "match_scopes": [],
+        "match_scopes": default_match_scopes(),
         "answer_mode": "textbook",
         "ocr_settings": {"auto_page_ocr_on_confirm": True},
         "pairs": [],
@@ -644,6 +655,7 @@ def merge_persistent_delivery_state(incoming: dict, existing: dict) -> None:
         "book_root", "image_root", "answer_image_root",
         "delivery_output_root", "language", "stage", "grade", "subject",
         "profile", "profile_source", "profile_reason", "profile_locked",
+        "online_review_base_revision",
         *ENRICH_PERSISTENT_PROJECT_KEYS,
     ):
         if key in existing:
@@ -971,7 +983,8 @@ def load_project(path: str | os.PathLike[str]) -> dict:
 def ensure_ids(project: dict) -> None:
     for page in project.get("pages", []):
         for record in page.get("questions", []):
-            record.setdefault("id", "q-" + uuid.uuid4().hex)
+            if "id" not in record:
+                record["id"] = "q-" + uuid.uuid4().hex
             normalize_record(record)
         groups = [
             record for record in page.get("questions", [])
@@ -991,13 +1004,19 @@ def ensure_ids(project: dict) -> None:
                 record["parent_id"] = parent["id"]
     for page in project.get("answer_pages", []):
         for record in page.get("answers", []):
-            record.setdefault("id", "a-" + uuid.uuid4().hex)
+            if "id" not in record:
+                record["id"] = "a-" + uuid.uuid4().hex
             normalize_record(record)
 
 
 def source_path(project: dict, page: dict, answer: bool = False) -> str:
     root = project.get("answer_image_root" if answer else "image_root", "")
     resolved_root = Path(str(root)).resolve()
+    return _source_path_in_root(resolved_root, page)
+
+
+def _source_path_in_root(resolved_root: Path, page: dict) -> str:
+    """Resolve one page against a root already resolved in this operation."""
     rotation = int(page.get("rotation", 0) or 0) % 360
     relative_value = page.get("rotated_image", "") if rotation else page.get("image", "")
     relative = Path(str(relative_value or ""))

@@ -11,6 +11,16 @@ from review_tools.export_manual_annotations import _stack_segments, export_proje
 
 
 class ManualAnnotationDataTests(unittest.TestCase):
+    def test_reclassifying_eightieth_page_preserves_first_page_identity(self):
+        pages=[{'image':f'book/{index+1}/image.jpg','status':'unlabeled','questions':[]}
+               for index in range(100)]
+        project={'pages':pages,'answer_pages':[],'ignored_pages':[],'pairs':[]}
+        result=data.reclassify_pages(project,'question',[79],'answer')
+        self.assertEqual(result['moved'],1)
+        self.assertEqual(project['pages'][0]['image'],'book/1/image.jpg')
+        self.assertEqual(project['answer_pages'][0]['image'],'book/80/image.jpg')
+        self.assertEqual(len(project['pages']),99)
+
     def test_unmatched_accepted_question_is_exported_as_pending_generation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -40,31 +50,38 @@ class ManualAnnotationDataTests(unittest.TestCase):
         self.assertTrue(np.all(composed[2] == 40))
         self.assertTrue(np.all(composed[3] == 180))
 
-    def test_canonical_number_normalizes_wrappers_and_fullwidth_but_keeps_chinese(self):
+    def test_canonical_number_normalizes_wrappers_fullwidth_and_chinese(self):
         self.assertEqual(
             data.canonical_number_path({"number_path": ["七", "1", "（1）"]}),
-            ("七", "1", "1"),
+            ("7", "1", "1"),
         )
         self.assertEqual(
             data.canonical_number_path({"number_path": ["第八题", "（二）"]}),
-            ("八", "二"),
+            ("8", "2"),
         )
         self.assertEqual(data._canonical_number("００７"), "7")
-        # 中文数字与阿拉伯数字是两套编号体系，不互相转换。
-        self.assertNotEqual(data._canonical_number("二"), "2")
-        self.assertNotEqual(data._canonical_number("（二）"), "2")
+        self.assertEqual(data._canonical_number("二"), "2")
+        self.assertEqual(data._canonical_number("（二）"), "2")
 
     def test_new_projects_initialize_match_scopes_and_page_scope_regions(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "1.jpg").write_bytes(b"")
             project = data.create_book_project(str(root))
-            self.assertEqual(project["match_scopes"], [])
+            # 标注员按「第几组」组织题目，新教材直接备好 1~10，不用每本书手工建。
+            names = [scope["name"] for scope in project["match_scopes"]]
+            self.assertEqual(names, [str(index) for index in range(1, 11)])
+            self.assertEqual(len({scope["id"] for scope in project["match_scopes"]}), 10)
             path = root / "project.json"
             data.save_project(project, path)
             loaded = data.load_project(path)
+            self.assertEqual(len(loaded["match_scopes"]), 10)
             self.assertEqual(loaded["pages"][0]["match_scope_id"], "")
             self.assertEqual(loaded["pages"][0]["match_scope_regions"], [])
+            # 老入口（题目目录 + 答案目录分开）也走同一套预置。
+            legacy = data.create_project(str(root))
+            self.assertEqual([scope["name"] for scope in legacy["match_scopes"]],
+                             [str(index) for index in range(1, 11)])
 
     def test_batch_preannotation_migrates_page_scope_to_existing_frames(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -151,9 +168,9 @@ class ManualAnnotationDataTests(unittest.TestCase):
 
     def test_hierarchical_number_is_migrated_and_displayed(self):
         record = data.new_record([1, 2, 30, 40], number="2", major="四、按要求完成句子")
-        self.assertEqual(record["major_number"], "四")
+        self.assertEqual(record["major_number"], "4")
         self.assertEqual(record["minor_number"], "2")
-        self.assertEqual(record["display_number"], "四-2")
+        self.assertEqual(record["display_number"], "4-2")
 
     def test_three_level_number_and_unnumbered_major_are_displayed_faithfully(self):
         grouped = data.new_record(
@@ -161,16 +178,16 @@ class ManualAnnotationDataTests(unittest.TestCase):
             subsection_title="（二）课外阅读",
         )
         composition = data.new_record([1, 2, 30, 40], number="", major="八、习作")
-        self.assertEqual(grouped["subsection_number"], "二")
-        self.assertEqual(grouped["display_number"], "七-二-3")
-        self.assertEqual(composition["display_number"], "八")
+        self.assertEqual(grouped["subsection_number"], "2")
+        self.assertEqual(grouped["display_number"], "7-2-3")
+        self.assertEqual(composition["display_number"], "8")
 
     def test_arbitrary_depth_number_path_migrates_legacy_fields(self):
         record = data.new_record(
             [1, 2, 30, 40], number_path=["七", "二", "甲", "1"],
         )
-        self.assertEqual(record["display_number"], "七-二-甲-1")
-        self.assertEqual(record["major_number"], "七")
+        self.assertEqual(record["display_number"], "7-2-甲-1")
+        self.assertEqual(record["major_number"], "7")
         self.assertEqual(record["minor_number"], "1")
 
     def test_shared_material_is_migrated_to_group_parent(self):
@@ -179,7 +196,7 @@ class ManualAnnotationDataTests(unittest.TestCase):
             region_role="shared_material",
         )
         self.assertEqual(record["region_role"], "group")
-        self.assertEqual(record["number_path"], ["七", "二"])
+        self.assertEqual(record["number_path"], ["7", "2"])
 
     def test_legacy_shared_material_becomes_parent_of_matching_questions(self):
         group = data.new_record(
@@ -213,7 +230,7 @@ class ManualAnnotationDataTests(unittest.TestCase):
         )
 
         self.assertEqual(record["minor_number"], "")
-        self.assertEqual(record["display_number"], "一")
+        self.assertEqual(record["display_number"], "1")
         self.assertEqual(data.hierarchy_warnings([record]), [])
 
     def test_reclassify_pages_preserves_ignored_annotations_and_cleans_pairs(self):
@@ -358,7 +375,7 @@ class ManualAnnotationDataTests(unittest.TestCase):
             data.new_record([1, 1, 10, 10], number="1", major="一、栏目"),
             data.new_record([1, 11, 10, 20], number="1", major="一、栏目"),
         ]
-        self.assertIn("一-1", data.hierarchy_warnings(records)[0])
+        self.assertIn("1-1", data.hierarchy_warnings(records)[0])
 
     def test_project_keeps_legacy_question_shape_and_pairs(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -412,7 +429,7 @@ class ManualAnnotationDataTests(unittest.TestCase):
             report = export_project(str(path), str(base / "out"))
             output = cv2.imread(str(base / "out" / report["samples"][0]["path"] / "question.jpg"))
             self.assertEqual(output.shape[0], 50)
-            self.assertEqual(report["samples"][0]["display_number"], "一-2")
+            self.assertEqual(report["samples"][0]["display_number"], "1-2")
 
     def test_export_appends_cross_page_continuation(self):
         with tempfile.TemporaryDirectory() as directory:
