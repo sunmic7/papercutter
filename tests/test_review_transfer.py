@@ -257,6 +257,20 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(304, second.status)
 
 
+    def test_unauthorized_binary_upload_closes_the_connection(self):
+        """鉴权失败时请求体没被消费，必须断开，否则长连接会串包。"""
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=20)
+        try:
+            connection.request("POST", f"/api/projects/{BOOK_ID}/page-previews", body=_jpeg(24, 40),
+                               headers={"Content-Type": "application/octet-stream"})
+            response = connection.getresponse()
+            response.read()
+        finally:
+            connection.close()
+        self.assertEqual(401, response.status)
+        self.assertEqual("close", (response.getheader("Connection") or "").lower())
+
+
 class ClientTransferTests(unittest.TestCase):
     """客户端侧：gzip 兼容老服务器、预览缓存命中。"""
 
