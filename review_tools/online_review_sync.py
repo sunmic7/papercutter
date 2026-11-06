@@ -123,6 +123,19 @@ def _review_content(project: dict) -> dict:
     return result
 
 
+def content_fingerprint(project: dict) -> str:
+    """Hash only what the review approves: deliverable content.
+
+    Autosaves bump ``project_revision`` even when nothing a reviewer can see
+    has changed (a page switch, a re-save of the same frames).  Comparing this
+    digest lets the server keep a freshly submitted review task alive instead
+    of marking it "resubmit" on the very next save.
+    """
+    if not isinstance(project, dict):
+        return ""
+    return hashlib.sha256(_canonical_json(_review_content(project))).hexdigest()
+
+
 def project_book_name(project: dict, project_path: str | Path) -> str:
     """Retain the original title when a project is stored under its generated ID."""
     from pathlib import PureWindowsPath
@@ -152,6 +165,8 @@ def build_review_snapshot(project_path: str | Path, max_preview_side: int = DEFA
         "book": {"id": book_id, "name": project_book_name(project, project_path)},
         "project_revision": int(project.get("project_revision", 0)),
         "snapshot_fingerprint": fingerprint,
+        # 内容指纹：只覆盖"审核能看到的东西"，保存时用它判断快照是否真的过期。
+        "content_fingerprint": content_fingerprint(project),
         "pages": pages,
         "notice": "仅为审核预览，不含最终交付物；最终裁图和最终 JSON 由服务器在逐页审核通过后统一生成。",
     }
