@@ -101,11 +101,36 @@ PRELABEL_INFERENCE_LOCK = threading.Lock()
 PRELABEL_INFLIGHT_LOCK = threading.Lock()
 PRELABEL_INFLIGHT: dict[tuple, "_PrelabelFlight"] = {}
 ANSWER_PRELABEL_REVIEW_THRESHOLD = 120
-PAPERFLOW_BRIDGE_REVISION = "column-prefix-20261029"
+PAPERFLOW_BRIDGE_REVISION = "recovery-draft-20261106"
 REVIEW_SESSION = ReviewSession()
 _configured_client_id = os.environ.get('PAPERFLOW_CLIENT_ID', '')
 LIBRARY_CLIENT_ID = _configured_client_id if re.fullmatch(r'[a-f0-9]{32}', _configured_client_id) else uuid.uuid4().hex
 MODEL_WARMUP_READY = threading.Event()
+
+
+# 恢复草稿是"服务器工程在本地留一手"的兜底，不是保存主链路。
+# 它曾经用固定的 <book_id>.tmp 做原子替换：自动保存每秒触发两次，两个线程
+# 同时写同一个 .tmp 时，Windows 会让后到的 os.replace 报 [WinError 5] 拒绝访问，
+# 异常一路冒到界面，员工看到"保存失败"，其实服务器那份早就写成功了。
+# 现在：临时名带进程+线程号（线程之间不会互相踩），替换失败只写日志不抛出。
+RECOVERY_DRAFT_LOCK = threading.Lock()
+
+
+def _write_recovery_draft(target: Path, payload: dict) -> None:
+    temporary = target.with_name(f"{target.name}.{os.getpid()}-{threading.get_ident()}.tmp")
+    try:
+        with RECOVERY_DRAFT_LOCK:
+            temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            os.replace(temporary, target)
+    except OSError as error:
+        # 草稿目录不可写、被安全软件短暂占用等，都不该让一次成功的保存显示成失败。
+        print(f"[recovery-draft] 本地恢复草稿写入被跳过（不影响服务器保存）：{error}",
+              file=sys.stderr, flush=True)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _review_login(payload):
@@ -125,11 +150,9 @@ def _library_request(payload: dict) -> dict:
         if re.fullmatch(r"B[A-F0-9]{32}", book_id):
             target = recovery / (book_id + ".json")
             recovery_target = target
-            temporary = target.with_suffix(".tmp")
             # No credentials or full textbook images are stored in recovery drafts.
-            temporary.write_text(json.dumps({"book_id": book_id, "base_revision": payload.get("base_revision"),
-                "project": (payload.get("payload") or {}).get("project")}, ensure_ascii=False), encoding="utf-8")
-            os.replace(temporary, target)
+            _write_recovery_draft(target, {"book_id": book_id, "base_revision": payload.get("base_revision"),
+                "project": (payload.get("payload") or {}).get("project")})
     credentials = REVIEW_SESSION.credentials()
     base, token = credentials["server_url"], credentials["_review_token"]
     action = payload.get("action", "list")
@@ -167,11 +190,14 @@ def _library_request(payload: dict) -> dict:
         "base_revision": payload.get("base_revision", -1),
     }, token, timeout=1800)
     if recovery_target and recovery_target.is_file():
-        draft = json.loads(recovery_target.read_text(encoding="utf-8"))
+        try:
+            draft = json.loads(recovery_target.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            print(f"[recovery-draft] 本地恢复草稿读取失败，本次不再标记已同步：{error}",
+                  file=sys.stderr, flush=True)
+            return result
         draft["synced"] = True
-        temporary = recovery_target.with_suffix(".tmp")
-        temporary.write_text(json.dumps(draft, ensure_ascii=False), encoding="utf-8")
-        os.replace(temporary, recovery_target)
+        _write_recovery_draft(recovery_target, draft)
     return result
 # 总开关：置 0/false/no/off 时 _save_page 不冻结不分级、三条 enrich 路由直接返回
 # {"ok": false, "disabled": true}，主流程行为与接入前完全一致。
