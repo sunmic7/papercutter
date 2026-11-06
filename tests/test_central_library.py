@@ -203,6 +203,8 @@ class CentralLibraryTests(unittest.TestCase):
             'PAPERFLOW_LIBRARY_ROOT': str(self.sources),
             'PAPERFLOW_ENGINE_ROOT': str(Path(__file__).resolve().parents[1]),
             'PAPERFLOW_ENRICH_ENABLED': '0',
+            # 后台实时样例题库线程有 20 秒去抖，测试里关掉，避免用例之间互相踩盘。
+            'PAPERFLOW_DISABLE_READY_SAMPLES': '1',
         })
         self.env.start()
         projects = self.root / 'projects'
@@ -310,6 +312,86 @@ class CentralLibraryTests(unittest.TestCase):
         self.operate(self.reviewer, '/api/project/save-cache', {'project': changed}, client='review-desk')
         regenerated = self.operate(self.reviewer, '/api/review/generate-delivery', client='review-desk')
         self.assertEqual(regenerated['submission_id'], submission['id'])
+
+    # ------------------------------------------------------------------
+    # 实时样例题库：单题够格就产出，不需要整本审核
+    # ------------------------------------------------------------------
+    def _ready_project(self, difficulty='基础'):
+        opened = self.library.open(self.marker, {'book_id': self.book_id, 'client_id': 'marker-desk'})
+        project = copy.deepcopy(opened['project'])
+        question = data.new_record([0, 0, 500, 240], major_number='一', text='实验题',
+            question_type='填空题', difficulty=difficulty, knowledge_points=['几何'],
+            illustrations=[{'bbox': [20, 20, 220, 220], 'image_kind': 'question_image'}])
+        answer = data.new_record([0, 0, 500, 240], answer=True, major_number='一', analysis='实验解析')
+        answer['answer'] = '42'
+        project.update(language='zh', stage='小学', grade='六年级', subject='数学')
+        answer_page = project['pages'].pop()
+        answer_page.update(status='accepted', answers=[answer])
+        answer_page.pop('questions', None)
+        project['answer_pages'] = [answer_page]
+        project['pages'][0].update(status='accepted', questions=[question])
+        data.set_pair(project, question['id'], [answer['id']])
+        self.operate(self.marker, '/api/project/save-cache', {'project': project})
+        return project
+
+    def test_ready_samples_emit_one_question_without_any_review(self):
+        """一题填齐就出一题的 JSON：不提交审核、不放行，也能拿到这一题。"""
+        self._ready_project()
+        result = self.library.sync_ready_samples(self.marker, self.book_id)
+        self.assertEqual(result['ready_count'], 1, result)
+        book_root = self.root / 'final-output' / self.book_id
+        dataset = book_root / 'ready_samples' / 'k12_dataset' / 'dataset.jsonl'
+        self.assertTrue(dataset.is_file())
+        rows = [json.loads(line) for line in dataset.read_text(encoding='utf-8').splitlines() if line.strip()]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['metainfo']['difficulty'], '基础')
+        self.assertEqual(rows[0]['data']['answer'], '42')
+        self.assertTrue((book_root / 'ready_samples' / 'k12_dataset' / 'images').is_dir())
+        # 只有审核后生成才允许写 current.json / versions：草稿绝不能冒充正式交付。
+        self.assertFalse((book_root / 'current.json').exists())
+        self.assertFalse((book_root / 'versions').exists())
+        # 同一内容重复重算必须复用同一个 id，否则正式版会变成另一条样本。
+        self.library.sync_ready_samples(self.marker, self.book_id)
+        again = [json.loads(line) for line in dataset.read_text(encoding='utf-8').splitlines() if line.strip()]
+        self.assertEqual(again[0]['id'], rows[0]['id'])
+        # 标注员自己就能看（"填好一题就能看到"的那条路）。
+        preview = self.store.delivery_samples(self.marker, self.book_id, version='live')
+        self.assertEqual(preview['total'], 1)
+        self.assertTrue(preview['versions'][0]['live'])
+        self.assertEqual(preview['versions'][0]['ready_count'], 1)
+
+    def test_ready_samples_drop_a_question_that_loses_eligibility(self):
+        self._ready_project()
+        self.library.sync_ready_samples(self.marker, self.book_id)
+        project = data.load_project(self.library.project_file(self.book_id))
+        project['pages'][0]['questions'][0]['difficulty'] = '简单'
+        data.save_project(project, self.library.project_file(self.book_id), increment_revision=True)
+        result = self.library.sync_ready_samples(self.marker, self.book_id)
+        self.assertEqual(result['ready_count'], 0)
+        reasons = {row['reason'] for row in result['reason_summary']}
+        self.assertTrue(any('难度' in reason for reason in reasons), reasons)
+        dataset = (self.root / 'final-output' / self.book_id / 'ready_samples'
+                   / 'k12_dataset' / 'dataset.jsonl')
+        self.assertEqual(dataset.read_text(encoding='utf-8').strip(), '')
+
+    def test_ready_samples_are_private_to_the_books_own_annotator(self):
+        self._ready_project()
+        self.library.sync_ready_samples(self.marker, self.book_id)
+        other = self.store.create_managed_user(self.admin, 'marker2', 'test-password', 'annotator')
+        self.store.set_responsible_person(self.boss, other['id'], self.reviewer['id'])
+        with self.assertRaises(LookupError):
+            self.store.delivery_samples(other, self.book_id, version='live')
+        # 已发布交付版本的鉴权没有被顺带放开：标注员仍然进不去。
+        with self.assertRaises(PermissionError):
+            self.store._delivery_preview_target(self.marker, self.book_id)
+
+    def test_ready_samples_need_a_project_first(self):
+        project_file = self.library.project_file(self.book_id)
+        if project_file.is_file():
+            project_file.unlink()
+        with self.assertRaises(ValueError) as caught:
+            self.library.sync_ready_samples(self.marker, self.book_id)
+        self.assertIn('标注工程', str(caught.exception))
 
     def test_conflicts_paths_and_cross_team_access_are_rejected(self):
         self.library.scan(self.boss)
@@ -540,7 +622,6 @@ class DistributedServerCroppingTests(unittest.TestCase):
         self.assertIn('缺少难度', reasons)
         self.assertIn('缺少知识点', reasons)
         self.assertTrue(report['items'])
-
 
 if __name__ == '__main__':
     unittest.main()

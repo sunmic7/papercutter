@@ -1043,16 +1043,22 @@ def sync_delivery_workspace(project_path: str | Path, runtime_root: str | Path,
                             changed_page_index: int | None = None,
                             materialize_all: bool = False,
                             changed_record_ids: list[str] | None = None,
-                            identity_path: str | Path | None = None) -> dict:
+                            identity_path: str | Path | None = None,
+                            output_root: str | Path | None = None) -> dict:
     """Sync edited delivery artifacts and rebuild the small authoritative indexes.
 
     Crops are rewritten only when their source signature changes. JSON is cheap and is
     refreshed for the changed page plus records touched by relations.
+
+    ``output_root`` overrides where the package is written.  The incremental
+    "ready samples" view of a book keeps its own root so that un-reviewed work
+    can never overwrite a published delivery version.
     """
     project_file = Path(project_path).resolve()
     project = data.load_project(project_file)
     data.ensure_delivery_ids(project)
-    root = delivery_root(project, runtime_root)
+    root = (Path(output_root).resolve() if output_root is not None
+            else delivery_root(project, runtime_root))
     root.mkdir(parents=True, exist_ok=True)
     old_manifest_path = root / "manifest.json"
     try:
