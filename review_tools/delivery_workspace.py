@@ -6,8 +6,11 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
+from datetime import datetime
 from pathlib import Path
 
+from review_tools import book_meta
 from review_tools import manual_annotation_data as data
 from review_tools.export_manual_annotations import _crop, _question_crop
 
@@ -18,6 +21,191 @@ K12_QUESTION_TYPES = {
     "证明题": "证明", "实验题": "实验探究", "实验探究题": "实验探究",
     "阅读理解": "阅读理解", "材料分析": "材料分析", "综合应用": "综合应用",
 }
+
+# --- 甲方词表（数据需求明细-供应商.xlsx / 需求1 第 3 行 N3 备注）-------------
+# N3 逐字给出 language/stage/grade/subject/question_type/difficulty 的取值，
+# 交付时必须逐项落表；映射后的值落在表外即拒收，不再原样透传。
+# 书级字段复用 ``book_meta``，那是 UI 下拉与交付校验的唯一同源定义。
+K12_LANGUAGES = book_meta.LANGUAGES                          # zh/en
+K12_STAGES = book_meta.STAGES                                # 小学/初中/高中
+K12_GRADES = tuple(book_meta.GRADE_NAMES.values())           # 一年级…高三
+K12_SUBJECTS = book_meta.SUBJECTS
+K12_QUESTION_TYPE_VALUES = (
+    "选择", "填空", "判断", "计算", "证明", "实验探究",
+    "阅读理解", "材料分析", "综合应用",
+)
+K12_DIFFICULTIES = ("基础", "中等", "困难")
+
+# H3⑬：手机号/邮箱/身份证/社交账号统一匿名化为小写字母 x。
+# 先长后短：邮箱必须先于手机号处理，否则邮箱里的数字段会被提前打散。
+_PII_PATTERNS = (
+    (re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"), "x"),
+    (re.compile(r"(?<!\d)\d{17}[\dXx](?!\d)"), "x"),
+    (re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)"), "x"),
+    (re.compile(r"(?:QQ|qq|微信|WeChat|wechat)\s*[:：]?\s*\d{5,12}"), "x"),
+)
+
+# H3③：整页试卷截图不得作为题图。判据与 illustration_candidates 的
+# ``page_like.page_area_ratio_min`` 保持一致（0.9），避免两套口径打架。
+FULL_PAGE_AREA_RATIO = 0.9
+
+
+# H3⑪：广告、导航、免责声明、HTML 字符、表情包等噪声一律不进交付文本。
+_HTML_TAG_RE = re.compile(r"</?[A-Za-z][A-Za-z0-9]*(?:\s[^<>]*)?/?>")
+_HTML_ENTITY_RE = re.compile(r"&(?:nbsp|amp|lt|gt|quot|apos|#\d{2,6});", re.IGNORECASE)
+_NOISE_SENTENCE_RE = re.compile(
+    r"(?:版权所有|侵权必究|免责声明|未经(?:许可|授权)[^。\n]{0,20}不得转载"
+    r"|扫码(?:关注|下载)|关注(?:微信)?公众号)"
+)
+_URL_RE = re.compile(r"(?:https?://|www\.)[^\s，。；、）)]+", re.IGNORECASE)
+_EMOJI_RE = re.compile("[\U0001F300-\U0001FAFF\u2600-\u27BF\uFE0F]")
+# H3⑥：这些字符出现在交付文本里就是 OCR/编码失败的硬信号。
+GARBLED_MARKERS = ("\ufffd", "\u0000")
+
+
+def _strip_noise(text: str) -> str:
+    """Remove markup, ads, URLs and emoji, then normalise whitespace (H3⑥⑪)."""
+    result = _HTML_TAG_RE.sub("", text)
+    result = _HTML_ENTITY_RE.sub(" ", result)
+    result = _NOISE_SENTENCE_RE.sub("", result)
+    result = _URL_RE.sub("", result)
+    result = _EMOJI_RE.sub("", result)
+    result = re.sub(r"[ \t]{2,}", " ", result)
+    result = re.sub(r"\n{3,}", "\n\n", result)
+    return result.strip()
+
+
+def _mask_pii(text: object) -> str:
+    """Replace identifiable personal data with a lowercase ``x`` (H3⑬)."""
+    result = str(text or "")
+    for pattern, replacement in _PII_PATTERNS:
+        result = pattern.sub(replacement, result)
+    return result
+
+
+def _k12_text(value: object) -> str:
+    """Public pipeline for every delivered string: formulas → noise → PII."""
+    return _mask_pii(_strip_noise(_unicode_math_text(value)))
+
+
+def _vocabulary_errors(meta: dict) -> list[str]:
+    """N3 词表闸：值非空但不在甲方枚举内即拒收。
+
+    空值由 ``_k12_validation`` 的必填项检查单独报，这里只看"填了但填错"。
+    """
+    checks = (
+        ("language", K12_LANGUAGES, "语言"),
+        ("stage", K12_STAGES, "学段"),
+        ("grade", K12_GRADES, "年级"),
+        ("subject", K12_SUBJECTS, "学科"),
+        ("question_type", K12_QUESTION_TYPE_VALUES, "题型"),
+        ("difficulty", K12_DIFFICULTIES, "难度"),
+    )
+    errors = []
+    for key, allowed, label in checks:
+        value = str(meta.get(key, "")).strip()
+        if value and value not in allowed:
+            errors.append(f"{label}不在甲方词表内：{value}")
+    return errors
+
+
+def _content_signature(sample: dict) -> str:
+    """Stable fingerprint of one delivered sample, used for dedup (H3⑩ / 备注2)."""
+    body = sample["data"]
+    payload = "\u0000".join([
+        re.sub(r"\s+", "", str(body.get("question", ""))),
+        "\u0001".join(re.sub(r"\s+", "", str(value)) for value in body.get("options", [])),
+        re.sub(r"\s+", "", str(body.get("answer", ""))),
+    ])
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+class _DeliveryIdentity:
+    """跨批次样本身份库（sqlite）：全局发号 + 内容指纹去重。
+
+    甲方备注第 2 条要求首批 1000 万组、后续增量不得重复，H3⑩ 又要求重复率
+    ≤0.1%。包内序号 ``0000001`` 在不同批次必然撞车，所以样本 id 必须由一个
+    跨批次单调递增的发号器给出；内容指纹同样要跨批次留存。
+
+    存 sqlite 而不是 JSON：1000 万条指纹的 JSON 全量读写在每次出包时都不可行。
+    """
+
+    def __init__(self, path: Path | None):
+        self.path = Path(path) if path is not None else None
+        self.connection = None
+        if self.path is None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.connection = sqlite3.connect(str(self.path), timeout=30)
+        self.connection.execute("PRAGMA journal_mode=WAL")
+        self.connection.executescript(
+            "CREATE TABLE IF NOT EXISTS samples ("
+            " content_hash TEXT PRIMARY KEY, book_id TEXT NOT NULL,"
+            " sample_id TEXT NOT NULL, created_at TEXT NOT NULL);"
+            "CREATE TABLE IF NOT EXISTS counter ("
+            " name TEXT PRIMARY KEY, value INTEGER NOT NULL);"
+            "INSERT OR IGNORE INTO counter(name, value) VALUES ('sample_id', 1);"
+        )
+        self.connection.commit()
+
+    def lookup(self, content_hash: str) -> dict | None:
+        if self.connection is None:
+            return None
+        row = self.connection.execute(
+            "SELECT book_id, sample_id FROM samples WHERE content_hash = ?", (content_hash,)
+        ).fetchone()
+        return None if row is None else {"book_id": row[0], "id": row[1]}
+
+    def allocate(self, content_hash: str, book_id: str) -> str:
+        """Reserve the next global sample id and record the fingerprint atomically."""
+        if self.connection is None:
+            return "0000001"
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            value = cursor.execute(
+                "SELECT value FROM counter WHERE name = 'sample_id'").fetchone()[0]
+            cursor.execute("UPDATE counter SET value = value + 1 WHERE name = 'sample_id'")
+            sample_id = f"{int(value):07d}"
+            cursor.execute(
+                "INSERT OR REPLACE INTO samples(content_hash, book_id, sample_id, created_at)"
+                " VALUES (?, ?, ?, ?)",
+                (content_hash, book_id, sample_id, datetime.now().isoformat(timespec="seconds")),
+            )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+        return sample_id
+
+    def close(self) -> None:
+        if self.connection is not None:
+            self.connection.commit()
+            self.connection.close()
+            self.connection = None
+
+
+def _page_pixel_size(project: dict, page: dict, cache: dict[int, tuple[int, int]],
+                     page_index: int) -> tuple[int, int]:
+    """Page width/height for the whole-page guard, decoded at 1/8 scale and cached."""
+    if page_index in cache:
+        return cache[page_index]
+    size = (0, 0)
+    try:
+        import cv2
+        import numpy as np
+
+        # cv2.imread cannot open non-ASCII paths on Windows, and every textbook
+        # folder here is Chinese-named. Decode from bytes instead.
+        raw = np.fromfile(data.source_path(project, page), dtype=np.uint8)
+        image = cv2.imdecode(raw, cv2.IMREAD_REDUCED_COLOR_4) if raw.size else None
+        if image is not None:
+            height, width = image.shape[:2]
+            size = (width * 4, height * 4)
+    except (OSError, ValueError, ImportError):
+        size = (0, 0)
+    cache[page_index] = size
+    return size
 
 
 def _wide_path(path: Path) -> str:
@@ -227,11 +415,18 @@ def _k12_validation(sample: dict, image_sizes: list[tuple[int, int]]) -> list[st
     for key, label in required_meta.items():
         if not str(meta.get(key, "")).strip():
             errors.append(f"缺少{label}")
+    errors.extend(_vocabulary_errors(meta))
     if not meta.get("knowledge_points"):
         errors.append("缺少知识点")
     for key, label in (("question", "题目文本"), ("answer", "标准答案"), ("analysis", "详细解析")):
-        if not str(body.get(key, "")).strip():
+        value = str(body.get(key, ""))
+        if not value.strip():
             errors.append(f"缺少{label}")
+        elif any(marker in value for marker in GARBLED_MARKERS):
+            errors.append(f"{label}含乱码字符")
+    for index, option in enumerate(body.get("options", []) or []):
+        if any(marker in str(option) for marker in GARBLED_MARKERS):
+            errors.append(f"选项{index + 1}含乱码字符")
     if not body.get("question_images") and not any(body.get("option_images", [])):
         errors.append("缺少有效题图")
     if any(min(width, height) < 128 for width, height in image_sizes):
@@ -243,7 +438,7 @@ def _k12_validation(sample: dict, image_sizes: list[tuple[int, int]]) -> list[st
 
 def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_rows: list,
                         question_relations: dict[str, dict], *, changed_page_index: int | None,
-                        materialize_all: bool) -> dict:
+                        materialize_all: bool, identity_path: Path | None = None) -> dict:
     """Build the customer-facing UTF-8 JSONL and meaningful illustration crops.
 
     Internal Q/A crops remain available for audit, but answer screenshots and whole-question
@@ -276,8 +471,11 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
     ordered_questions = sorted(question_rows, key=_record_position)
     lines, report_items, active_images, page_lines = [], [], set(), {}
     page_orders = {}
+    page_sizes: dict[int, tuple[int, int]] = {}
+    identity = _DeliveryIdentity(identity_path)
+    book_id = str(project["delivery_book_id"])
+    claimed_signatures: dict[str, str] = {}
     for global_order, (page_index, page, question) in enumerate(ordered_questions, 1):
-        sample_id = f"{global_order:07d}"
         page_number = page_index + 1
         page_folder = f"P{page_number:04d}"
         page_orders[page_index] = page_orders.get(page_index, 0) + 1
@@ -290,13 +488,12 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
         answer_infos = [part for item in primary_answer_infos for part in answer_chain(item)]
         answers = [_clean_text(item[2].get("answer")) for item in answer_infos]
         analyses = [_clean_text(item[2].get("analysis")) for item in answer_infos]
-        question_images, option_images, image_sizes, image_targets = [], [], [], []
         illustrations = sorted(
             (item for item in question.get("illustrations", []) if isinstance(item, dict)),
             key=lambda item: (int(item.get("bbox", [0, 0, 0, 0])[1]), int(item.get("bbox", [0, 0, 0, 0])[0])),
         )
-        q_index = 0
-        option_index = 0
+        # Pass 1 — decide which crops may be delivered at all (no id needed yet).
+        slots, image_sizes, full_page_skipped = [], [], 0
         for illustration in illustrations:
             kind = str(illustration.get("image_kind", "question_image"))
             if kind == "ignore":
@@ -304,52 +501,76 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
             box = illustration.get("bbox", [])
             width = max(0, int(box[2]) - int(box[0])) if len(box) == 4 else 0
             height = max(0, int(box[3]) - int(box[1])) if len(box) == 4 else 0
+            # H3③：整页试卷截图不得作为题图。候选阶段已判过 page_like，但那时
+            # 只是"灰色不可采用"；人工把整页框标成 image-area 后仍会进 illustrations，
+            # 所以交付闸必须按页面像素面积二次复查。
+            page_width, page_height = _page_pixel_size(project, page, page_sizes, page_index)
+            if page_width and page_height:
+                area_ratio = (width * height) / float(page_width * page_height)
+                if area_ratio >= FULL_PAGE_AREA_RATIO:
+                    full_page_skipped += 1
+                    continue
             image_sizes.append((width, height))
+            label = ""
             if kind == "option_image":
                 label = re.sub(r"[^A-Za-z0-9]", "", str(illustration.get("option_label", ""))).upper() or "X"
-                option_index += 1
-                filename = f"{sample_id}_option_{label}_{option_index:02d}.jpg"
-                option_images.append(f"images/{filename}")
-            else:
-                q_index += 1
-                filename = f"{sample_id}_img_{q_index:02d}.jpg"
-                question_images.append(f"images/{filename}")
-            target_image = (image_root / filename).resolve()
-            image_targets.append((target_image, box))
+            slots.append((kind, box, label))
+
         ocr_question, inferred_options = _split_ocr_choices(question.get("text", ""))
         explicit_options = _string_list(question.get("options", []))
         options = explicit_options or inferred_options
         raw_type = _clean_text(question.get("question_type", ""))
         effective_type = "选择题" if inferred_options else raw_type
-        sample = {
-            "id": sample_id,
-            "metainfo": {
-                "language": _clean_text(project.get("language")),
-                "stage": _clean_text(project.get("stage")),
-                "grade": _clean_text(project.get("grade")),
-                "subject": _clean_text(project.get("subject")),
-                "question_type": K12_QUESTION_TYPES.get(effective_type, effective_type),
-                "difficulty": _clean_text(question.get("difficulty", "")),
-                "knowledge_points": _string_list(question.get("knowledge_points", [])),
-            },
-            "data": {
-                "question_images": question_images,
-                "option_images": option_images,
-                "question": _unicode_math_text(ocr_question),
-                "options": ([_unicode_math_text(value) for value in options]
-                            if K12_QUESTION_TYPES.get(effective_type, effective_type) == "选择" else []),
-                "answer": _unicode_math_text("\n".join(value for value in answers if value)),
-                "analysis": _unicode_math_text("\n".join(value for value in analyses if value)),
-            },
-            "source": {
-                "book_id": project["delivery_book_id"], "question_page": page_number,
-                "page_order": page_order,
-                "question_number": data.display_number(question),
-                "internal_question_id": question.get("delivery_id", ""),
-                "internal_answer_ids": [item[2].get("delivery_id", "") for item in answer_infos],
-            },
-        }
+        final_type = K12_QUESTION_TYPES.get(effective_type, effective_type)
+
+        def build_sample(sample_id: str) -> tuple[dict, list[tuple[Path, list]]]:
+            question_images, option_images, targets = [], [], []
+            q_index = option_index = 0
+            for slot_kind, slot_box, slot_label in slots:
+                if slot_kind == "option_image":
+                    option_index += 1
+                    filename = f"{sample_id}_option_{slot_label}_{option_index:02d}.jpg"
+                    option_images.append(f"images/{filename}")
+                else:
+                    q_index += 1
+                    filename = f"{sample_id}_img_{q_index:02d}.jpg"
+                    question_images.append(f"images/{filename}")
+                targets.append(((image_root / filename).resolve(), slot_box))
+            return ({
+                "id": sample_id,
+                "metainfo": {
+                    "language": _clean_text(project.get("language")),
+                    "stage": _clean_text(project.get("stage")),
+                    "grade": _clean_text(project.get("grade")),
+                    "subject": _clean_text(project.get("subject")),
+                    "question_type": final_type,
+                    "difficulty": _clean_text(question.get("difficulty", "")),
+                    "knowledge_points": _string_list(question.get("knowledge_points", [])),
+                },
+                "data": {
+                    "question_images": question_images,
+                    "option_images": option_images,
+                    "question": _k12_text(ocr_question),
+                    "options": [_k12_text(value) for value in options] if final_type == "选择" else [],
+                    "answer": _k12_text("\n".join(value for value in answers if value)),
+                    "analysis": _k12_text("\n".join(value for value in analyses if value)),
+                },
+                "source": {
+                    "book_id": book_id, "question_page": page_number,
+                    "page_order": page_order,
+                    "question_number": data.display_number(question),
+                    "internal_question_id": question.get("delivery_id", ""),
+                    "internal_answer_ids": [item[2].get("delivery_id", "") for item in answer_infos],
+                },
+            }, targets)
+
+        sample, image_targets = build_sample("0000000")   # probe: id is irrelevant to validation
         errors = _k12_validation(sample, image_sizes)
+        if full_page_skipped:
+            errors.append(f"已剔除{full_page_skipped}张整页截图（H3③）")
+        signature = _content_signature(sample)
+        if signature in claimed_signatures:
+            errors.append(f"与第{claimed_signatures[signature]}条重复（H3⑩）")
         if str(page.get("status", "")) != "accepted":
             errors.append("题目页尚未确认")
         if relation.get("status") != "accepted" or not answer_infos:
@@ -360,10 +581,24 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
                     and relation.get("status") == "accepted"
                     and bool(answer_infos) and all(str(item[1].get("status", "")) == "accepted" for item in answer_infos)
                     and not errors)
+        sample_id = f"{global_order:07d}"
+        if eligible:
+            # 跨批次身份：同一内容在别的书里交付过就是重复（备注第 2 条），
+            # 同一本书重出则复用旧 id，保证样本 id 跨版本稳定。
+            owner = identity.lookup(signature)
+            if owner and str(owner.get("book_id", "")) != book_id:
+                errors.append(f"与教材 {owner.get('book_id')} 已交付样本内容重复（备注2）")
+                eligible = False
+            elif owner:
+                sample_id = str(owner.get("id") or sample_id)
+            else:
+                sample_id = identity.allocate(signature, book_id)
+            claimed_signatures[signature] = sample_id
         report_items.append({"id": sample_id, "page": page_index + 1,
                              "question_number": data.display_number(question),
                              "eligible": eligible, "errors": errors})
         if eligible:
+            sample, image_targets = build_sample(sample_id)
             for target, box in image_targets:
                 if materialize_page or not target.is_file():
                     crop = _crop(data.source_path(project, page), box)
@@ -376,6 +611,7 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
             for target, _box in image_targets:
                 if target.is_file():
                     target.unlink()
+    identity.close()
     for stale in images_root.glob("*.jpg"):
         if stale.resolve() not in active_images:
             stale.unlink()
@@ -408,8 +644,28 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
               "eligible_count": len(lines), "rejected_count": len(ordered_questions) - len(lines),
               "items": report_items}
     _atomic_json(k12_root / "quality_report.json", report)
+    _atomic_json(k12_root / "coverage_report.json", _coverage_summary(lines))
     return {"dataset_file": str(dataset_path), "eligible_count": len(lines),
             "rejected_count": report["rejected_count"]}
+
+
+def _coverage_summary(lines: list[str]) -> dict:
+    """H3⑨ 均衡覆盖统计：按学段/学科/语言/题型/难度计数。
+
+    单个批次必然不均衡（一本书只覆盖一个年级），所以这里只出报表、不做交付闸；
+    均衡是投放层按报表挑书，不是让生成器拒收。
+    """
+    counters = {key: {} for key in ("stage", "subject", "language", "question_type", "difficulty")}
+    for line in lines:
+        try:
+            sample = json.loads(line)
+        except ValueError:
+            continue
+        meta = sample.get("metainfo", {})
+        for key, bucket in counters.items():
+            value = str(meta.get(key, "") or "未填")
+            bucket[value] = bucket.get(value, 0) + 1
+    return {"schema_version": 1, "samples": len(lines), "distribution": counters}
 
 
 def delivery_root(project: dict, runtime_root: str | Path) -> Path:
@@ -709,6 +965,9 @@ def sync_delivery_workspace(project_path: str | Path, runtime_root: str | Path,
         root, project, question_rows, answer_rows, question_relations,
         changed_page_index=(changed_page_index if selected_kind == "question" else None),
         materialize_all=materialize_all,
+        # 身份库跟随"交付包根目录"共享：服务器上所有书都落在同一个交付根，
+        # 跨批次去重因此覆盖全站；本机每个交付根各自独立，不会串书。
+        identity_path=root.parent / "delivery_identity.sqlite3",
     )
     # Delivery generation may assign missing public IDs, but it is part of the
     # caller's logical mutation and must not advance the renderer CAS revision
