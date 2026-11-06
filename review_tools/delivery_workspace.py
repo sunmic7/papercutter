@@ -743,8 +743,9 @@ def _reason_summary(items: list[dict], limit: int = 40) -> list[dict]:
             bucket["count"] += 1
             number = str(item.get("question_number") or "").strip()
             page = item.get("page")
-            # 只写题号时操作员还得回逐题明细里找页码，直接给出"第几页 题号"。
-            label = f"第{page}页 {number}" if number and page else number
+            # 示例只给题号：页码是扫描页序（含封面、前置页），和书上的印刷页码
+            # 对不上，混在一起反而让人以为写错了。只有题号缺失时才用页号兜底定位。
+            label = number or (f"第{page}页" if page else "")
             if label and len(bucket["questions"]) < 5 and label not in bucket["questions"]:
                 bucket["questions"].append(label)
     return sorted(buckets.values(), key=lambda row: (-row["count"], row["reason"]))[:limit]

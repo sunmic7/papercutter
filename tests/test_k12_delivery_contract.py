@@ -241,6 +241,16 @@ class DeliveryDiagnosisTests(unittest.TestCase):
             self.assertEqual(reasons["缺少难度"]["count"], 1)
             self.assertTrue(reasons["缺少难度"]["questions"])
 
+    def test_reason_examples_show_the_question_number_only(self):
+        """示例列只放题号：页码是扫描页序，和书上印的页码对不上。"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = build_project(root, texts=["求面积。"], difficulty="")
+            report = analyze_delivery(path, root / "runtime")
+            example = report["reason_summary"][0]["questions"][0]
+            self.assertEqual(example, report["items"][0]["question_number"])
+            self.assertNotIn("页", example)
+
     def test_missing_book_meta_is_reported_separately(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
