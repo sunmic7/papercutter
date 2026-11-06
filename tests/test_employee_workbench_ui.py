@@ -8,6 +8,36 @@ APP_JS = ROOT / "desktop_annotation" / "PaperFlow-Annotation" / "resources" / "a
 
 
 class EmployeeWorkbenchInteractionTests(unittest.TestCase):
+    def test_logged_out_staff_must_login_before_opening_any_textbook(self):
+        main = (APP_JS / "main.js").read_text(encoding="utf-8")
+        review = (APP_JS / "company-review.js").read_text(encoding="utf-8")
+        html = (APP_JS.parent / "index.html").read_text(encoding="utf-8")
+
+        open_start = main.index("async openPaperFlowBook(")
+        open_end = main.index("redrawCurrentPaperFlowPageAfterLayout", open_start)
+        open_method = main[open_start:open_end]
+        self.assertIn("this.companyReview?.session?.logged_in", open_method)
+        self.assertNotIn("window.electronAPI.selectWorkspaceFolder()", open_method)
+        self.assertLess(open_method.index("this.companyReview?.session?.logged_in"), open_method.index("if (!bookRoot)"))
+        self.assertIn('id="companyLoginGate"', html)
+        self.assertIn('this.loginReady?.()', review)
+        self.assertIn("请先点击上方“登录公司账号”，登录后即可使用审核功能。", review)
+        self.assertLess(html.index('class="workflow-steps"'), html.index('class="company-account-controls"'))
+
+    def test_startup_does_not_try_to_restore_a_server_book_before_login(self):
+        source = (APP_JS / "main.js").read_text(encoding="utf-8")
+        init_start = source.index("async init()")
+        init_end = source.index("setPaperFlowInteractionLocked", init_start)
+        init = source[init_start:init_end]
+
+        self.assertIn("await this.companyReview.init()", init)
+        self.assertIn("await this.restorePaperFlowAccountBook();", init)
+        self.assertIn("await this.companyReview.requireLogin()", init)
+        restore = source[source.index("async restorePaperFlowAccountBook()"):source.index("async paperFlowRequest(")]
+        self.assertIn("const key = this.paperFlowLastBookKey();", restore)
+        self.assertIn("if (!key) return;", restore)
+        self.assertNotIn("getItem('paperflowLastBookRoot')", restore)
+
     def test_edit_menu_rotates_only_an_empty_paperflow_page(self):
         source = (APP_JS / "main.js").read_text(encoding="utf-8")
         electron = (APP_JS.parent / "electron" / "main.js").read_text(encoding="utf-8")
@@ -257,8 +287,10 @@ class EmployeeWorkbenchInteractionTests(unittest.TestCase):
         self.assertIn("menu-show-operation-help", electron)
         self.assertIn("onMenuShowOperationHelp", preload)
         self.assertIn("showPaperFlowOperationHelp()", main)
-        for section in ["题目页切分与复核", "答案页切分", "续框、旋转与页面分类", "保存、匹配和生成"]:
-            self.assertIn(section, main)
+        self.assertIn("window.ocrTool?.showPaperFlowOperationHelp?.()", (APP_JS / "ui-manager.js").read_text(encoding="utf-8"))
+        self.assertIn('style="width:min(900px,96vw)', main)
+        self.assertIn("onlyPendingFrames", main)
+        self.assertIn("data-operation-help-close", main)
 
     def test_question_options_are_derived_only_during_formal_export(self):
         source = (APP_JS / "ui-manager.js").read_text(encoding="utf-8")
@@ -301,7 +333,8 @@ class EmployeeWorkbenchInteractionTests(unittest.TestCase):
         method = source[start:end]
         self.assertIn("this.uiManager.updateAnnotationInMemory(selected);", method)
         self.assertIn("saveProjectCacheOnExit", method)
-        self.assertIn("timeoutMs: 3000", method)
+        self.assertIn("startsWith('server://') ? 60000 : 3000", method)
+        self.assertIn("startsWith('server://')) throw serviceSaveError", method)
         self.assertIn("project: this.paperFlowProject", method)
         self.assertLess(
             method.index("paperFlowRequest('/api/project/save-cache'"),
@@ -324,14 +357,17 @@ class EmployeeWorkbenchInteractionTests(unittest.TestCase):
         self.assertIn(".toolbar-center #currentImageName", css)
         self.assertIn("text-overflow: ellipsis", css)
 
-    def test_typing_only_marks_memory_dirty_without_disk_autosave(self):
+    def test_server_typing_saves_automatically_while_legacy_local_typing_stays_in_memory(self):
         source = (APP_JS / "main.js").read_text(encoding="utf-8")
         # 锚定方法定义本身；调用点（如配对画框）会出现在定义之前。
         start = source.index("schedulePaperFlowSave() {")
         end = source.index("commitCurrentPaperFlowPageToMemory", start)
         method = source[start:end]
         self.assertIn("退出时保存", method)
-        self.assertNotIn("setTimeout", method)
+        self.assertIn("this.isPaperFlowServerProject()", method)
+        self.assertIn("this.canSyncPaperFlowServer()", method)
+        self.assertIn("this.persistCurrentPaperFlowCache()", method)
+        self.assertIn("setTimeout", method)
         self.assertNotIn("savePaperFlowPage", method)
 
     def test_page_navigation_only_commits_to_memory(self):
@@ -349,7 +385,8 @@ class EmployeeWorkbenchInteractionTests(unittest.TestCase):
         preload = (APP_JS.parent / "electron" / "preload.js").read_text(encoding="utf-8")
         main = (APP_JS / "main.js").read_text(encoding="utf-8")
         self.assertIn("label: '打开教材…'", electron)
-        self.assertIn("label: '生成交付文件'", electron)
+        # 最终 JSON 统一由服务器在逐页审核通过后生成，客户端不再保留导出入口。
+        self.assertNotIn("本地导出", electron)
         # 「页面」菜单已删除，旋转并入「视图」；「模式」与文件/视图并列。
         self.assertNotIn("label: '页面'", electron)
         self.assertIn("label: '模式'", electron)
@@ -504,21 +541,22 @@ class EmployeeWorkbenchInteractionTests(unittest.TestCase):
 
     def test_ocr_migration_clears_legacy_local_default_but_preserves_new_user_choices(self):
         workbench = (APP_JS / "employee-workbench.js").read_text(encoding="utf-8")
-        self.assertIn("cloud-fast-v4", workbench)
+        self.assertIn("vision-free-v5", workbench)
         self.assertIn("paperflowOcrModelUserSelected", workbench)
-        self.assertIn("? saved\n            : 'qwen3-vl-plus'", workbench)
+        self.assertIn("? saved\n            : 'qwen3.8-flash'", workbench)
 
     def test_ocr_model_selectors_only_offer_cloud_models_and_one_local_emergency_fallback(self):
         service = (APP_JS / "ocr-service.js").read_text(encoding="utf-8")
         settings = (APP_JS / "ui-manager.js").read_text(encoding="utf-8")
         for source in (service, settings):
-            self.assertIn("qwen3-vl-plus", source)
+            for model in ('qwen3.8-flash', 'qwen3.8-max-0902', 'qwen3.8-omni-flash'):
+                self.assertIn(model, source)
+            self.assertNotIn('qwen3-vl-plus', source)
+            self.assertNotIn('qwen-vl-ocr', source)
             self.assertIn("local-rapidocr", source)
             self.assertNotIn("local-pix2text", source)
             self.assertNotIn("doubao-seed", source)
-            # 2026-10-19：qwen3-vl-flash 在当前账号已下线，调用返回 404
-            # model_not_found。默认模型改为已验证可用的 qwen3-vl-plus，
-            # 不再把失效模型名放进选择器。
+            # Removed legacy providers must not return through either selector.
             self.assertNotIn("qwen3-vl-flash", source)
 
     def test_preview_uses_the_offline_wysiwyg_formula_renderer(self):
@@ -603,13 +641,16 @@ class EmployeeWorkbenchInteractionTests(unittest.TestCase):
         self.assertIn("onMenuShowOcrSettings", preload)
         self.assertIn("onMenuShowOcrSettings?.(() => this.uiManager?.showSettings())", main)
 
-    def test_auto_page_ocr_setting_is_visible_by_default_and_runs_after_confirmation(self):
+    def test_page_confirmation_only_starts_ocr_for_pending_frames(self):
         html = (APP_JS.parent / "index.html").read_text(encoding="utf-8")
         main = (APP_JS / "main.js").read_text(encoding="utf-8")
-        self.assertIn('id="settingsAutoPageOcrOnConfirm" checked', html)
+        self.assertIn('id="settingsAutoPageOcrOnConfirm" checked disabled', html)
         self.assertIn("autoPageOcrOnConfirm: autoPageOcrOnConfirm", html)
         self.assertIn("paperFlowAutoPageOcrOnConfirm()", main)
-        self.assertIn("await this.recognizeCurrentPage({autoAfterConfirm: true});", main)
+        self.assertIn("return true;", main)
+        self.assertIn("paperflowOcrNeedsRefresh", main)
+        self.assertIn("markPaperFlowFrameOcrDirty(annotation)", main)
+        self.assertIn("await this.recognizeCurrentPage({autoAfterConfirm: true, onlyPendingFrames: true});", main)
         self.assertIn("/api/project/set-ocr-settings", main)
 
     def test_page_ocr_uses_bounded_cloud_parallelism_and_smaller_jpeg_uploads(self):
@@ -768,11 +809,13 @@ if (run(legacyBreak) !== '第一行\n第二行') throw new Error('literal legacy
         self.assertIn("this.paperFlowRecordNumberKey(full) !== number", main)
         self.assertIn("verticalGap >= -8 && verticalGap <= 30", main)
 
-    def test_visible_generation_flow_reports_the_customer_k12_delivery_path(self):
+    def test_client_no_longer_reports_a_local_delivery_path(self):
+        """交付路径只在服务器侧产生；工作台不再展示本地生成结果。"""
         main = (APP_JS / "main.js").read_text(encoding="utf-8")
         api = (ROOT / "desktop_annotation" / "paperflow_annotation_api.py").read_text(encoding="utf-8")
-        self.assertIn("result.k12_output_path", main)
-        self.assertIn('result["k12_output_path"]', api)
+        self.assertNotIn("result.k12_output_path", main)
+        self.assertNotIn("/api/review/generate-delivery", api)
+        # 服务器生成仍然走同一套交付契约。
         self.assertIn("sync_delivery_workspace(project_path", api)
 
     def test_ocr_result_records_engine_and_elapsed_time_without_logging_text(self):
@@ -828,8 +871,8 @@ if (run(legacyBreak) !== '第一行\n第二行') throw new Error('literal legacy
         self.assertIn("flushPendingPaperFlowPrelabelsToProject()", source)
         self.assertIn("await this.persistCurrentPaperFlowCache();", method)
         self.assertIn("paperFlowOpenInProgress", method)
-        self.assertIn("localStorage.setItem('paperflowLastBookRoot'", method)
-        self.assertIn("openPaperFlowBook(lastBookRoot)", source)
+        self.assertIn("localStorage.setItem(accountBookKey", method)
+        self.assertIn("openPaperFlowBook(root, null, {restoring:true})", source)
         self.assertIn("const mainContent = document.querySelector('.main-content');", source)
         self.assertIn("mainContent.style.pointerEvents = 'none';", source)
         self.assertLess(
@@ -918,17 +961,23 @@ if (run(legacyBreak) !== '第一行\n第二行') throw new Error('literal legacy
     def test_final_delivery_uses_the_authenticated_private_upload_flow(self):
         source = (APP_JS / "main.js").read_text(encoding="utf-8")
         page = (APP_JS.parent / "index.html").read_text(encoding="utf-8")
-        self.assertIn('id="uploadPaperFlowDelivery"', page)
-        self.assertIn("openPaperFlowOnlineReview('delivery')", source)
-        self.assertIn("'/api/review/upload-delivery'", source)
-        self.assertIn("delivery_path: this.paperFlowLastDeliveryPath", source)
-        self.assertIn("result.delivery_output_path || result.output_path", source)
+        # Company delivery is generated automatically after final approval.
+        self.assertNotIn('id="uploadPaperFlowDelivery"', page)
+        self.assertNotIn('id="exportPaperFlowProject"', page)
+        self.assertIn('id="companyAccount"', page)
+        self.assertIn("服务器自动生成最终交付", source)
 
-    def test_review_centre_lists_and_replaces_private_deliveries_for_superiors(self):
+    def test_review_centre_lists_delivery_jobs_and_allows_admin_retry(self):
         source = (ROOT / "online_review_beta" / "static" / "app.js").read_text(encoding="utf-8")
         self.assertIn("/api/deliveries/${encodeURIComponent(bookId)}", source)
-        self.assertIn("id=\"deliveryReplacement\"", source)
-        self.assertIn("'/api/deliveries/files'", source)
+        self.assertIn("重新生成交付", source)
+        self.assertIn("/regenerate`,{}", source)
+        self.assertIn("服务器自动排队生成", source)
+        self.assertNotIn("<th>交付生成</th>", source)
+        self.assertIn("生成JSON", (ROOT / "online_review_beta" / "static" / "index.html").read_text(encoding="utf-8"))
+        self.assertIn("适应整页", source)
+        for status in ("等待生成", "正在生成", "生成成功", "生成失败"):
+            self.assertIn(status, source)
 
     def test_failed_confirmation_restores_the_status_from_before_commit(self):
         source = (APP_JS / "main.js").read_text(encoding="utf-8")
@@ -991,29 +1040,34 @@ if (run(legacyBreak) !== '第一行\n第二行') throw new Error('literal legacy
         self.assertIn("'/api/project/set-book-metadata'", method)
         self.assertIn("paperFlowManualSaveInProgress", method)
 
-    def test_group_generation_is_an_explicit_file_menu_action(self):
+    def test_client_no_longer_generates_or_uploads_delivery(self):
+        """生成 JSON 只有服务器一条路；客户端不再保留导出/上传入口。"""
         source = (APP_JS / "main.js").read_text(encoding="utf-8")
         html = (APP_JS.parent / "index.html").read_text(encoding="utf-8")
         electron = (APP_JS.parent / "electron" / "main.js").read_text(encoding="utf-8")
         preload = (APP_JS.parent / "electron" / "preload.js").read_text(encoding="utf-8")
-        self.assertIn("label: '生成交付文件'", electron)
-        self.assertIn("menu-generate-group-delivery", electron)
-        self.assertIn("onMenuGenerateGroupDelivery", preload)
-        self.assertIn("'/api/project/group-export-preflight'", source)
-        self.assertIn("'/api/project/export-match-scope'", source)
-        save_start = source.index("async savePaperFlowPage(")
-        save_end = source.index("async exportPaperFlowProject", save_start)
-        self.assertIn("sync_delivery: false", source[save_start:save_end])
+        company = (APP_JS / "company-review.js").read_text(encoding="utf-8")
+        self.assertNotIn("本地导出", electron)
+        self.assertNotIn("menu-generate-group-delivery", electron)
+        self.assertNotIn("onMenuGenerateGroupDelivery", preload)
+        self.assertNotIn("exportPaperFlowProject", source)
+        self.assertNotIn("exportPaperFlowProject", company)
+        # 工作台只负责提交审核快照，生成与上传都在服务器完成。
+        self.assertNotIn("generate-delivery", source)
+        self.assertNotIn("async generate()", company)
+        self.assertNotIn('<span>生成并上传交付</span>', html)
+        # 保存页仍然只落盘、不触发任何交付同步。
+        self.assertIn("sync_delivery: false", source)
         self.assertIn("paperflowPageAccepted", source)
         self.assertNotIn('id="paperFlowPageKind"', html)
-        self.assertIn('<span>生成交付文件</span>', html)
+        self.assertIn("提交审核", source)
         # 顶部工具栏改成「教材 / 当前页 / 交付」三段分组后，跨组顺序不再固定；
         # 但仍需锁定每一组内部的先后，防止组内的操作步骤被打乱。
         groups = [
             ['id="managePaperFlowPages"', 'id="manageMatchScopes"'],
             ['id="generatePrelabels"', 'id="employeeDrawQuestion"',
              'id="employeeDeleteSelected"', 'id="confirmPaperFlowPage"'],
-            ['id="exportPaperFlowProject"', 'id="submitPaperFlowReview"'],
+            ['id="submitPaperFlowReview"'],
         ]
         for group in groups:
             positions = [html.index(value) for value in group]
@@ -1121,7 +1175,7 @@ if (run(legacyBreak) !== '第一行\n第二行') throw new Error('literal legacy
     def test_confirmed_match_keeps_the_stable_pair_identity_from_backend(self):
         source = (APP_JS / "main.js").read_text(encoding="utf-8")
         start = source.index("async confirmPaperFlowMatch(noAnswer)")
-        end = source.index("async exportPaperFlowProject()", start)
+        end = source.index("async generatePaperFlowPrelabels()", start)
         method = source[start:end]
 
         self.assertIn("const result = await this.paperFlowRequest('/api/project/set-pair'", method)
@@ -1145,7 +1199,7 @@ if (run(legacyBreak) !== '第一行\n第二行') throw new Error('literal legacy
         move_end = source.index("openPaperFlowPageManager()", move_start)
         move_method = source[move_start:move_end]
         manager_start = move_end
-        manager_end = source.index("paperFlowPageForImage(", manager_start)
+        manager_end = source.index("\n    paperFlowPageForImage(", manager_start)
         manager_method = source[manager_start:manager_end]
         persist_start = source.index("async persistCurrentPaperFlowCache()")
         persist_end = source.index("\n    flushPendingPaperFlowPrelabelsToProject()", persist_start)
@@ -1211,6 +1265,42 @@ if (run(legacyBreak) !== '第一行\n第二行') throw new Error('literal legacy
         self.assertIn("renderPageSelectionSection('question', '题目页'", source)
         self.assertIn("renderPageSelectionSection('answer', '答案页'", source)
         self.assertIn('data-scope-page-list="${sectionKind}"', source)
+    def test_logged_out_session_never_attempts_repeated_server_autosaves(self):
+        source = (APP_JS / "main.js").read_text(encoding="utf-8")
+        start = source.index("    schedulePaperFlowSave() {")
+        end = source.index("    commitCurrentPaperFlowPageToMemory", start)
+        method = source[start:end]
+
+        self.assertIn("isPaperFlowServerProject()", source)
+        self.assertIn("canSyncPaperFlowServer()", source)
+        self.assertIn("this.isPaperFlowServerProject() && !this.canSyncPaperFlowServer()", method)
+        self.assertIn("本地修改已保留 · 登录后再同步", method)
+        self.assertIn("if (this.canSyncPaperFlowServer())", method)
+        self.assertLess(method.index("!this.canSyncPaperFlowServer()"),
+                        method.index("await this.persistCurrentPaperFlowCache()"))
+
+    def test_selected_question_frame_can_be_numbered_with_digits_and_space(self):
+        ui = (APP_JS / "ui-manager.js").read_text(encoding="utf-8")
+        main = (APP_JS / "main.js").read_text(encoding="utf-8")
+        shortcut_start = ui.index("    onKeyDown(e) {")
+        shortcut_end = ui.index("    /**", shortcut_start)
+        shortcut = ui[shortcut_start:shortcut_end]
+        handler_start = main.index("    handlePaperFlowQuickNumberKey(key) {")
+        handler_end = main.index("    handleShortcut(shortcut)", handler_start)
+        handler = main[handler_start:handler_end]
+
+        self.assertIn("'1': 'quickNumberDigit'", shortcut)
+        self.assertIn("' ': 'quickNumberNextLevel'", shortcut)
+        self.assertIn("quickNumberZeroOrReset", shortcut)
+        self.assertIn("e.target.tagName === 'SELECT'", shortcut)
+        self.assertIn("entry.level = 'minor'", handler)
+        self.assertIn("entry.major += key", handler)
+        self.assertIn("entry.minor += key", handler)
+        self.assertIn("annotation.attributes.paperflowNumberPath = path", main)
+        self.assertIn("按空格后再输入小题号，如 2，题号即为 3-2", main)
+        self.assertNotIn("switchQuestionPage", main)
+        self.assertNotIn("switchAnswerPage", main)
+        self.assertNotIn("openAnswerMatching", main)
 
 
 if __name__ == "__main__":

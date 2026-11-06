@@ -642,11 +642,265 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
     os.replace(temporary, dataset_path)
     report = {"schema_version": 1, "total_questions": len(ordered_questions),
               "eligible_count": len(lines), "rejected_count": len(ordered_questions) - len(lines),
+              "reason_summary": _reason_summary(report_items),
               "items": report_items}
     _atomic_json(k12_root / "quality_report.json", report)
     _atomic_json(k12_root / "coverage_report.json", _coverage_summary(lines))
     return {"dataset_file": str(dataset_path), "eligible_count": len(lines),
             "rejected_count": report["rejected_count"]}
+
+
+def _reason_summary(items: list[dict], limit: int = 40) -> list[dict]:
+    """Aggregate per-question errors into "what is this book mostly missing"."""
+    buckets: dict[str, dict] = {}
+    for item in items:
+        for reason in item.get("errors", []) or []:
+            bucket = buckets.setdefault(
+                reason, {"reason": reason, "count": 0, "questions": []})
+            bucket["count"] += 1
+            label = str(item.get("question_number") or "")
+            if label and len(bucket["questions"]) < 5 and label not in bucket["questions"]:
+                bucket["questions"].append(label)
+    return sorted(buckets.values(), key=lambda row: (-row["count"], row["reason"]))[:limit]
+
+
+def _relation_maps(project: dict, questions_by_internal: dict,
+                   answers_by_internal: dict) -> tuple[dict[str, dict], dict[str, dict]]:
+    """Accepted question↔answer pairs, keyed by internal record id.
+
+    Shared by the writer and the read-only analyzer so both agree on which
+    pairs count as "matched".
+    """
+    question_relations: dict[str, dict] = {}
+    answer_relations: dict[str, dict] = {}
+    for pair in project.get("pairs", []):
+        if str(pair.get("status", "")) != "accepted" or not pair.get("answer_ids"):
+            continue
+        question = questions_by_internal.get(str(pair.get("question_id", "")))
+        answers = [answers_by_internal.get(str(value)) for value in pair.get("answer_ids", [])]
+        if (
+            not question
+            or str(question[1].get("status", "")) != "accepted"
+            or not answers
+            or any(row is None or str(row[1].get("status", "")) != "accepted" for row in answers)
+        ):
+            continue
+        public_answers = [row[2]["delivery_id"] for row in answers if row]
+        question_relations[question[2]["id"]] = {**pair, "public_answer_ids": public_answers}
+        for answer in (row for row in answers if row):
+            relation = answer_relations.setdefault(answer[2]["id"], {"public_question_ids": []})
+            relation["public_question_ids"].append(question[2]["delivery_id"])
+    return question_relations, answer_relations
+
+
+BOOK_FIELDS = (("language", "语言"), ("stage", "学段"), ("grade", "年级"), ("subject", "学科"))
+
+
+def analyze_delivery(project_path: str | Path, runtime_root: str | Path,
+                     *, identity_path: str | Path | None = None,
+                     project_document: dict | None = None) -> dict:
+    """Read-only readiness report: what blocks this book from generating, and why.
+
+    Runs the same per-question checks as ``_write_k12_delivery`` but crops no
+    image, writes no file and allocates no sample id — operators get the blocker
+    list BEFORE a generation job is queued, instead of a generic failure after.
+    """
+    project_file = Path(project_path).resolve()
+    project = dict(project_document) if project_document is not None else data.load_project(project_file)
+    data.ensure_delivery_ids(project)
+    root = delivery_root(project, runtime_root)
+    question_rows = sorted(
+        [row for row in data.all_questions(project)
+         if row[2].get("region_role", "question") == "question"],
+        key=_record_position,
+    )
+    answer_rows = sorted(
+        [row for row in data.all_answers(project)
+         if row[2].get("region_role", "question") in {"question", "continuation"}],
+        key=_record_position,
+    )
+    questions_by_internal = {record["id"]: (index, page, record)
+                             for index, page, record in question_rows}
+    answers_by_internal = {record["id"]: (index, page, record)
+                           for index, page, record in answer_rows}
+    question_relations, _answer_relations = _relation_maps(
+        project, questions_by_internal, answers_by_internal)
+    continuations_by_parent: dict[str, list[tuple]] = {}
+    for row in answer_rows:
+        record = row[2]
+        if record.get("region_role") == "continuation" and record.get("continuation_of"):
+            continuations_by_parent.setdefault(str(record["continuation_of"]), []).append(row)
+
+    def answer_chain(row: tuple) -> list[tuple]:
+        chain, queue, seen = [], [row], set()
+        while queue:
+            current = queue.pop(0)
+            internal_id = str(current[2].get("id", ""))
+            if internal_id in seen:
+                continue
+            seen.add(internal_id)
+            chain.append(current)
+            queue.extend(sorted(continuations_by_parent.get(internal_id, []), key=_record_position))
+        return chain
+
+    book_id = str(project["delivery_book_id"])
+    book = {"book_id": book_id, "title": _clean_text(project.get("title", "")),
+            "fields": {key: _clean_text(project.get(key)) for key, _label in BOOK_FIELDS},
+            "errors": []}
+    for key, label in BOOK_FIELDS:
+        if not _clean_text(project.get(key)):
+            book["errors"].append(f"缺少{label}")
+        elif key == "language" and book["fields"][key] not in K12_LANGUAGES:
+            book["errors"].append(f"语言不在甲方词表内：{book['fields'][key]}")
+        elif key == "stage" and book["fields"][key] not in K12_STAGES:
+            book["errors"].append(f"学段不在甲方词表内：{book['fields'][key]}")
+        elif key == "grade" and book["fields"][key] not in K12_GRADES:
+            book["errors"].append(f"年级不在甲方词表内：{book['fields'][key]}")
+        elif key == "subject" and book["fields"][key] not in K12_SUBJECTS:
+            book["errors"].append(f"学科不在甲方词表内：{book['fields'][key]}")
+
+    identity_file = (Path(identity_path) if identity_path is not None
+                     else root.parent / "delivery_identity.sqlite3")
+    # Look-only: opening a missing identity file would create it, and a pure
+    # diagnosis must not leave artifacts behind.
+    identity = _DeliveryIdentity(identity_file if identity_file.is_file() else None)
+    ordered_questions = question_rows
+    items: list[dict] = []
+    page_orders: dict[int, int] = {}
+    page_sizes: dict[int, tuple[int, int]] = {}
+    claimed_signatures: dict[str, str] = {}
+    preview: list[dict] = []
+    try:
+        for global_order, (page_index, page, question) in enumerate(ordered_questions, 1):
+            page_number = page_index + 1
+            page_orders[page_index] = page_orders.get(page_index, 0) + 1
+            page_order = page_orders[page_index]
+            relation = question_relations.get(str(question.get("id", "")), {})
+            primary = [answers_by_internal.get(str(value)) for value in relation.get("answer_ids", [])]
+            primary = sorted((item for item in primary if item), key=_record_position)
+            answer_infos = [part for item in primary for part in answer_chain(item)]
+            answers = [_clean_text(item[2].get("answer")) for item in answer_infos]
+            analyses = [_clean_text(item[2].get("analysis")) for item in answer_infos]
+            illustrations = sorted(
+                (item for item in question.get("illustrations", []) if isinstance(item, dict)),
+                key=lambda item: (int(item.get("bbox", [0, 0, 0, 0])[1]),
+                                  int(item.get("bbox", [0, 0, 0, 0])[0])),
+            )
+            slots, image_sizes, full_page_skipped = [], [], 0
+            for illustration in illustrations:
+                kind = str(illustration.get("image_kind", "question_image"))
+                if kind == "ignore":
+                    continue
+                box = illustration.get("bbox", [])
+                width = max(0, int(box[2]) - int(box[0])) if len(box) == 4 else 0
+                height = max(0, int(box[3]) - int(box[1])) if len(box) == 4 else 0
+                page_width, page_height = _page_pixel_size(project, page, page_sizes, page_index)
+                if page_width and page_height and (
+                        (width * height) / float(page_width * page_height) >= FULL_PAGE_AREA_RATIO):
+                    full_page_skipped += 1
+                    continue
+                image_sizes.append((width, height))
+                label = ""
+                if kind == "option_image":
+                    label = re.sub(r"[^A-Za-z0-9]", "",
+                                   str(illustration.get("option_label", ""))).upper() or "X"
+                slots.append((kind, box, label))
+            ocr_question, inferred_options = _split_ocr_choices(question.get("text", ""))
+            options = _string_list(question.get("options", [])) or inferred_options
+            raw_type = _clean_text(question.get("question_type", ""))
+            effective_type = "选择题" if inferred_options else raw_type
+            final_type = K12_QUESTION_TYPES.get(effective_type, effective_type)
+
+            def build_sample(sample_id: str) -> dict:
+                question_images, option_images = [], []
+                q_index = option_index = 0
+                for slot_kind, _slot_box, slot_label in slots:
+                    if slot_kind == "option_image":
+                        option_index += 1
+                        option_images.append(
+                            f"images/{sample_id}_option_{slot_label}_{option_index:02d}.jpg")
+                    else:
+                        q_index += 1
+                        question_images.append(f"images/{sample_id}_img_{q_index:02d}.jpg")
+                return {
+                    "id": sample_id,
+                    "metainfo": {
+                        "language": _clean_text(project.get("language")),
+                        "stage": _clean_text(project.get("stage")),
+                        "grade": _clean_text(project.get("grade")),
+                        "subject": _clean_text(project.get("subject")),
+                        "question_type": final_type,
+                        "difficulty": _clean_text(question.get("difficulty", "")),
+                        "knowledge_points": _string_list(question.get("knowledge_points", [])),
+                    },
+                    "data": {
+                        "question_images": question_images,
+                        "option_images": option_images,
+                        "question": _k12_text(ocr_question),
+                        "options": ([_k12_text(value) for value in options]
+                                    if final_type == "选择" else []),
+                        "answer": _k12_text("\n".join(value for value in answers if value)),
+                        "analysis": _k12_text("\n".join(value for value in analyses if value)),
+                    },
+                    "source": {
+                        "book_id": book_id, "question_page": page_number,
+                        "page_order": page_order,
+                        "question_number": data.display_number(question),
+                        "internal_question_id": question.get("delivery_id", ""),
+                        "internal_answer_ids": [item[2].get("delivery_id", "")
+                                                for item in answer_infos],
+                    },
+                }
+
+            sample = build_sample("0000000")
+            errors = _k12_validation(sample, image_sizes)
+            if full_page_skipped:
+                errors.append(f"已剔除{full_page_skipped}张整页截图（H3③）")
+            signature = _content_signature(sample)
+            if signature in claimed_signatures:
+                errors.append(f"与第{claimed_signatures[signature]}条重复（H3⑩）")
+            if str(page.get("status", "")) != "accepted":
+                errors.append("题目页尚未确认")
+            if relation.get("status") != "accepted" or not answer_infos:
+                errors.append("题目尚未匹配答案")
+            elif any(str(item[1].get("status", "")) != "accepted" for item in answer_infos):
+                errors.append("答案页尚未确认")
+            eligible = (str(page.get("status", "")) == "accepted"
+                        and relation.get("status") == "accepted"
+                        and bool(answer_infos)
+                        and all(str(item[1].get("status", "")) == "accepted"
+                                for item in answer_infos)
+                        and not errors)
+            if eligible:
+                owner = identity.lookup(signature)
+                if owner and str(owner.get("book_id", "")) != book_id:
+                    errors.append(f"与教材 {owner.get('book_id')} 已交付样本内容重复（备注2）")
+                    eligible = False
+                else:
+                    claimed_signatures[signature] = str(
+                        (owner or {}).get("id") or f"{global_order:07d}")
+                    if len(preview) < 3:
+                        preview.append(build_sample(claimed_signatures[signature]))
+            items.append({"page": page_number,
+                          "question_number": data.display_number(question),
+                          "eligible": eligible, "errors": errors})
+    finally:
+        identity.close()
+
+    total = len(items)
+    eligible_count = sum(1 for item in items if item["eligible"])
+    return {
+        "schema_version": 1,
+        "book": book,
+        "total_questions": total,
+        "eligible_count": eligible_count,
+        "rejected_count": total - eligible_count,
+        "deliverable": eligible_count > 0,
+        "reason_summary": _reason_summary(items),
+        "items": items,
+        "sample_preview": preview,
+        "dataset_path": str(root / "k12_dataset" / "dataset.jsonl"),
+    }
 
 
 def _coverage_summary(lines: list[str]) -> dict:
@@ -788,7 +1042,8 @@ def sync_delivery_workspace(project_path: str | Path, runtime_root: str | Path,
                             *, changed_kind: str | None = None,
                             changed_page_index: int | None = None,
                             materialize_all: bool = False,
-                            changed_record_ids: list[str] | None = None) -> dict:
+                            changed_record_ids: list[str] | None = None,
+                            identity_path: str | Path | None = None) -> dict:
     """Sync edited delivery artifacts and rebuild the small authoritative indexes.
 
     Crops are rewritten only when their source signature changes. JSON is cheap and is
@@ -967,7 +1222,10 @@ def sync_delivery_workspace(project_path: str | Path, runtime_root: str | Path,
         materialize_all=materialize_all,
         # 身份库跟随"交付包根目录"共享：服务器上所有书都落在同一个交付根，
         # 跨批次去重因此覆盖全站；本机每个交付根各自独立，不会串书。
-        identity_path=root.parent / "delivery_identity.sqlite3",
+        # 服务器每个版本写在自己的 staging 目录下，所以必须由调用方显式传入
+        # 交付根级路径，否则会变成"每个版本一份空库"、跨批次去重形同虚设。
+        identity_path=Path(identity_path) if identity_path is not None
+        else root.parent / "delivery_identity.sqlite3",
     )
     # Delivery generation may assign missing public IDs, but it is part of the
     # caller's logical mutation and must not advance the renderer CAS revision

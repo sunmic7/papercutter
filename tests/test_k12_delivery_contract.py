@@ -19,6 +19,7 @@ from review_tools.delivery_workspace import (
     _k12_text,
     _mask_pii,
     _strip_noise,
+    analyze_delivery,
     sync_delivery_workspace,
 )
 
@@ -211,6 +212,64 @@ class CrossBatchIdentityTests(unittest.TestCase):
             second, _ = deliver(path, root / "runtime")
             self.assertEqual(len(first), 1)
             self.assertEqual(first[0]["id"], second[0]["id"])
+
+
+class DeliveryDiagnosisTests(unittest.TestCase):
+    """生成前体检：不进队列也能看到缺什么，而且绝不留下文件。"""
+
+    def test_healthy_book_is_deliverable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = analyze_delivery(build_project(root, texts=["求面积。"]), root / "runtime")
+            self.assertTrue(report["deliverable"])
+            self.assertEqual(report["eligible_count"], 1)
+            self.assertEqual(report["reason_summary"], [])
+            self.assertEqual(report["book"]["errors"], [])
+            self.assertEqual(sorted(report["sample_preview"][0]),
+                             ["data", "id", "metainfo", "source"])
+
+    def test_missing_question_field_is_named(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = build_project(root, texts=["求面积。"], difficulty="")
+            report = analyze_delivery(path, root / "runtime")
+            self.assertFalse(report["deliverable"])
+            reasons = {row["reason"]: row for row in report["reason_summary"]}
+            self.assertIn("缺少难度", reasons)
+            self.assertEqual(reasons["缺少难度"]["count"], 1)
+            self.assertTrue(reasons["缺少难度"]["questions"])
+
+    def test_missing_book_meta_is_reported_separately(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = build_project(root, texts=["求面积。"])
+            project = data.load_project(path)
+            project["grade"] = ""
+            data.save_project(project, path, increment_revision=False)
+            report = analyze_delivery(path, root / "runtime")
+            self.assertIn("缺少年级", report["book"]["errors"])
+            self.assertFalse(report["deliverable"])
+
+    def test_diagnosis_writes_nothing_and_matches_generation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = build_project(root, texts=["求面积。", "求周长。"])
+            runtime = root / "runtime"
+            report = analyze_delivery(path, runtime)
+            self.assertFalse((runtime / "delivery_packages").exists(),
+                             "体检不得创建交付目录")
+            samples, _delivery = deliver(path, runtime)
+            self.assertEqual(report["eligible_count"], len(samples))
+
+    def test_quality_report_carries_reason_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = build_project(root, texts=["求面积。"], question_type="火星题")
+            _samples, delivery = deliver(path, root / "runtime")
+            report = json.loads((delivery / "k12_dataset" / "quality_report.json")
+                                .read_text(encoding="utf-8"))
+            self.assertTrue(report["reason_summary"])
+            self.assertEqual(report["reason_summary"][0]["count"], 1)
 
 
 if __name__ == "__main__":

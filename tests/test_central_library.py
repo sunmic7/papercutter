@@ -496,6 +496,40 @@ class DistributedServerCroppingTests(unittest.TestCase):
         self.assertIn('原书页面图不完整', str(caught.exception))
         self.assertIn('直接重试不会成功', str(caught.exception))
 
+    def test_diagnosis_names_blockers_before_any_generation(self):
+        """排队前就能看到缺什么，而且体检本身不产生交付版本。"""
+        submission = self._approved_submission()
+        self._strip_roots_and_upload_scans(submission['id'])
+        report = self.library.diagnose_delivery(self.reviewer, self.book_id)
+        self.assertEqual(report['project_source'], 'frozen')
+        self.assertEqual(report['review']['pending_count'], 0)
+        self.assertEqual(report['review']['approved_count'], report['review']['page_count'])
+        self.assertTrue(report['deliverable'], report['reason_summary'])
+        self.assertEqual(report['eligible_count'], 1)
+        _book, assignment, _root = self.library.book(self.reviewer, self.book_id)
+        final_root = self.store._delivery_root(assignment, self.book_id)
+        self.assertFalse((final_root / 'current.json').exists(), '体检不得发布交付版本')
+        result = self.store.run_next_delivery_job()
+        self.assertEqual(result['status'], 'succeeded', result.get('error'))
+        self.assertEqual(result['k12']['eligible_count'], report['eligible_count'])
+
+    def test_diagnosis_reports_what_is_still_missing(self):
+        """缺字段时给出逐题原因，而不是泛泛的"没有符合规范的题目"。"""
+        submission = self._approved_submission()
+        frozen, _target = self._strip_roots_and_upload_scans(submission['id'])
+        project = json.loads(frozen.read_text(encoding='utf-8'))
+        for page in project.get('pages') or []:
+            for question in page.get('questions') or []:
+                question['difficulty'] = ''
+                question['knowledge_points'] = []
+        frozen.write_text(json.dumps(project, ensure_ascii=False), encoding='utf-8')
+        report = self.library.diagnose_delivery(self.reviewer, self.book_id)
+        self.assertFalse(report['deliverable'])
+        reasons = {row['reason'] for row in report['reason_summary']}
+        self.assertIn('缺少难度', reasons)
+        self.assertIn('缺少知识点', reasons)
+        self.assertTrue(report['items'])
+
 
 if __name__ == '__main__':
     unittest.main()

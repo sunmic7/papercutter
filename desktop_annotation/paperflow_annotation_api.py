@@ -69,6 +69,7 @@ from review_tools import online_review_sync as review_sync
 export_project = _lazy_function('review_tools.export_manual_annotations', 'export_project')
 delivery_root = _lazy_function('review_tools.delivery_workspace', 'delivery_root')
 sync_delivery_workspace = _lazy_function('review_tools.delivery_workspace', 'sync_delivery_workspace')
+analyze_delivery = _lazy_function('review_tools.delivery_workspace', 'analyze_delivery')
 export_scope = _lazy_function('review_tools.group_delivery', 'export_scope')
 preflight_scope = _lazy_function('review_tools.group_delivery', 'preflight_scope')
 from review_tools.workspace_store import database_path, page_snapshot, sync_project
@@ -81,7 +82,6 @@ from review_tools.online_review_sync import (
     pull_review_decisions,
     push_project_snapshot,
     submit_review_snapshot,
-    upload_final_delivery,
     upload_project_source_images,
 )
 auto_book_profile = _lazy_function('cut_questions_v4', 'auto_book_profile')
@@ -1976,35 +1976,6 @@ def _review_status(payload: dict) -> dict:
     return result
 
 
-def _review_generate_delivery(payload: dict) -> dict:
-    status = _review_status(payload)
-    if not status["can_deliver"]:
-        raise ValueError("当前本地版本尚未全部审核通过。请更新服务器工程、提交对应版本并完成审核。")
-    # The same authenticated actor and approved local snapshot generate AND upload.
-    result = _export_match_scope(payload)
-    quality_path = Path(result["delivery_output_path"]) / "k12_dataset" / "quality_report.json"
-    try:
-        quality = json.loads(quality_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise RuntimeError("无法读取本次最终交付质量报告，未上传任何文件。") from error
-    eligible = int(quality.get("eligible_count", 0) or 0)
-    if eligible <= 0:
-        failures: dict[str, int] = {}
-        for item in quality.get("items", []):
-            for reason in item.get("errors", []):
-                failures[str(reason)] = failures.get(str(reason), 0) + 1
-        summary = "、".join(f"{name} {count} 题" for name, count in
-                            sorted(failures.items(), key=lambda row: (-row[1], row[0]))[:5])
-        raise ValueError(
-            "本次没有符合客户交付规范的题目，未上传任何文件。"
-            f"请先补全教材元数据和题目字段，再生成；质量报告：{quality_path}"
-            + (f"；主要缺项：{summary}" if summary else "")
-        )
-    uploaded = _review_upload_delivery({**payload, "delivery_path": result["delivery_output_path"]})
-    _, project = _load_project(payload)
-    return {**result, "upload": uploaded, "project_revision": project["project_revision"]}
-
-
 def _authenticated_review_route(handler, roles=None):
     def run(payload):
         # Session credentials override all caller-supplied server/account fields.
@@ -2090,12 +2061,6 @@ def _review_pull_decisions(payload: dict) -> dict:
         **result,
         "notice": "审核结论已保存到教材本地目录，未生成、修改或上传任何最终裁图和最终 JSON。",
     }
-
-
-def _review_upload_delivery(payload: dict) -> dict:
-    project_path, _project = _load_project(payload)
-    result = upload_final_delivery(str(payload.get("server_url", "")), str(payload.get("username", "")), str(payload.get("password", "")), project_path, str(payload.get("delivery_path", "")), **_review_token_kwargs(payload))
-    return {"ok": True, **result, "notice": "最终交付已按账号上传到服务器私有目录。"}
 
 
 def _review_list_projects(payload: dict) -> dict:
@@ -2728,7 +2693,6 @@ ROUTES = {
     "/api/project/export-match-scope": _export_match_scope,
     "/api/review/submit": _review_submit,
     "/api/review/pull-decisions": _review_pull_decisions,
-    "/api/review/upload-delivery": _review_upload_delivery,
     "/api/review/list-projects": _review_list_projects,
     "/api/review/import-project": _review_import_project,
     "/api/review/push-project": _review_push_project,
@@ -2754,9 +2718,8 @@ ROUTES.update({
     "/api/review/logout": lambda payload: REVIEW_SESSION.logout(),
     "/api/review/forget-on-exit": lambda payload: REVIEW_SESSION.forget_on_exit(),
     "/api/review/status": _authenticated_review_route(_review_status),
-    "/api/review/generate-delivery": _authenticated_review_route(_review_generate_delivery, REVIEWERS),
 })
-MUTATING_ROUTES.update({"/api/review/submit", "/api/review/generate-delivery"})
+MUTATING_ROUTES.update({"/api/review/submit"})
 
 
 class PaperFlowHandler(BaseHTTPRequestHandler):
