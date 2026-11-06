@@ -10,6 +10,15 @@ from review_tools import online_review_sync
 
 
 class OnlineReviewSyncTests(unittest.TestCase):
+    def test_title_is_preserved_across_generated_storage_folders(self):
+        project = {"delivery_book_id": "B0123456789ABCDEF0123456789ABCDEF",
+            "book_root": "J:/central/B0123456789ABCDEF0123456789ABCDEF",
+            "source_book_name": "数学六年级下册（北师大版）"}
+        self.assertEqual(online_review_sync.project_book_name(project, "cache/project.json"), "数学六年级下册（北师大版）")
+        project.pop("source_book_name")
+        project["book_root"] = r"F:\测试\原版教材"
+        self.assertEqual(online_review_sync.project_book_name(project, "cache/project.json"), "原版教材")
+
     def test_project_sync_document_removes_local_textbook_roots(self):
         with tempfile.TemporaryDirectory() as directory:
             project_path = Path(directory) / "PaperFlow标注项目.json"
