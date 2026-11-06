@@ -229,6 +229,17 @@ class CentralLibraryTests(unittest.TestCase):
         return self.library.operate(user, {'book_id': self.book_id, 'operation': operation,
             'payload': payload or {}, 'client_id': client, 'base_revision': revision})
 
+    def test_diagnose_before_any_project_explains_instead_of_errno(self):
+        """刚分配、还没提交标注的教材，点「检查缺什么」要看到人话而不是 Errno 2。"""
+        project_file = self.library.project_file(self.book_id)
+        if project_file.is_file():
+            project_file.unlink()
+        with self.assertRaises(ValueError) as caught:
+            self.library.diagnose_delivery(self.reviewer, self.book_id)
+        message = str(caught.exception)
+        self.assertIn('标注工程', message)
+        self.assertNotIn('Errno', message)
+
     def test_full_annotation_review_delivery_cycle_preserves_originals(self):
         opened = self.library.open(self.marker, {'book_id': self.book_id, 'client_id': 'marker-desk'})
         self.assertEqual(opened['project_path'], 'server://' + self.book_id)
