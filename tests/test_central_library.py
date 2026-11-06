@@ -53,6 +53,21 @@ class CentralLibraryTests(unittest.TestCase):
         fresh={**self.marker,'_lease_session_hash':hashlib.sha256(token.encode()).hexdigest()}
         self.library.acquire(fresh,self.book_id,'new-computer')
 
+    def test_discovery_counts_every_scan_under_the_book_folder_in_one_pass(self):
+        """扫描只走一遍文件系统，统计仍要把题目/答案/数字子目录都算进来。"""
+        image = (self.sources / 'math-2015' / '1.jpg').read_bytes()
+        book = self.sources.parent / '2020' / '合集教材'
+        for parts, name in ((('题目',), 'a.jpg'), (('答案',), 'b.jpg'), (('1', '题目'), 'c.jpg')):
+            folder = book.joinpath(*parts)
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / name).write_bytes(image)
+        discovered = self.library._discover_books(self.sources.parent / '2020')
+        self.assertEqual(1, len(discovered))
+        folder, count, size = discovered[0]
+        self.assertEqual(book, folder)
+        self.assertEqual(3, count)
+        self.assertEqual(len(image) * 3, size)
+
     def test_folder_registration_recurses_and_survives_restart_without_duplicate_books(self):
         from online_review_beta.central_library import CentralLibrary
         year = self.sources.parent / '2016'
