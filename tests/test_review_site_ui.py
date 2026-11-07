@@ -37,15 +37,19 @@ class DiagnosisExampleTests(unittest.TestCase):
 
 
 class DeliveryCheckEntryTests(unittest.TestCase):
-    """「检查缺什么」和「页面明细」是同一件事的两个维度，合成一个入口。"""
+    """「检查缺什么」和「页面明细」合成一个入口，并改成整页 + 左侧菜单。
+
+    题目一多，逐题明细就是几百行；原来的做法是把所有块堆在一个弹窗里一路往下拉，
+    操作员要看最后一页得滚很久。现在左边点菜单、右边只看这一块，明细自带分页。
+    """
 
     def setUp(self):
         self.source = (STATIC / "app.js").read_text(encoding="utf-8")
 
     def test_one_merged_entry_replaces_two_buttons(self):
         self.assertIn("检查与明细", self.source)
-        self.assertIn("function deliveryCheckHtml(", self.source)
-        self.assertIn("async function openDeliveryCheck(", self.source)
+        self.assertIn("async function showDeliveryCheck(", self.source)
+        self.assertIn("function checkShellHtml(", self.source)
         self.assertNotIn("diagnose-delivery", self.source)
         self.assertNotIn("delivery-pages'", self.source)
 
@@ -55,9 +59,42 @@ class DeliveryCheckEntryTests(unittest.TestCase):
         self.assertNotIn("preview-live-samples", self.source)
         self.assertNotIn("openLiveSamples", self.source)
 
-    def test_merged_panel_shows_both_dimensions(self):
-        self.assertIn("生成后的逐页收录", self.source)
-        self.assertIn("pageCoverageHtml(pages)", self.source)
+    def test_panel_is_a_full_page_with_a_menu(self):
+        # 不再是 showPanel 弹窗，而是和「预览内容」一样的整页视图。
+        self.assertIn("'checkView'", self.source)
+        self.assertIn("class=\"chk-body\"", self.source)
+        self.assertIn("class=\"chk-menu\"", self.source)
+        for key, label in (("overview", "概览"), ("missing", "缺什么"),
+                           ("items", "逐题明细"), ("pages", "逐页收录")):
+            self.assertIn(f"['{key}','{label}']", self.source)
+
+    def test_item_detail_is_paginated(self):
+        # 逐题明细必须分页，不能一次把几百行全铺出来；分页条还要在表格上方，
+        # 否则一页 30 条也得先滚到底才能翻页。
+        self.assertIn("CHECK_PAGE_SIZE = 30", self.source)
+        self.assertIn("paginate(filtered,checkState.page,CHECK_PAGE_SIZE)", self.source)
+        self.assertIn("bindPager(panel,checkState.lastPage", self.source)
+        self.assertIn('class="chk-listhead"', self.source)
+
+    def test_missing_reason_row_jumps_to_filtered_items(self):
+        self.assertIn("data-reason-jump", self.source)
+        self.assertIn("checkState.reason=node.dataset.reasonJump", self.source)
+        self.assertIn("data-clear-filter", self.source)
+
+    def test_hints_and_sample_json_are_no_longer_shown_here(self):
+        # 两个碍眼的块都撤了：题图提醒没有行动价值，JSON 说明搬到「预览内容」。
+        self.assertNotIn("只是提醒，不影响生成", self.source)
+        self.assertNotIn("可交付样本长什么样", self.source)
+
+    def test_delivery_json_is_explained_in_the_preview(self):
+        self.assertIn("交付 JSON（这条题写进 dataset.jsonl 的原文）", self.source)
+        self.assertIn("甲方拿到的就是它", self.source)
+
+    def test_page_coverage_is_hidden_from_annotators(self):
+        # 逐页明细接口只对审核员/管理员开放，标注员点开时降级成一句说明。
+        self.assertIn("逐页收录明细只对有审核权限的账号开放", self.source)
+        server = (STATIC.parent / "central_library.py").read_text(encoding="utf-8")
+        self.assertIn("只有审核员或管理员可以查看交付页面明细", server)
 
     def test_page_coverage_is_hidden_from_annotators(self):
         # 逐页明细接口只对审核员/管理员开放，标注员点开时降级成一句说明。
