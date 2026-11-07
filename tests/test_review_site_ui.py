@@ -5,6 +5,7 @@
 "第N页 题号"，而那个页号是扫描页序，和书上的印刷页码对不上。
 """
 from pathlib import Path
+import re
 import unittest
 
 
@@ -103,6 +104,48 @@ class DeliveryCheckEntryTests(unittest.TestCase):
         self.assertIn("只有审核员或管理员可以查看交付页面明细", server)
 
 
+class RegenerateSucceededDeliveryTests(unittest.TestCase):
+    """生成成功之后还要能再来一次：后面补了新题、改了标注，全靠这个按钮继续出包。"""
+
+    def setUp(self):
+        self.source = (STATIC / "app.js").read_text(encoding="utf-8")
+
+    def test_succeeded_rows_still_offer_regenerate(self):
+        self.assertIn("const rerun=state==='succeeded';", self.source)
+        self.assertIn("['failed','not_generated','awaiting_review'].includes(state)||rerun", self.source)
+        self.assertIn("rerun?'重新生成'", self.source)
+
+    def test_regenerate_is_forced(self):
+        # 不带 force 时后端看到已有成功任务会直接返回 already_queued，按钮就成摆设。
+        self.assertIn("data-force=\"${rerun?'1':''}\"", self.source)
+        self.assertIn("{force:Boolean(force),only_reviewed:Boolean(values.only_reviewed)}", self.source)
+
+    def test_regenerate_dialog_says_the_old_version_is_replaced(self):
+        self.assertIn("生成成功后新版本替换上一版，旧的那份 JSON 一并删除", self.source)
+
+
+class PreviewRenderSafetyTests(unittest.TestCase):
+    """交付预览整页崩过一次：``map(text=>`` 被写成 ``map(text=``，
+    strict mode 下每次迭代都抛 ``text is not defined``，页面只剩一句报错。"""
+
+    def setUp(self):
+        self.source = (STATIC / "app.js").read_text(encoding="utf-8")
+
+    def test_no_assignment_inside_callback_parameters(self):
+        broken = re.compile(r"\.(?:map|filter|forEach|find|some|every)\(\s*[A-Za-z_$][\w$]*\s*=(?![=>])")
+        self.assertEqual(broken.findall(self.source), [],
+                         "回调参数写成了赋值（漏了 =>），运行时会抛 ReferenceError")
+
+    def test_analysis_only_shows_when_not_already_merged(self):
+        # 答案与解析已经合并；analysis 只有在没并进 answer 时才单独补一块。
+        self.assertIn("const hasExtraAnalysis = extraAnalysis && !String(body.answer || '').includes(extraAnalysis);", self.source)
+        self.assertIn("${hasExtraAnalysis ?", self.source)
+
+    def test_preview_keeps_answer_and_analysis_in_one_block(self):
+        self.assertIn("<h4>答案与解析</h4>", self.source)
+        self.assertNotIn("<h4>详细解析</h4>", self.source)
+
+
 class TaskListGroupingTests(unittest.TestCase):
     """同一本教材提交过多次时，列表只给最新一条；要看全部走「历史版本」。"""
 
@@ -189,9 +232,3 @@ class WordingGuardTests(unittest.TestCase):
             if not path.is_file():
                 continue
             self.assertNotIn("甲方", path.read_text(encoding="utf-8"), f"{path.name} 里还有“甲方”字样")
-
-    def test_answer_and_analysis_share_one_block(self):
-        source = (STATIC / "app.js").read_text(encoding="utf-8")
-        self.assertIn("<h4>答案与解析</h4>", source)
-        # 解析已经并进答案，单独的「详细解析」块不再常驻；旧数据才补一块「补充解析」。
-        self.assertNotIn("<h4>详细解析</h4>", source)
