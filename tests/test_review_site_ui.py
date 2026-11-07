@@ -19,10 +19,51 @@ class TaskStatusCardTests(unittest.TestCase):
 
 
 class DiagnosisExampleTests(unittest.TestCase):
-    def test_example_column_header_is_just_the_question_number(self):
-        source = (STATIC / "app.js").read_text(encoding="utf-8")
-        self.assertIn("<th>示例题号</th>", source)
-        self.assertNotIn("示例（页码 · 题号）", source)
+    """汇总表只说"缺什么、各多少题"；具体是哪几道题，看下面的逐题明细。
+
+    这张表曾经挂过「示例题号」一列（先是裸题号，后来是"第N页 2-1"），
+    两种写法都被操作员判为看不懂，而且和逐题明细重复，已整列去掉。
+    """
+
+    def setUp(self):
+        self.source = (STATIC / "app.js").read_text(encoding="utf-8")
+
+    def test_summary_table_has_no_example_column(self):
+        self.assertNotIn("<th>示例题号</th>", self.source)
+        self.assertNotIn("示例（页码 · 题号）", self.source)
+
+    def test_summary_table_keeps_reason_and_count(self):
+        self.assertIn("<th>缺少项</th><th>题数</th>", self.source)
+
+
+class DeliveryCheckEntryTests(unittest.TestCase):
+    """「检查缺什么」和「页面明细」是同一件事的两个维度，合成一个入口。"""
+
+    def setUp(self):
+        self.source = (STATIC / "app.js").read_text(encoding="utf-8")
+
+    def test_one_merged_entry_replaces_two_buttons(self):
+        self.assertIn("检查与明细", self.source)
+        self.assertIn("function deliveryCheckHtml(", self.source)
+        self.assertIn("async function openDeliveryCheck(", self.source)
+        self.assertNotIn("diagnose-delivery", self.source)
+        self.assertNotIn("delivery-pages'", self.source)
+
+    def test_live_sample_list_is_gone(self):
+        # 「实时题单」与「预览内容」同源，且服务器端早已不产草稿目录，入口已删。
+        self.assertNotIn("实时题单", self.source)
+        self.assertNotIn("preview-live-samples", self.source)
+        self.assertNotIn("openLiveSamples", self.source)
+
+    def test_merged_panel_shows_both_dimensions(self):
+        self.assertIn("生成后的逐页收录", self.source)
+        self.assertIn("pageCoverageHtml(pages)", self.source)
+
+    def test_page_coverage_is_hidden_from_annotators(self):
+        # 逐页明细接口只对审核员/管理员开放，标注员点开时降级成一句说明。
+        self.assertIn("逐页收录明细只对有审核权限的账号开放", self.source)
+        server = (STATIC.parent / "central_library.py").read_text(encoding="utf-8")
+        self.assertIn("只有审核员或管理员可以查看交付页面明细", server)
 
 
 class TaskListGroupingTests(unittest.TestCase):
