@@ -972,10 +972,10 @@ if (run(legacyBreak) !== '第一行\n第二行') throw new Error('literal legacy
         source = (ROOT / "online_review_beta" / "static" / "app.js").read_text(encoding="utf-8")
         self.assertIn("/api/deliveries/${encodeURIComponent(bookId)}", source)
         self.assertIn("重新生成交付", source)
-        self.assertIn("/regenerate`,{}", source)
-        # 生成不再要求整本审完：按页收录已放行的内容，整本放行后自动出完整版。
-        self.assertIn("整本放行后自动出完整版", source)
-        self.assertIn("只收录已放行的页面", source)
+        self.assertIn("only_reviewed", source)
+        # 生成不再要求整本审完：按甲方字段判定，字段齐全就能出包。
+        self.assertIn("按甲方字段判定", source)
+        self.assertIn("只收录审核已通过的页面", source)
         self.assertNotIn("<th>交付生成</th>", source)
         self.assertIn("生成JSON", (ROOT / "online_review_beta" / "static" / "index.html").read_text(encoding="utf-8"))
         self.assertIn("适应整页", source)

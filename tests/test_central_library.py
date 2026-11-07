@@ -284,8 +284,8 @@ class CentralLibraryTests(unittest.TestCase):
         self.operate(self.marker, '/api/library/release')
         review = self.library.open(self.reviewer, {'book_id': self.book_id, 'client_id': 'review-desk'})
         self.assertEqual(review['project']['pages'][0]['questions'][0]['text'], '实验题')
-        with self.assertRaises(ValueError):
-            self.operate(self.reviewer, '/api/review/generate-delivery', client='review-desk')
+        # 默认按甲方字段判定：还没放行也能出包，这里不再被拦。
+        # 严格模式（only_reviewed）仍要求整页放行，见 test_partial_approval...。
         submission = self.store.list_submissions(self.reviewer)[0]
         frozen_project = self.store.preview_root / submission['id'] / 'project.json'
         self.assertTrue(frozen_project.is_file())
@@ -368,7 +368,8 @@ class CentralLibraryTests(unittest.TestCase):
             if page['kind'] == 'answer' or page['page_index'] == 0:
                 self.store.decide_page(self.reviewer, submission['id'], page['page_key'], 'approved', '')
         # 只放行第 1 页，仍然可以生成——这正是"不必等整本审完"。
-        self.store.retry_delivery(self.reviewer, self.book_id, force=True)
+        # 严格模式（only_reviewed）：只收录放行页，版本标 partial。
+        self.store.retry_delivery(self.reviewer, self.book_id, force=True, only_reviewed=True)
         first = self.store.run_next_delivery_job()
         self.assertEqual(first['status'], 'succeeded', first.get('error'))
         self.assertTrue(first['partial'])
@@ -763,7 +764,8 @@ class PageCoverageTests(unittest.TestCase):
             {"page": 4, "eligible": False, "errors": ["该题所在页面尚未审核放行"]},
         ]
         report = build_page_coverage(book_id='b1', version='v1', partial=True,
-                                     decisions=decisions, items=items, generated_at='now')
+                                     decisions=decisions, items=items, generated_at='now',
+                                     only_reviewed=True)
         summary = report['summary']
         self.assertEqual(summary['question_pages'], 5)
         self.assertEqual(summary['delivered_pages'], 1)

@@ -28,7 +28,8 @@ from review_tools.delivery_workspace import (
 
 def build_project(root: Path, *, texts: list[str], difficulty: str = "中等",
                   question_type: str = "填空题", box: tuple[int, int, int, int] = (20, 20, 220, 220),
-                  output_root: Path | None = None, subject: str = "数学") -> Path:
+                  output_root: Path | None = None, subject: str = "数学",
+                  illustrations: bool = True) -> Path:
     """Create a complete, otherwise-valid project with one question per text."""
     question_root, answer_root = root / "questions", root / "answers"
     question_root.mkdir(parents=True, exist_ok=True)
@@ -47,7 +48,8 @@ def build_project(root: Path, *, texts: list[str], difficulty: str = "中等",
         record = data.new_record(
             [0, y, 300, y + 240], major_number=f"一{index + 1}", text=text,
             question_type=question_type, difficulty=difficulty, knowledge_points=["测试"],
-            illustrations=[{"bbox": list(box), "image_kind": "question_image"}],
+            illustrations=([{"bbox": list(box), "image_kind": "question_image"}]
+                           if illustrations else []),
         )
         answer = data.new_record([0, y, 300, y + 240], answer=True,
                                  major_number=f"一{index + 1}", analysis="详细解析过程")
@@ -328,31 +330,103 @@ class IdentityOverwriteTests(unittest.TestCase):
                 connection.close()
 
 
-class PartialApprovalTests(unittest.TestCase):
-    """部分放行：只收录"题目页和答案页都放行"的题，页号按 (种类, 序号) 判。"""
+class DeliveryScopeTests(unittest.TestCase):
+    """进包口径：默认按甲方字段判定，审核只否决"退回/需精修"。"""
 
-    def test_only_pages_approved_in_both_lists_reach_the_package(self):
+    def test_fields_are_enough_without_any_review(self):
+        """没审过的页也能出包——抽检流程不能被全量审核卡住。"""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             path = build_project(root, texts=["题一"])
-            self.assertEqual(deliver(path, root / "runtime", allowed_pages=set())[0], [])
-            # 只放行题目页：答案还没复核，这一题不能进包。
-            self.assertEqual(
-                deliver(path, root / "runtime", allowed_pages={("question", 0)})[0], [])
-            rows, _delivery = deliver(
-                path, root / "runtime",
-                allowed_pages={("question", 0), ("answer", 0)})
+            rows, _delivery = deliver(path, root / "runtime", allowed_pages=set())
             self.assertEqual(len(rows), 1)
 
-    def test_unapproved_question_is_reported_not_silently_dropped(self):
+    def test_reviewed_only_mode_needs_both_lists_approved(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             path = build_project(root, texts=["题一"])
-            _rows, delivery = deliver(path, root / "runtime", allowed_pages=set())
+            self.assertEqual(
+                deliver(path, root / "runtime", allowed_pages=set(),
+                        only_reviewed=True)[0], [])
+            # 只放行题目页：答案还没复核，严格模式下这一题不能进包。
+            self.assertEqual(
+                deliver(path, root / "runtime",
+                        allowed_pages={("question", 0)}, only_reviewed=True)[0], [])
+            rows, _delivery = deliver(
+                path, root / "runtime",
+                allowed_pages={("question", 0), ("answer", 0)}, only_reviewed=True)
+            self.assertEqual(len(rows), 1)
+
+    def test_review_unapproved_page_is_counted_out_of_scope(self):
+        """严格模式下没放行的页是"还没审"，不是"缺字段"。"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = build_project(root, texts=["题一"])
+            _rows, delivery = deliver(path, root / "runtime", allowed_pages=set(),
+                                      only_reviewed=True)
+            report = json.loads((delivery / "k12_dataset" / "quality_report.json")
+                                .read_text(encoding="utf-8"))
+            self.assertEqual(report["total_questions"], 0)
+            self.assertEqual(report["scope"]["skipped_unreviewed_questions"], 1)
+            self.assertEqual(report["scope"]["skipped_unreviewed_pages"], 1)
+            self.assertEqual(report["reason_summary"], [])
+
+    def test_answer_page_not_approved_blocks_only_in_strict_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = build_project(root, texts=["题一"])
+            _rows, delivery = deliver(path, root / "runtime",
+                                      allowed_pages={("question", 0)},
+                                      only_reviewed=True)
             report = json.loads((delivery / "k12_dataset" / "quality_report.json")
                                 .read_text(encoding="utf-8"))
             reasons = {row["reason"] for row in report["reason_summary"]}
-            self.assertIn("该题所在页面尚未审核放行", reasons)
+            self.assertIn("答案页尚未审核放行", reasons)
+
+    def test_returned_page_never_reaches_the_package(self):
+        """审核员明确退回的页：字段再齐也不收，且要说清原因。"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = build_project(root, texts=["题一"])
+            rows, delivery = deliver(
+                path, root / "runtime",
+                rejected_pages={("question", 0)})
+            report = json.loads((delivery / "k12_dataset" / "quality_report.json")
+                                .read_text(encoding="utf-8"))
+            self.assertEqual(rows, [])
+            self.assertEqual(report["scope"]["blocked_by_review_questions"], 1)
+            self.assertEqual(report["scope"]["blocked_by_review_pages"], 1)
+
+    def test_answer_text_falls_back_to_ocr_when_answer_is_blank(self):
+        """答案框只做了 OCR、没人工填 answer：不能判成缺少标准答案。"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = build_project(root, texts=["题一"])
+            project = json.loads(path.read_text(encoding="utf-8"))
+            for page in project["answer_pages"]:
+                for record in page["answers"]:
+                    record["text"] = "12. 56 68 37 62."
+                    record["answer"] = ""
+            path.write_text(json.dumps(project, ensure_ascii=False), encoding="utf-8")
+            rows, delivery = deliver(path, root / "runtime")
+            self.assertEqual(len(rows), 1)
+            self.assertIn("56", rows[0]["data"]["answer"])
+            report = json.loads((delivery / "k12_dataset" / "quality_report.json")
+                                .read_text(encoding="utf-8"))
+            self.assertEqual(report["reason_summary"], [])
+
+    def test_missing_illustration_is_only_a_hint(self):
+        """题图不是必填：question_images 字段存在且为空数组就合规。"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = build_project(root, texts=["题一"], illustrations=False)
+            rows, delivery = deliver(path, root / "runtime")
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["data"]["question_images"], [])
+            report = json.loads((delivery / "k12_dataset" / "quality_report.json")
+                                .read_text(encoding="utf-8"))
+            self.assertEqual(report["reason_summary"], [])
+            self.assertEqual(report["hint_summary"][0]["reason"], "本题没有题图")
 
 
 if __name__ == "__main__":

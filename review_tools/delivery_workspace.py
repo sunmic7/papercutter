@@ -467,9 +467,32 @@ def _unicode_math_text(value: object) -> str:
     return _clean_text(convert(source)).replace("{", "(").replace("}", ")")
 
 
-def _k12_validation(sample: dict, image_sizes: list[tuple[int, int]]) -> list[str]:
+def _answer_body_text(record: dict) -> str:
+    """答案记录的正文：人工填的标准答案优先，其次答案框的 OCR 原文。
+
+    快照层（``enrich_snapshot._answer_text``）会退到 ``analysis``，但交付的
+    "标准答案"字段不能拿解析过程顶替，所以顺序是 answer → text → analysis。
+    答案框只做了 OCR、没人工填 answer 时，这里能取到 ``text``，不该判缺答案。
+    """
+    if not isinstance(record, dict):
+        return ""
+    for key in ("answer", "text", "analysis"):
+        value = _clean_text(record.get(key))
+        if value:
+            return value
+    return ""
+
+
+def _k12_validation(sample: dict, image_sizes: list[tuple[int, int]]) -> tuple[list[str], list[str]]:
+    """Return ``(errors, hints)``: errors block delivery, hints only inform.
+
+    题图不是必填项 —— 甲方 schema 要求 ``question_images`` 字段存在，空数组是
+    合法值；一本练习册里大部分题本来就没有插图。原来把"没有题图"当拒收理由，
+    会让整本书一条都出不来。
+    """
     meta, body = sample["metainfo"], sample["data"]
     errors = []
+    hints: list[str] = []
     required_meta = {
         "language": "语言", "stage": "学段", "grade": "年级", "subject": "学科",
         "question_type": "题型", "difficulty": "难度",
@@ -490,27 +513,32 @@ def _k12_validation(sample: dict, image_sizes: list[tuple[int, int]]) -> list[st
         if any(marker in str(option) for marker in GARBLED_MARKERS):
             errors.append(f"选项{index + 1}含乱码字符")
     if not body.get("question_images") and not any(body.get("option_images", [])):
-        errors.append("缺少有效题图")
+        hints.append("本题没有题图")
     if any(min(width, height) < 128 for width, height in image_sizes):
         errors.append("图片最短边低于128像素")
     if meta.get("question_type") == "选择" and len(body.get("options", [])) < 2:
         errors.append("选择题选项不完整")
-    return errors
+    return errors, hints
 
 
 def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_rows: list,
                         question_relations: dict[str, dict], *, changed_page_index: int | None,
                         materialize_all: bool, identity_path: Path | None = None,
-                        allowed_pages: set[tuple[str, int]] | None = None) -> dict:
+                        allowed_pages: set[tuple[str, int]] | None = None,
+                        rejected_pages: set[tuple[str, int]] | None = None,
+                        only_reviewed: bool = False) -> dict:
     """Build the customer-facing UTF-8 JSONL and meaningful illustration crops.
 
     Internal Q/A crops remain available for audit, but answer screenshots and whole-question
     screenshots are deliberately not referenced by this formal dataset.
 
-    ``allowed_pages`` restricts the package to pages whose review decision is
-    "approved", tagged as ``("question", index)`` / ``("answer", index)`` — the two
-    lists are numbered independently, so a bare index cannot tell them apart.
-    ``None`` means the caller already gated the whole book.
+    ``allowed_pages`` / ``rejected_pages`` 都是 ``{("question"|"answer", index)}``
+    （两个列表各自从 0 编号，所以必须带 kind）：
+
+    * ``rejected_pages`` —— 审核员点过"退回/需精修"的页，**永远不收录**。
+    * ``only_reviewed=True`` —— 只收 ``allowed_pages`` 里已放行的页（严格版流程）。
+    * 默认 ``only_reviewed=False`` —— 不看放行状态，题目字段齐全就收录；
+      没审完不影响出包，适合抽检流程。
     """
     k12_root = root / "k12_dataset"
     pages_root = k12_root / "pages"
@@ -544,7 +572,21 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
     book_id = str(project["delivery_book_id"])
     claimed_signatures: dict[str, str] = {}
     identity_counts: dict[str, int] = {}
+    skipped_unreviewed_pages: set[int] = set()
+    skipped_unreviewed_questions = 0
+    blocked_by_review_pages: set[int] = set()
+    blocked_by_review_questions = 0
     for global_order, (page_index, page, question) in enumerate(ordered_questions, 1):
+        if rejected_pages and ("question", page_index) in rejected_pages:
+            # 审核员明确说"退回/需精修"：字段再齐也不进包。
+            blocked_by_review_pages.add(page_index)
+            blocked_by_review_questions += 1
+            continue
+        if only_reviewed and allowed_pages is not None and ("question", page_index) not in allowed_pages:
+            # 严格模式下才按"已放行"筛；默认模式不看审核进度。
+            skipped_unreviewed_pages.add(page_index)
+            skipped_unreviewed_questions += 1
+            continue
         page_number = page_index + 1
         page_folder = f"P{page_number:04d}"
         page_orders[page_index] = page_orders.get(page_index, 0) + 1
@@ -555,7 +597,7 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
         primary_answer_infos = [answers_by_internal.get(str(value)) for value in relation.get("answer_ids", [])]
         primary_answer_infos = sorted((item for item in primary_answer_infos if item), key=_record_position)
         answer_infos = [part for item in primary_answer_infos for part in answer_chain(item)]
-        answers = [_clean_text(item[2].get("answer")) for item in answer_infos]
+        answers = [_answer_body_text(item[2]) for item in answer_infos]
         analyses = [_clean_text(item[2].get("analysis")) for item in answer_infos]
         illustrations = sorted(
             (item for item in question.get("illustrations", []) if isinstance(item, dict)),
@@ -634,7 +676,7 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
             }, targets)
 
         sample, image_targets = build_sample("0000000")   # probe: id is irrelevant to validation
-        errors = _k12_validation(sample, image_sizes)
+        errors, hints = _k12_validation(sample, image_sizes)
         if full_page_skipped:
             errors.append(f"已剔除{full_page_skipped}张整页截图（H3③）")
         signature = _content_signature(sample)
@@ -646,12 +688,13 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
             errors.append("题目尚未匹配答案")
         elif any(str(item[1].get("status", "")) != "accepted" for item in answer_infos):
             errors.append("答案页尚未确认")
-        # 部分放行时，一道题只有在题干页和答案页都审核放行后才进包；
-        # 否则会把没复核过的答案交付出去。
-        if allowed_pages is not None:
-            if ("question", page_index) not in allowed_pages or any(
-                    ("answer", int(item[0])) not in allowed_pages for item in answer_infos):
-                errors.append("该题所在页面尚未审核放行")
+        # 题目页能收（上面的 continue 已经排除了被退回的页），但答案页被退回
+        # 或者严格模式没放行时，答案不能跟着发出去。
+        if rejected_pages and any(("answer", int(item[0])) in rejected_pages for item in answer_infos):
+            errors.append("答案页被审核退回")
+        elif only_reviewed and allowed_pages is not None and any(
+                ("answer", int(item[0])) not in allowed_pages for item in answer_infos):
+            errors.append("答案页尚未审核放行")
         eligible = (str(page.get("status", "")) == "accepted"
                     and relation.get("status") == "accepted"
                     and bool(answer_infos) and all(str(item[1].get("status", "")) == "accepted" for item in answer_infos)
@@ -674,7 +717,7 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
                 identity_counts[identity_status] = identity_counts.get(identity_status, 0) + 1
         report_items.append({"id": sample_id, "page": page_index + 1,
                              "question_number": data.display_number(question),
-                             "eligible": eligible, "errors": errors,
+                             "eligible": eligible, "errors": errors, "hints": hints,
                              "identity": identity_status})
         if eligible:
             sample, image_targets = build_sample(sample_id)
@@ -702,7 +745,7 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
     # operators can audit the book page-by-page without gaps.
     active_page_indexes = ({index for index in range(len(project.get("pages", [])))}
                            if materialize_all else ({changed_page_index} if changed_page_index is not None else set()))
-    if allowed_pages is not None:
+    if only_reviewed and allowed_pages is not None:
         active_page_indexes &= {index for kind, index in allowed_pages if kind == "question"}
     active_page_indexes.update(
         int(path.name[1:]) - 1 for path in pages_root.glob("P[0-9][0-9][0-9][0-9]")
@@ -721,9 +764,20 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
     temporary = dataset_path.with_suffix(".jsonl.tmp")
     temporary.write_text(("\n".join(lines) + ("\n" if lines else "")), encoding="utf-8")
     os.replace(temporary, dataset_path)
-    report = {"schema_version": 1, "total_questions": len(ordered_questions),
-              "eligible_count": len(lines), "rejected_count": len(ordered_questions) - len(lines),
+    report = {"schema_version": 2,
+              # total_questions / rejected_count 只算"本次生成范围"（已放行页面），
+              # 未放行的页单独记在 scope 里：它们是"还没审"，不是"不合格"。
+              "total_questions": len(report_items),
+              "book_question_count": len(ordered_questions),
+              "eligible_count": len(lines),
+              "rejected_count": len(report_items) - len(lines),
+              "scope": {"reviewed_only": bool(only_reviewed and allowed_pages is not None),
+                        "skipped_unreviewed_pages": len(skipped_unreviewed_pages),
+                        "skipped_unreviewed_questions": skipped_unreviewed_questions,
+                        "blocked_by_review_pages": len(blocked_by_review_pages),
+                        "blocked_by_review_questions": blocked_by_review_questions},
               "reason_summary": _reason_summary(report_items),
+              "hint_summary": _reason_summary(report_items, key="hints", limit=12),
               "identity_summary": identity_counts,
               "items": report_items}
     _atomic_json(k12_root / "quality_report.json", report)
@@ -733,11 +787,11 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
             "identity_summary": identity_counts}
 
 
-def _reason_summary(items: list[dict], limit: int = 40) -> list[dict]:
-    """Aggregate per-question errors into "what is this book mostly missing"."""
+def _reason_summary(items: list[dict], key: str = "errors", limit: int = 40) -> list[dict]:
+    """Aggregate per-question blockers (``key="errors"``) or hints into buckets."""
     buckets: dict[str, dict] = {}
     for item in items:
-        for reason in item.get("errors", []) or []:
+        for reason in item.get(key, []) or []:
             bucket = buckets.setdefault(
                 reason, {"reason": reason, "count": 0, "questions": []})
             bucket["count"] += 1
@@ -785,12 +839,19 @@ BOOK_FIELDS = (("language", "语言"), ("stage", "学段"), ("grade", "年级"),
 
 def analyze_delivery(project_path: str | Path, runtime_root: str | Path,
                      *, identity_path: str | Path | None = None,
-                     project_document: dict | None = None) -> dict:
+                     project_document: dict | None = None,
+                     allowed_pages: set[tuple[str, int]] | None = None,
+                     rejected_pages: set[tuple[str, int]] | None = None,
+                     only_reviewed: bool = False) -> dict:
     """Read-only readiness report: what blocks this book from generating, and why.
 
     Runs the same per-question checks as ``_write_k12_delivery`` but crops no
     image, writes no file and allocates no sample id — operators get the blocker
     list BEFORE a generation job is queued, instead of a generic failure after.
+
+    口径与生成完全一致：默认按字段判定（``only_reviewed=False``），审核没做完
+    也照样算；``only_reviewed=True`` 才只统计已放行页面。``rejected_pages``
+    （审核退回/需精修）永远排除。
     """
     project_file = Path(project_path).resolve()
     project = dict(project_document) if project_document is not None else data.load_project(project_file)
@@ -857,8 +918,20 @@ def analyze_delivery(project_path: str | Path, runtime_root: str | Path,
     page_sizes: dict[int, tuple[int, int]] = {}
     claimed_signatures: dict[str, str] = {}
     preview: list[dict] = []
+    skipped_unreviewed_pages: set[int] = set()
+    skipped_unreviewed_questions = 0
+    blocked_by_review_pages: set[int] = set()
+    blocked_by_review_questions = 0
     try:
         for global_order, (page_index, page, question) in enumerate(ordered_questions, 1):
+            if rejected_pages and ("question", page_index) in rejected_pages:
+                blocked_by_review_pages.add(page_index)
+                blocked_by_review_questions += 1
+                continue
+            if only_reviewed and allowed_pages is not None and ("question", page_index) not in allowed_pages:
+                skipped_unreviewed_pages.add(page_index)
+                skipped_unreviewed_questions += 1
+                continue
             page_number = page_index + 1
             page_orders[page_index] = page_orders.get(page_index, 0) + 1
             page_order = page_orders[page_index]
@@ -866,7 +939,7 @@ def analyze_delivery(project_path: str | Path, runtime_root: str | Path,
             primary = [answers_by_internal.get(str(value)) for value in relation.get("answer_ids", [])]
             primary = sorted((item for item in primary if item), key=_record_position)
             answer_infos = [part for item in primary for part in answer_chain(item)]
-            answers = [_clean_text(item[2].get("answer")) for item in answer_infos]
+            answers = [_answer_body_text(item[2]) for item in answer_infos]
             analyses = [_clean_text(item[2].get("analysis")) for item in answer_infos]
             illustrations = sorted(
                 (item for item in question.get("illustrations", []) if isinstance(item, dict)),
@@ -940,7 +1013,7 @@ def analyze_delivery(project_path: str | Path, runtime_root: str | Path,
                 }
 
             sample = build_sample("0000000")
-            errors = _k12_validation(sample, image_sizes)
+            errors, hints = _k12_validation(sample, image_sizes)
             if full_page_skipped:
                 errors.append(f"已剔除{full_page_skipped}张整页截图（H3③）")
             signature = _content_signature(sample)
@@ -952,6 +1025,11 @@ def analyze_delivery(project_path: str | Path, runtime_root: str | Path,
                 errors.append("题目尚未匹配答案")
             elif any(str(item[1].get("status", "")) != "accepted" for item in answer_infos):
                 errors.append("答案页尚未确认")
+            if rejected_pages and any(("answer", int(item[0])) in rejected_pages for item in answer_infos):
+                errors.append("答案页被审核退回")
+            elif only_reviewed and allowed_pages is not None and any(
+                    ("answer", int(item[0])) not in allowed_pages for item in answer_infos):
+                errors.append("答案页尚未审核放行")
             eligible = (str(page.get("status", "")) == "accepted"
                         and relation.get("status") == "accepted"
                         and bool(answer_infos)
@@ -970,20 +1048,27 @@ def analyze_delivery(project_path: str | Path, runtime_root: str | Path,
                         preview.append(build_sample(claimed_signatures[signature]))
             items.append({"page": page_number,
                           "question_number": data.display_number(question),
-                          "eligible": eligible, "errors": errors})
+                          "eligible": eligible, "errors": errors, "hints": hints})
     finally:
         identity.close()
 
     total = len(items)
     eligible_count = sum(1 for item in items if item["eligible"])
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "book": book,
         "total_questions": total,
+        "book_question_count": len(ordered_questions),
         "eligible_count": eligible_count,
         "rejected_count": total - eligible_count,
+        "scope": {"reviewed_only": bool(only_reviewed and allowed_pages is not None),
+                  "skipped_unreviewed_pages": len(skipped_unreviewed_pages),
+                  "skipped_unreviewed_questions": skipped_unreviewed_questions,
+                  "blocked_by_review_pages": len(blocked_by_review_pages),
+                  "blocked_by_review_questions": blocked_by_review_questions},
         "deliverable": eligible_count > 0,
         "reason_summary": _reason_summary(items),
+        "hint_summary": _reason_summary(items, key="hints", limit=12),
         "items": items,
         "sample_preview": preview,
         "dataset_path": str(root / "k12_dataset" / "dataset.jsonl"),
@@ -1132,11 +1217,17 @@ def sync_delivery_workspace(project_path: str | Path, runtime_root: str | Path,
                             changed_record_ids: list[str] | None = None,
                             identity_path: str | Path | None = None,
                             output_root: str | Path | None = None,
-                            allowed_pages: set[tuple[str, int]] | None = None) -> dict:
+                            allowed_pages: set[tuple[str, int]] | None = None,
+                            rejected_pages: set[tuple[str, int]] | None = None,
+                            only_reviewed: bool = False) -> dict:
     """Sync edited delivery artifacts and rebuild the small authoritative indexes.
 
     Crops are rewritten only when their source signature changes. JSON is cheap and is
     refreshed for the changed page plus records touched by relations.
+
+    ``only_reviewed=False``（默认）按字段判定：题目字段齐全就收录，审核没做完
+    不影响出包（抽检流程）。``True`` 时只收 ``allowed_pages`` 里已放行的页。
+    ``rejected_pages``（审核退回/需精修）两种模式都排除。
 
     ``output_root`` overrides where the package is written.  The incremental
     "ready samples" view of a book keeps its own root so that un-reviewed work
@@ -1324,6 +1415,8 @@ def sync_delivery_workspace(project_path: str | Path, runtime_root: str | Path,
         identity_path=Path(identity_path) if identity_path is not None
         else root.parent / "delivery_identity.sqlite3",
         allowed_pages=(set(allowed_pages) if allowed_pages is not None else None),
+        rejected_pages=(set(rejected_pages) if rejected_pages is not None else None),
+        only_reviewed=bool(only_reviewed),
     )
     # Delivery generation may assign missing public IDs, but it is part of the
     # caller's logical mutation and must not advance the renderer CAS revision
