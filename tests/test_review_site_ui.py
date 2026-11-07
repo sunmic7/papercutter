@@ -65,9 +65,23 @@ class DeliveryCheckEntryTests(unittest.TestCase):
         self.assertIn("'checkView'", self.source)
         self.assertIn("class=\"chk-body\"", self.source)
         self.assertIn("class=\"chk-menu\"", self.source)
-        for key, label in (("overview", "概览"), ("missing", "缺什么"),
-                           ("items", "逐题明细"), ("pages", "逐页收录")):
+        for key, label in (("items", "逐题明细"), ("missing", "缺什么"), ("coverage", "收录概览")):
             self.assertIn(f"['{key}','{label}']", self.source)
+
+    def test_item_detail_comes_first_and_is_the_default(self):
+        # 点进来最想看的就是"哪道题不行"，逐题明细排第一且默认选中，别再多点一次。
+        self.assertIn("['items','逐题明细'],", self.source)
+        self.assertIn("menu:'items'", self.source)
+        self.assertIn("checkState.menu='items';", self.source)
+        # 旧的「概览」「逐页收录」两个菜单已经合并成一个。
+        self.assertNotIn("['overview','概览']", self.source)
+        self.assertNotIn("['pages','逐页收录']", self.source)
+
+    def test_overview_and_page_coverage_are_one_menu(self):
+        self.assertIn("function checkCoverageHtml()", self.source)
+        self.assertIn("chk-divider", self.source)
+        self.assertIn("${checkPagesHtml()}", self.source)
+        self.assertNotIn("checkOverviewHtml", self.source)
 
     def test_item_detail_is_paginated(self):
         # 逐题明细必须分页，不能一次把几百行全铺出来；分页条还要在表格上方，
@@ -90,12 +104,6 @@ class DeliveryCheckEntryTests(unittest.TestCase):
     def test_delivery_json_is_explained_in_the_preview(self):
         self.assertIn("交付 JSON（这条题写进 dataset.jsonl 的原文）", self.source)
         self.assertIn("这就是最终交付出去的内容", self.source)
-
-    def test_page_coverage_is_hidden_from_annotators(self):
-        # 逐页明细接口只对审核员/管理员开放，标注员点开时降级成一句说明。
-        self.assertIn("逐页收录明细只对有审核权限的账号开放", self.source)
-        server = (STATIC.parent / "central_library.py").read_text(encoding="utf-8")
-        self.assertIn("只有审核员或管理员可以查看交付页面明细", server)
 
     def test_page_coverage_is_hidden_from_annotators(self):
         # 逐页明细接口只对审核员/管理员开放，标注员点开时降级成一句说明。
