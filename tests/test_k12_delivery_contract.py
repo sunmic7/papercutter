@@ -313,14 +313,16 @@ class IdentityOverwriteTests(unittest.TestCase):
             path = build_project(root, texts=["同一道题"])
             rows, delivery = deliver(path, root / "runtime")
             self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0]["data"]["answer"], "42")
+            # 原教材给了讲解就并进答案，不再单列一份。
+            self.assertEqual(rows[0]["data"]["answer"], "42\n详细解析过程")
+            self.assertEqual(rows[0]["data"]["analysis"], "")
             project = data.load_project(path)
             project["answer_pages"][0]["answers"][0]["answer"] = "43"
             data.save_project(project, path, increment_revision=False)
             rows2, _delivery = deliver(path, root / "runtime")
             self.assertEqual(len(rows2), 1, "改答案后不能变成两条样本")
             self.assertEqual(rows2[0]["id"], rows[0]["id"], "同一道题必须沿用同一个 id")
-            self.assertEqual(rows2[0]["data"]["answer"], "43")
+            self.assertEqual(rows2[0]["data"]["answer"], "43\n详细解析过程")
             database = next(delivery.parent.glob("delivery_identity.sqlite3"))
             connection = sqlite3.connect(str(database))
             try:
@@ -427,6 +429,53 @@ class DeliveryScopeTests(unittest.TestCase):
                                 .read_text(encoding="utf-8"))
             self.assertEqual(report["reason_summary"], [])
             self.assertEqual(report["hint_summary"][0]["reason"], "本题没有题图")
+
+    def test_answer_and_analysis_share_one_field(self):
+        """答案和解析放一块：有讲解就接在答案后面，analysis 不再单独写一份。"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = build_project(root, texts=["题一"])
+            rows, _delivery = deliver(path, root / "runtime")
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["data"]["answer"], "42\n详细解析过程")
+            self.assertIn("analysis", rows[0]["data"], "字段要保留，值可以为空")
+            self.assertEqual(rows[0]["data"]["analysis"], "")
+
+    def test_question_without_analysis_still_ships(self):
+        """原教材没写解析：不拦，这一题照样进包。"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = build_project(root, texts=["题一"])
+            project = json.loads(path.read_text(encoding="utf-8"))
+            for page in project["answer_pages"]:
+                for record in page["answers"]:
+                    record["analysis"] = ""
+            path.write_text(json.dumps(project, ensure_ascii=False), encoding="utf-8")
+            rows, delivery = deliver(path, root / "runtime")
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["data"]["answer"], "42")
+            report = json.loads((delivery / "k12_dataset" / "quality_report.json")
+                                .read_text(encoding="utf-8"))
+            self.assertEqual(report["reason_summary"], [])
+
+    def test_answer_key_alone_is_enough_when_only_analysis_was_written(self):
+        """答案框里只填了解析：答案字段拿得到内容，不判缺少标准答案。"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = build_project(root, texts=["题一"])
+            project = json.loads(path.read_text(encoding="utf-8"))
+            for page in project["answer_pages"]:
+                for record in page["answers"]:
+                    record["answer"] = ""
+                    record["text"] = ""
+                    record["analysis"] = "先通分再相加，得 42"
+            path.write_text(json.dumps(project, ensure_ascii=False), encoding="utf-8")
+            rows, delivery = deliver(path, root / "runtime")
+            self.assertEqual(len(rows), 1)
+            self.assertIn("42", rows[0]["data"]["answer"])
+            report = json.loads((delivery / "k12_dataset" / "quality_report.json")
+                                .read_text(encoding="utf-8"))
+            self.assertEqual(report["reason_summary"], [])
 
 
 if __name__ == "__main__":

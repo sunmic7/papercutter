@@ -467,7 +467,9 @@ class CentralLibraryTests(unittest.TestCase):
         rows = [json.loads(line) for line in dataset.read_text(encoding='utf-8').splitlines() if line.strip()]
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]['metainfo']['difficulty'], '基础')
-        self.assertEqual(rows[0]['data']['answer'], '42')
+        # 答案与解析合成一段：原教材的讲解接在答案后面。
+        self.assertEqual(rows[0]['data']['answer'], '42\n实验解析')
+        self.assertEqual(rows[0]['data']['analysis'], '')
         self.assertTrue((book_root / 'ready_samples' / 'k12_dataset' / 'images').is_dir())
         # 只有审核后生成才允许写 current.json / versions：草稿绝不能冒充正式交付。
         self.assertFalse((book_root / 'current.json').exists())

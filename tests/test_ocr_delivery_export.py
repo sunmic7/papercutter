@@ -77,8 +77,9 @@ class OCRDeliveryExportTests(unittest.TestCase):
             self.assertEqual([item["data"]["question"] for item in lines], ["第一题", "第二题"])
             self.assertEqual(lines[0]["id"], "0000001")
             self.assertEqual(lines[0]["data"]["question_images"], ["images/0000001_img_01.jpg"])
-            self.assertEqual(lines[0]["data"]["answer"], "A")
-            self.assertEqual(lines[0]["data"]["analysis"], "第一题解析")
+            # 答案与解析合成一段；analysis 字段保留但不再重复一份。
+            self.assertEqual(lines[0]["data"]["answer"], "A\n第一题解析")
+            self.assertEqual(lines[0]["data"]["analysis"], "")
             self.assertTrue((delivery / "k12_dataset" / "images" / "0000001_img_01.jpg").is_file())
             self.assertTrue((delivery / "k12_dataset" / "pages" / "P0001" / "dataset.jsonl").is_file())
             self.assertFalse((delivery / "k12_dataset" / "pages" / "P0001" / "images" / "answer_1.jpg").exists())
@@ -111,8 +112,8 @@ class OCRDeliveryExportTests(unittest.TestCase):
             line = (Path(result["output_path"]) / "k12_dataset" / "dataset.jsonl").read_text(encoding="utf-8").strip()
             payload = json.loads(line)
             self.assertEqual(payload["data"]["question"], "求 1⁄x 与 √(y)")
-            self.assertEqual(payload["data"]["answer"], "1⁄2")
-            self.assertEqual(payload["data"]["analysis"], "x²")
+            self.assertEqual(payload["data"]["answer"], "1⁄2\nx²")
+            self.assertEqual(payload["data"]["analysis"], "")
             self.assertNotIn("\\frac", line)
             self.assertNotIn("$", line)
             # Per-frame delivery JSON must use the same current editable result

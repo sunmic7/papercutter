@@ -467,7 +467,8 @@ class OnlineReviewBetaTests(unittest.TestCase):
         self.store.decide_page(self.reviewer, created["id"], "question-0", "approved", "")
         uploaded = self.store.upload_delivery_file(self.annotator, payload)
         self.assertEqual(uploaded["bytes"], len(content))
-        # 4) 退回新页面后再次上传：重新被拒（最新提交必须全放行）。
+        # 4) 有页面被改动后再次上传：重新被拒（最新提交必须全放行）。
+        document["pages"][0]["regions"][0]["bbox"] = [22, 32, 402, 502]
         second = self.store.create_submission(self.annotator, document)
         with self.assertRaises(PermissionError):
             self.store.upload_delivery_file(self.annotator, payload)
@@ -525,7 +526,11 @@ class OnlineReviewBetaTests(unittest.TestCase):
         newer = self.store.create_submission(self.reviewer, document, reviewer_refresh=True)
         self.assertEqual(newer["supersedes_submission_id"], first["id"])
         self.assertIn(self.store.submission(self.reviewer, first["id"])["status"], {"resubmitted", "outdated"})
-        self.assertEqual(self.store.submission(self.reviewer, newer["id"])["status"], "pending")
+        # 页框和页面图都没变，这次提交直接沿用上一轮的放行结论，不用再审一遍。
+        refreshed = self.store.submission(self.reviewer, newer["id"])
+        self.assertEqual(refreshed["status"], "reviewed")
+        self.assertEqual(refreshed["pages"][0]["review_status"], "approved")
+        self.assertEqual(refreshed["pages"][0]["inherited_from"], first["id"])
 
     def _seed_source_book(self, book_id: str = "BSRC") -> str:
         self.store.staff_data_root = Path(self.temp.name) / "private" / "staff_projects"
@@ -787,3 +792,110 @@ class OnlineReviewBetaTests(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+
+def two_page_snapshot() -> dict:
+    """两页的快照：一页被改动、另一页没动，才能验证"只重审改动页"。"""
+    document = snapshot()
+    document["pages"].append({
+        "page_key": "question-1", "kind": "question", "page_index": 1,
+        "image_name": "002.jpg", "width": 1200, "height": 1800,
+        "regions": [{"id": "q-2", "display_number": "2", "bbox": [40, 60, 500, 700]}],
+        "preview": document["pages"][0]["preview"],
+    })
+    return document
+
+
+class IncrementalReviewTests(unittest.TestCase):
+    """重新提交时，框没动过的页面沿用上一轮审核结论，不再重复审核。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.store = ReviewStore(Path(self.temp.name))
+        self.super_admin = self.store.create_user("superadmin", "very-secret-password", "super_admin")
+        self.admin = self.store.create_managed_user(self.super_admin, "admin", "very-secret-password", "admin")
+        self.annotator = self.store.create_managed_user(self.admin, "marker", "very-secret-password", "annotator")
+        self.reviewer = self.store.create_managed_user(self.admin, "reviewer", "very-secret-password", "reviewer")
+        self.store.set_responsible_person(self.super_admin, self.annotator["id"], self.reviewer["id"])
+        raw_create = self.store.create_submission
+
+        def create_with_freeze(actor, document, **kwargs):
+            if isinstance(document, dict) and kwargs.get("project_document") is None and not document.get("project_document"):
+                document = {**document, "project_document": {
+                    "project_revision": document.get("project_revision", 0), "pages": []}}
+            return raw_create(actor, document, **kwargs)
+
+        self.store.create_submission = create_with_freeze
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _approve_all(self, submission_id):
+        for page_key in ("question-0", "question-1"):
+            self.store.decide_page(self.reviewer, submission_id, page_key, "approved", "")
+
+    def _pages(self, submission_id):
+        return {page["page_key"]: page for page in self.store.submission(self.reviewer, submission_id)["pages"]}
+
+    def test_untouched_pages_keep_their_previous_approval(self):
+        first = self.store.create_submission(self.annotator, two_page_snapshot())
+        self._approve_all(first["id"])
+        second = self.store.create_submission(self.annotator, two_page_snapshot())
+        pages = self._pages(second["id"])
+        self.assertEqual({key: page["review_status"] for key, page in pages.items()},
+                         {"question-0": "approved", "question-1": "approved"})
+        self.assertEqual({page["inherited_from"] for page in pages.values()}, {first["id"]})
+        # 整本都沿用旧结论 = 这次提交已经审完，不该再占着"待审"。
+        self.assertEqual(second["inherited_pages"], 2)
+        self.assertEqual(second["pending_pages"], 0)
+        self.assertEqual(self.store.submission(self.reviewer, second["id"])["status"], "reviewed")
+
+    def test_moving_one_box_only_reopens_that_page(self):
+        first = self.store.create_submission(self.annotator, two_page_snapshot())
+        self._approve_all(first["id"])
+        document = two_page_snapshot()
+        document["pages"][1]["regions"][0]["bbox"] = [40, 60, 500, 720]
+        second = self.store.create_submission(self.annotator, document)
+        pages = self._pages(second["id"])
+        self.assertEqual(pages["question-0"]["review_status"], "approved")
+        self.assertEqual(pages["question-0"]["inherited_from"], first["id"])
+        self.assertEqual(pages["question-1"]["review_status"], "pending")
+        self.assertEqual(pages["question-1"]["inherited_from"], "")
+        self.assertEqual(second["pending_pages"], 1)
+
+    def test_renumbering_a_box_also_reopens_the_page(self):
+        first = self.store.create_submission(self.annotator, two_page_snapshot())
+        self._approve_all(first["id"])
+        document = two_page_snapshot()
+        document["pages"][0]["regions"][0]["display_number"] = "3"
+        second = self.store.create_submission(self.annotator, document)
+        self.assertEqual(self._pages(second["id"])["question-0"]["review_status"], "pending")
+
+    def test_replacing_the_page_image_reopens_the_page(self):
+        first = self.store.create_submission(self.annotator, two_page_snapshot())
+        self._approve_all(first["id"])
+        document = two_page_snapshot()
+        document["pages"][0]["image_name"] = "001-v2.jpg"
+        second = self.store.create_submission(self.annotator, document)
+        self.assertEqual(self._pages(second["id"])["question-0"]["review_status"], "pending")
+
+    def test_a_rejected_page_is_never_carried_over(self):
+        """退回/需精修的页不继承：标注员很可能只改了框外文字，结论照抄会永远出不去。"""
+        first = self.store.create_submission(self.annotator, two_page_snapshot())
+        self.store.decide_page(self.reviewer, first["id"], "question-0", "returned", "重新框")
+        self.store.decide_page(self.reviewer, first["id"], "question-1", "approved", "")
+        second = self.store.create_submission(self.annotator, two_page_snapshot())
+        pages = self._pages(second["id"])
+        self.assertEqual(pages["question-0"]["review_status"], "pending")
+        self.assertEqual(pages["question-1"]["review_status"], "approved")
+        self.assertEqual(self.store.submission(self.reviewer, second["id"])["status"], "in_review")
+
+    def test_pages_from_an_older_submission_still_count(self):
+        """连交三次：中间那次没审，第三次照样能沿用第一次的放行结论。"""
+        first = self.store.create_submission(self.annotator, two_page_snapshot())
+        self._approve_all(first["id"])
+        self.store.create_submission(self.annotator, two_page_snapshot())
+        third = self.store.create_submission(self.annotator, two_page_snapshot())
+        pages = self._pages(third["id"])
+        self.assertEqual({page["review_status"] for page in pages.values()}, {"approved"})
+        self.assertEqual({page["inherited_from"] for page in pages.values()}, {first["id"]})

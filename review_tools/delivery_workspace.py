@@ -22,7 +22,7 @@ K12_QUESTION_TYPES = {
     "阅读理解": "阅读理解", "材料分析": "材料分析", "综合应用": "综合应用",
 }
 
-# --- 甲方词表（数据需求明细-供应商.xlsx / 需求1 第 3 行 N3 备注）-------------
+# --- 交付词表（数据需求明细-供应商.xlsx / 需求1 第 3 行 N3 备注）-------------
 # N3 逐字给出 language/stage/grade/subject/question_type/difficulty 的取值，
 # 交付时必须逐项落表；映射后的值落在表外即拒收，不再原样透传。
 # 书级字段复用 ``book_meta``，那是 UI 下拉与交付校验的唯一同源定义。
@@ -89,7 +89,7 @@ def _k12_text(value: object) -> str:
 
 
 def _vocabulary_errors(meta: dict) -> list[str]:
-    """N3 词表闸：值非空但不在甲方枚举内即拒收。
+    """N3 词表闸：值非空但不在规范枚举内即拒收。
 
     空值由 ``_k12_validation`` 的必填项检查单独报，这里只看"填了但填错"。
     """
@@ -105,7 +105,7 @@ def _vocabulary_errors(meta: dict) -> list[str]:
     for key, allowed, label in checks:
         value = str(meta.get(key, "")).strip()
         if value and value not in allowed:
-            errors.append(f"{label}不在甲方词表内：{value}")
+            errors.append(f"{label}不在规范词表内：{value}")
     return errors
 
 
@@ -132,7 +132,7 @@ class _DeliveryIdentity:
     * ``questions``（``<教材>#<题目持久 id>``）回答"这是不是同一道题"。同一道题
       重出——哪怕答案改过——都复用同一个 sample_id，新的 JSON 直接覆盖旧的，
       旧内容不会作为另一条样本留在包里。
-    * ``samples``（内容指纹）回答"这段内容有没有在别的书里交付过"，对应甲方
+    * ``samples``（内容指纹）回答"这段内容有没有在别的书里交付过"，对应交付方
       备注第 2 条与 H3⑩。
 
     两者分开的直接后果：改答案不再等于"又一道新题"。以前按内容指纹发号，
@@ -182,7 +182,7 @@ class _DeliveryIdentity:
         ``updated``   同一道题、内容改过，沿用原 id 并顶掉旧内容指纹（旧 JSON 作废）；
         ``reused``    同书同内容的历史样本（升级前的库没有题目身份），复用其 id；
         ``new``       新题，发新号；
-        ``conflict``  同内容已在别的书交付过，按甲方备注第 2 条拒收。
+        ``conflict``  同内容已在别的书交付过，按数据要求第 2 条拒收。
         """
         if self.connection is None:
             return {"status": "new", "id": "0000001"}
@@ -483,12 +483,36 @@ def _answer_body_text(record: dict) -> str:
     return ""
 
 
+def _merged_answer_text(answers: list[str], analyses: list[str]) -> str:
+    """答案和解析合成一段：原教材给了解析就接在答案后面，不再单列一份。
+
+    交付 JSON 的 ``answer`` 能直接给到答案与讲解两部分；``analysis`` 字段保留
+    但不再要求有值，缺解析也不拦。空答案、只有解析的题目仍然出得来。
+    """
+    body = "\n".join(value for value in answers if value).strip()
+    extras: list[str] = []
+    for value in analyses:
+        text = value.strip()
+        if not text:
+            continue
+        # 同一条记录里 answer 和 analysis 常常是同一段话，重复贴两遍没有意义。
+        if text in body or text in extras:
+            continue
+        extras.append(text)
+    if not extras:
+        return body
+    return "\n".join([body, *extras]) if body else "\n".join(extras)
+
+
 def _k12_validation(sample: dict, image_sizes: list[tuple[int, int]]) -> tuple[list[str], list[str]]:
     """Return ``(errors, hints)``: errors block delivery, hints only inform.
 
-    题图不是必填项 —— 甲方 schema 要求 ``question_images`` 字段存在，空数组是
+    题图不是必填项 —— 交付规范要求 ``question_images`` 字段存在，空数组是
     合法值；一本练习册里大部分题本来就没有插图。原来把"没有题图"当拒收理由，
     会让整本书一条都出不来。
+
+    解析同样不再必填：答案框里有什么就交付什么，原教材给了讲解就并进
+    ``answer``，没给也不拦 —— 否则一整本没有解析的教辅一道题都出不了。
     """
     meta, body = sample["metainfo"], sample["data"]
     errors = []
@@ -503,7 +527,7 @@ def _k12_validation(sample: dict, image_sizes: list[tuple[int, int]]) -> tuple[l
     errors.extend(_vocabulary_errors(meta))
     if not meta.get("knowledge_points"):
         errors.append("缺少知识点")
-    for key, label in (("question", "题目文本"), ("answer", "标准答案"), ("analysis", "详细解析")):
+    for key, label in (("question", "题目文本"), ("answer", "标准答案")):
         value = str(body.get(key, ""))
         if not value.strip():
             errors.append(f"缺少{label}")
@@ -663,8 +687,9 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
                     "option_images": option_images,
                     "question": _k12_text(ocr_question),
                     "options": [_k12_text(value) for value in options] if final_type == "选择" else [],
-                    "answer": _k12_text("\n".join(value for value in answers if value)),
-                    "analysis": _k12_text("\n".join(value for value in analyses if value)),
+                    "answer": _k12_text(_merged_answer_text(answers, analyses)),
+                    # 讲解已经并进 answer，不再单列一份；字段保留，缺失不算错。
+                    "analysis": "",
                 },
                 "source": {
                     "book_id": book_id, "question_page": page_number,
@@ -704,7 +729,7 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
         if eligible:
             # 同一道题只保留一条样本：题目身份（教材 + 题目持久 id）决定 sample_id，
             # 重出时不论谁点的生成，都沿用同一个 id 并顶掉旧内容——旧 JSON 作废。
-            # 内容指纹只用于跨书查重（甲方备注第 2 条 / H3⑩）。
+            # 内容指纹只用于跨书查重（数据要求第 2 条 / H3⑩）。
             question_key = f"{book_id}#{question.get('delivery_id') or question.get('id') or global_order}"
             claim = identity.claim(question_key, book_id, signature)
             if claim["status"] == "conflict":
@@ -899,13 +924,13 @@ def analyze_delivery(project_path: str | Path, runtime_root: str | Path,
         if not _clean_text(project.get(key)):
             book["errors"].append(f"缺少{label}")
         elif key == "language" and book["fields"][key] not in K12_LANGUAGES:
-            book["errors"].append(f"语言不在甲方词表内：{book['fields'][key]}")
+            book["errors"].append(f"语言不在规范词表内：{book['fields'][key]}")
         elif key == "stage" and book["fields"][key] not in K12_STAGES:
-            book["errors"].append(f"学段不在甲方词表内：{book['fields'][key]}")
+            book["errors"].append(f"学段不在规范词表内：{book['fields'][key]}")
         elif key == "grade" and book["fields"][key] not in K12_GRADES:
-            book["errors"].append(f"年级不在甲方词表内：{book['fields'][key]}")
+            book["errors"].append(f"年级不在规范词表内：{book['fields'][key]}")
         elif key == "subject" and book["fields"][key] not in K12_SUBJECTS:
-            book["errors"].append(f"学科不在甲方词表内：{book['fields'][key]}")
+            book["errors"].append(f"学科不在规范词表内：{book['fields'][key]}")
 
     identity_file = (Path(identity_path) if identity_path is not None
                      else root.parent / "delivery_identity.sqlite3")
@@ -999,8 +1024,9 @@ def analyze_delivery(project_path: str | Path, runtime_root: str | Path,
                         "question": _k12_text(ocr_question),
                         "options": ([_k12_text(value) for value in options]
                                     if final_type == "选择" else []),
-                        "answer": _k12_text("\n".join(value for value in answers if value)),
-                        "analysis": _k12_text("\n".join(value for value in analyses if value)),
+                        "answer": _k12_text(_merged_answer_text(answers, analyses)),
+                        # 讲解已经并进 answer，不再单列一份；字段保留，缺失不算错。
+                        "analysis": "",
                     },
                     "source": {
                         "book_id": book_id, "question_page": page_number,

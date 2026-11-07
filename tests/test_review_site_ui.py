@@ -88,7 +88,7 @@ class DeliveryCheckEntryTests(unittest.TestCase):
 
     def test_delivery_json_is_explained_in_the_preview(self):
         self.assertIn("交付 JSON（这条题写进 dataset.jsonl 的原文）", self.source)
-        self.assertIn("甲方拿到的就是它", self.source)
+        self.assertIn("这就是最终交付出去的内容", self.source)
 
     def test_page_coverage_is_hidden_from_annotators(self):
         # 逐页明细接口只对审核员/管理员开放，标注员点开时降级成一句说明。
@@ -175,3 +175,23 @@ class SourceFolderMenuTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WordingGuardTests(unittest.TestCase):
+    """界面上不再出现"甲方"这种对外称呼，一律用"交付"口径。"""
+
+    def test_no_supplier_wording_on_any_ui_surface(self):
+        root = STATIC.parents[1]
+        workbench = root / "desktop_annotation" / "PaperFlow-Annotation" / "resources" / "app" / "js"
+        surfaces = [STATIC / "app.js", STATIC / "index.html", STATIC / "styles.css", STATIC / "review-ui.js"]
+        surfaces.extend(path for path in sorted(workbench.glob("*.js")) if path.is_file())
+        for path in surfaces:
+            if not path.is_file():
+                continue
+            self.assertNotIn("甲方", path.read_text(encoding="utf-8"), f"{path.name} 里还有“甲方”字样")
+
+    def test_answer_and_analysis_share_one_block(self):
+        source = (STATIC / "app.js").read_text(encoding="utf-8")
+        self.assertIn("<h4>答案与解析</h4>", source)
+        # 解析已经并进答案，单独的「详细解析」块不再常驻；旧数据才补一块「补充解析」。
+        self.assertNotIn("<h4>详细解析</h4>", source)
