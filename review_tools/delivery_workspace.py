@@ -474,17 +474,20 @@ def _strip_printed_minor_prefix(text: str, minor: object) -> str:
     那更可能是答案本身的小数（小题 8 的答案 "8.5"），而不是题号。
     "7.6.0288" 这类出现第二个分隔点的，说明 "7." 一定是题号，剥成 "6.0288"。
     前面带标点的变体（"，、1. 12.56 …"，OCR 把答案行的序号点读歪了）同样剥。
+    点号后面有空格时（印刷答案行 "3. 15立方分米" 的标准排版）也剥——真小数
+    "3.14" 的点后不会有空格。
     """
     raw = str(text or "")
     try:
         minor_value = int(str(minor).strip())
     except (TypeError, ValueError):
         return raw
-    match = re.match(r"^[、，,.\s]*(\d{1,3})\s*[.、．]\s*(\S.*)$", raw, re.S)
+    match = re.match(r"^[、，,.\s]*(\d{1,3})\s*[.、．](\s*)(\S.*)$", raw, re.S)
     if not match or int(match.group(1)) != minor_value:
         return raw
-    rest = match.group(2)
-    if rest[:1].isdigit() and not re.search(r"[.、．]", rest):
+    rest = match.group(3)
+    if (rest[:1].isdigit() and not match.group(2)
+            and not re.search(r"[.、．]", rest)):
         return raw
     return rest
 
@@ -510,16 +513,22 @@ def _analysis_is_numeric_fragment(value: str, body: str) -> bool:
     return all(any(token in candidate for candidate in body_digits) for token in digits)
 
 
-def _answer_body_text(record: dict) -> str:
+def _answer_body_text(record: dict, prefer_text: bool = False) -> str:
     """答案记录的正文：人工填的标准答案优先，其次答案框的 OCR 原文。
 
     快照层（``enrich_snapshot._answer_text``）会退到 ``analysis``，但交付的
     "标准答案"字段不能拿解析过程顶替，所以顺序是 answer → text → analysis。
     答案框只做了 OCR、没人工填 answer 时，这里能取到 ``text``，不该判缺答案。
+
+    ``prefer_text=True`` 用于**有续框的答案**：框被拆分（答案换行处切出续框）
+    之后，``answer`` 里还是拆分前的旧合并文本（含续框那半的内容，常见乱序
+    碎片），而 ``text`` 是当前框自己的重新 OCR——此时以 text 为准，续框内容
+    由续框记录自己供给，避免"旧合并文本 + 续框"拼出重复错乱的答案。
     """
     if not isinstance(record, dict):
         return ""
-    for key in ("answer", "text", "analysis"):
+    keys = ("text", "answer", "analysis") if prefer_text else ("answer", "text", "analysis")
+    for key in keys:
         value = _clean_text(record.get(key))
         if value:
             return _strip_printed_minor_prefix(
@@ -669,7 +678,14 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
         primary_answer_infos = [answers_by_internal.get(str(value)) for value in relation.get("answer_ids", [])]
         primary_answer_infos = sorted((item for item in primary_answer_infos if item), key=_record_position)
         answer_infos = [part for item in primary_answer_infos for part in answer_chain(item)]
-        answers = [_answer_body_text(item[2]) for item in answer_infos]
+
+        def _answer_body(item: tuple) -> str:
+            record = item[2]
+            # 有续框的答案：answer 字段是拆分前的旧合并文本，改用框自身 OCR。
+            prefer_text = bool(continuations_by_parent.get(str(record.get("id", ""))))
+            return _answer_body_text(record, prefer_text)
+
+        answers = [_answer_body(item) for item in answer_infos]
         analyses = [_clean_text(item[2].get("analysis")) for item in answer_infos]
         illustrations = sorted(
             (item for item in question.get("illustrations", []) if isinstance(item, dict)),
@@ -1012,7 +1028,14 @@ def analyze_delivery(project_path: str | Path, runtime_root: str | Path,
             primary = [answers_by_internal.get(str(value)) for value in relation.get("answer_ids", [])]
             primary = sorted((item for item in primary if item), key=_record_position)
             answer_infos = [part for item in primary for part in answer_chain(item)]
-            answers = [_answer_body_text(item[2]) for item in answer_infos]
+
+            def _answer_body(item: tuple) -> str:
+                record = item[2]
+                # 有续框的答案：answer 字段是拆分前的旧合并文本，改用框自身 OCR。
+                prefer_text = bool(continuations_by_parent.get(str(record.get("id", ""))))
+                return _answer_body_text(record, prefer_text)
+
+            answers = [_answer_body(item) for item in answer_infos]
             analyses = [_clean_text(item[2].get("analysis")) for item in answer_infos]
             illustrations = sorted(
                 (item for item in question.get("illustrations", []) if isinstance(item, dict)),

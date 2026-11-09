@@ -137,6 +137,14 @@ class PrintedMinorPrefixTests(unittest.TestCase):
             "12.56    37.68    62.8")
         self.assertEqual(_strip_printed_minor_prefix("，、1. 12.56", 1), "12.56")
 
+    def test_space_after_dot_means_printed_number(self):
+        # 真实案例 BADA11D3FD6 题 2-3：印刷答案行 "3. 15立方分米"，OCR 忠实
+        # 保留点后空格。真小数 "3.14立方分米" 的点后不会有空格，仍然不动。
+        self.assertEqual(_strip_printed_minor_prefix("3. 15 立方分米", 3), "15 立方分米")
+        self.assertEqual(_strip_printed_minor_prefix("3. 15立方分米", 3), "15立方分米")
+        self.assertEqual(_strip_printed_minor_prefix("3.14立方分米", 3), "3.14立方分米")
+        self.assertEqual(_strip_printed_minor_prefix("3.14 平方分米", 3), "3.14 平方分米")
+
 
 class StaleAnalysisFragmentTests(unittest.TestCase):
     """答案框重新 OCR 后 text 会刷新，但旧"答案/解析拆分"写进 analysis 的
@@ -161,6 +169,39 @@ class StaleAnalysisFragmentTests(unittest.TestCase):
 
     def test_pure_punctuation_is_dropped(self):
         self.assertEqual(_merged_answer_text(["12.56"], ["。、．"]), "12.56")
+
+
+class ContinuationAnswerTests(unittest.TestCase):
+    """有续框的答案：answer 字段是拆分前的旧合并文本，交付改用框自身 OCR。
+
+    真实案例 BADA11D3FD6 题 2-3：答案框后来在换行处拆出续框，主框的
+    ``answer`` 还是拆分前 OCR 的乱序残留（"5立方分米\\n3. 1\\n15"），而
+    ``text`` 是当前框自己的重新 OCR（"3. 15 立方分米"）。若仍 answer 优先，
+    交付就会拼出"旧残留 + 续框"的四行错乱答案。
+    """
+
+    PRIMARY = {"id": "p", "answer": "5立方分米\n3. 1\n15", "text": "3. 15 立方分米",
+               "analysis": "", "minor_number": "3"}
+    CONTINUATION = {"id": "c", "continuation_of": "p", "answer": "5 立方分米",
+                    "text": "5 立方分米", "analysis": "", "minor_number": ""}
+
+    def test_prefer_text_for_records_with_continuations(self):
+        self.assertEqual(_answer_body_text(self.PRIMARY, prefer_text=True), "15 立方分米")
+
+    def test_normal_records_keep_answer_priority(self):
+        self.assertEqual(_answer_body_text(self.PRIMARY), "5立方分米\n3. 1\n15")
+
+    def test_continuation_record_supplies_its_own_body(self):
+        self.assertEqual(_answer_body_text(self.CONTINUATION), "5 立方分米")
+
+    def test_prefer_text_falls_back_to_answer_when_text_missing(self):
+        record = dict(self.PRIMARY, text="")
+        self.assertEqual(_answer_body_text(record, prefer_text=True), "5立方分米\n3. 1\n15")
+
+    def test_merged_chain_reads_like_the_printed_answer(self):
+        bodies = [_answer_body_text(self.PRIMARY, True), _answer_body_text(self.CONTINUATION)]
+        merged = _merged_answer_text(bodies, ["", ""])
+        self.assertEqual(merged, "15 立方分米\n5 立方分米")
 
 
 class DeliveryGateTests(unittest.TestCase):

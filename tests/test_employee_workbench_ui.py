@@ -1137,9 +1137,14 @@ if (run(legacyBreak) !== '第一行\n第二行') throw new Error('literal legacy
         和裸 LaTeX（`$4\\frac{1}{2}$`）原样亮给员工，交付修好后界面也"还是没变"。
         """
         ui_source = (APP_JS / "ui-manager.js").read_text(encoding="utf-8")
-        self.assertIn("paperFlowAnswerPreviewText(record)", ui_source)
-        # 候选顺序与交付一致：answer → text → analysis。
-        self.assertIn("for (const key of ['answer', 'text', 'analysis'])", ui_source)
+        self.assertIn("paperFlowAnswerPreviewText(record, preferText = false)", ui_source)
+        self.assertIn("part !== record", ui_source)
+        # 候选顺序与交付一致：answer → text → analysis；有续框的主框改为
+        # text → answer → analysis（answer 是拆分前的旧合并文本）。
+        self.assertIn("preferText ? ['text', 'answer', 'analysis'] : ['answer', 'text', 'analysis']", ui_source)
+        # 答案链要包含续框片段（continuation_of），与交付 answer_chain 同口径。
+        self.assertIn("childrenOf", ui_source)
+        self.assertIn("continuation_of", ui_source)
         # 每个候选剥印刷小题号（复用主程序的剥号逻辑）。
         self.assertIn("window.ocrTool?.stripPaperFlowPrintedNumber", ui_source)
         # analysis 里旧 OCR 残留的纯数字碎片会被丢掉。
@@ -1152,7 +1157,9 @@ if (run(legacyBreak) !== '第一行\n第二行') throw new Error('literal legacy
     def test_strip_printed_number_handles_punctuation_variants(self):
         """剥号逻辑要认「、1. 12.56 …」这类前导标点变体（与交付层一致）。"""
         main_source = (APP_JS / "main.js").read_text(encoding="utf-8")
-        self.assertIn("/^[、，,.\\s]*(\\d{1,3})\\s*[.、．]\\s*(\\S[\\s\\S]*)$/", main_source)
+        self.assertIn("/^[、，,.\\s]*(\\d{1,3})\\s*[.、．](\\s*)(\\S[\\s\\S]*)$/", main_source)
+        # 点号后有空格（印刷答案行 "3. 15立方分米"）也要剥；真小数 "3.14" 不动。
+        self.assertIn("if (/^\\d/.test(rest) && !match[2] && !/[.、．]/.test(rest)) return source;", main_source)
 
     def test_pair_draw_mode_wiring(self):
         """配对画框：入口在顶部「模式」菜单，画题框记配对源，答案页画答案框自动配对。"""
