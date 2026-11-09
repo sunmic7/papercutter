@@ -975,7 +975,7 @@ if (run(legacyBreak) !== '第一行\n第二行') throw new Error('literal legacy
         self.assertIn("only_reviewed", source)
         # 生成不再要求整本审完：按交付字段判定，字段齐全就能出包。
         self.assertIn("按交付字段判定", source)
-        self.assertIn("只收录审核已通过的页面", source)
+        self.assertIn("只生成审核已通过的页面", source)
         self.assertNotIn("<th>交付生成</th>", source)
         self.assertIn("生成JSON", (ROOT / "online_review_beta" / "static" / "index.html").read_text(encoding="utf-8"))
         self.assertIn("适应整页", source)
@@ -1119,7 +1119,6 @@ if (run(legacyBreak) !== '第一行\n第二行') throw new Error('literal legacy
         insert_at = ui_source.index("${matchedAnswerBlock}", content_group_end)
         self.assertLess(content_group_end, insert_at)
         self.assertIn("buildMatchedAnswerBlock", ui_source)
-        self.assertIn("record.answer || record.analysis || record.text", ui_source)
         self.assertIn("pf-card-answer-jump", ui_source)
         self.assertIn("data-answer-locations", ui_source)
         # 答案块不再出现在卡片摘要区。
@@ -1130,6 +1129,30 @@ if (run(legacyBreak) !== '第一行\n第二行') throw new Error('literal legacy
         self.assertIn("async jumpToPaperFlowAnswer(", main_source)
         self.assertIn("loadPaperFlowKind('answer', page.image)", main_source)
         self.assertIn("selectAnnotation(first.answerId)", main_source)
+
+    def test_matched_answer_preview_uses_delivery_cleaning_chain(self):
+        """答案卡预览必须与交付同口径：answer → text → analysis，剥印刷小题号。
+
+        之前卡片直接显示 record.answer 原文——旧数据里残留的「、1. 12.56 …」
+        和裸 LaTeX（`$4\\frac{1}{2}$`）原样亮给员工，交付修好后界面也"还是没变"。
+        """
+        ui_source = (APP_JS / "ui-manager.js").read_text(encoding="utf-8")
+        self.assertIn("paperFlowAnswerPreviewText(record)", ui_source)
+        # 候选顺序与交付一致：answer → text → analysis。
+        self.assertIn("for (const key of ['answer', 'text', 'analysis'])", ui_source)
+        # 每个候选剥印刷小题号（复用主程序的剥号逻辑）。
+        self.assertIn("window.ocrTool?.stripPaperFlowPrintedNumber", ui_source)
+        # analysis 里旧 OCR 残留的纯数字碎片会被丢掉。
+        self.assertIn("isPaperFlowNumericFragment(stripped, firstBody)", ui_source)
+        self.assertIn("isPaperFlowNumericFragment(value, body)", ui_source)
+        # 含公式的答案交给渲染器，员工看渲染结果而不是 `$...$` 源码。
+        self.assertIn("pf-answer-preview-text", ui_source)
+        self.assertIn("window.latexRenderer.render(rawText, previewNode)", ui_source)
+
+    def test_strip_printed_number_handles_punctuation_variants(self):
+        """剥号逻辑要认「、1. 12.56 …」这类前导标点变体（与交付层一致）。"""
+        main_source = (APP_JS / "main.js").read_text(encoding="utf-8")
+        self.assertIn("/^[、，,.\\s]*(\\d{1,3})\\s*[.、．]\\s*(\\S[\\s\\S]*)$/", main_source)
 
     def test_pair_draw_mode_wiring(self):
         """配对画框：入口在顶部「模式」菜单，画题框记配对源，答案页画答案框自动配对。"""
