@@ -140,16 +140,27 @@ def _page_entries(project: dict, max_preview_side: int, include_previews: bool,
                 continue
             regions = []
             for record in page.get(records_key, []):
-                if not isinstance(record, dict) or str(record.get("region_role", "question")) != "question":
+                if not isinstance(record, dict):
+                    continue
+                # 续框（跨页续题片段）也要进审核快照：审核员在网站上必须能看到它，
+                # 否则一份跨页题目在网站上只剩半截，审核结论会漏掉这半截。
+                role = str(record.get("region_role", "question"))
+                if role not in ("question", "continuation"):
                     continue
                 bbox = record.get("bbox")
                 if not (isinstance(bbox, (list, tuple)) and len(bbox) == 4):
                     continue
-                regions.append({
+                region = {
                     "id": str(record.get("id", "")),
                     "display_number": annotation_data.display_number(record),
                     "bbox": [int(round(float(value))) for value in bbox],
-                })
+                }
+                if role == "continuation":
+                    region["role"] = "continuation"
+                    source_id = str(record.get("continuation_of", "") or "")
+                    if source_id:
+                        region["continuation_of"] = source_id
+                regions.append(region)
             if not regions:
                 continue
             candidates.append({

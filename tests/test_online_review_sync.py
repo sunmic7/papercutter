@@ -59,3 +59,30 @@ class OnlineReviewSyncTests(unittest.TestCase):
             self.assertEqual(snapshot["pages"][0]["width"], 64)
             self.assertEqual(snapshot["pages"][0]["height"], 48)
             self.assertTrue(snapshot["pages"][0]["preview"].startswith("data:image/jpeg;base64,"))
+
+    def test_snapshot_includes_continuation_boxes_with_role(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            page_path = root / "第1页.jpg"
+            image = np.full((48, 64, 3), 255, dtype=np.uint8)
+            cv2.imencode(".jpg", image)[1].tofile(str(page_path))
+            project_path = root / "PaperFlow标注项目.json"
+            project_path.write_text(
+                '{"image_root": "' + str(root).replace("\\", "\\\\") + '", '
+                '"pages": [{"image": "第1页.jpg", "status": "accepted", "questions": ['
+                '{"id": "q-1", "bbox": [1, 2, 30, 40], "major_number": "2", "minor_number": "8"},'
+                '{"id": "q-1-cont", "bbox": [2, 42, 30, 47], "region_role": "continuation", "continuation_of": "q-1"},'
+                '{"id": "grp-1", "bbox": [3, 3, 10, 10], "region_role": "group"}'
+                ']}], '
+                '"answer_pages": []}',
+                encoding="utf-8",
+            )
+
+            snapshot = online_review_sync.build_review_snapshot(project_path, include_previews=False)
+
+            regions = snapshot["pages"][0]["regions"]
+            self.assertEqual([region["id"] for region in regions], ["q-1", "q-1-cont"])
+            self.assertEqual(regions[0]["display_number"], "2-8")
+            self.assertNotIn("role", regions[0])
+            self.assertEqual(regions[1]["role"], "continuation")
+            self.assertEqual(regions[1]["continuation_of"], "q-1")

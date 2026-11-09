@@ -65,7 +65,7 @@ class DeliveryCheckEntryTests(unittest.TestCase):
         self.assertIn("'checkView'", self.source)
         self.assertIn("class=\"chk-body\"", self.source)
         self.assertIn("class=\"chk-menu\"", self.source)
-        for key, label in (("items", "逐题明细"), ("missing", "缺什么"), ("coverage", "收录概览")):
+        for key, label in (("items", "逐题明细"), ("missing", "缺什么"), ("coverage", "生成概览")):
             self.assertIn(f"['{key}','{label}']", self.source)
 
     def test_item_detail_comes_first_and_is_the_default(self):
@@ -107,7 +107,7 @@ class DeliveryCheckEntryTests(unittest.TestCase):
 
     def test_page_coverage_is_hidden_from_annotators(self):
         # 逐页明细接口只对审核员/管理员开放，标注员点开时降级成一句说明。
-        self.assertIn("逐页收录明细只对有审核权限的账号开放", self.source)
+        self.assertIn("逐页生成明细只对有审核权限的账号开放", self.source)
         server = (STATIC.parent / "central_library.py").read_text(encoding="utf-8")
         self.assertIn("只有审核员或管理员可以查看交付页面明细", server)
 
@@ -222,6 +222,80 @@ class SourceFolderMenuTests(unittest.TestCase):
     def test_editing_a_source_folder_can_change_its_path(self):
         self.assertIn("新路径", self.source)
         self.assertIn("new_path", self.source)
+
+
+class DeliveryScopeBadgeTests(unittest.TestCase):
+    """生成成功 ≠ 整本都生成了：列表要写明这一版生成的页数/题数，部分生成单独标。
+
+    操作员反馈：看到"最终 JSON 与裁剪图已发布"还以为是整本教材都出完了，
+    实际上被退回的页、字段不全的题都没生成。另外口径统一用"生成"，不用"收录"。
+    """
+
+    def setUp(self):
+        self.source = (STATIC / "app.js").read_text(encoding="utf-8")
+
+    def test_row_shows_real_question_counts(self):
+        self.assertIn("function deliveryCoverageView(", self.source)
+        self.assertIn("row.delivery_coverage||{}", self.source)
+        self.assertIn("页全部生成", self.source)
+        self.assertIn("生成 ${num(cov.inQuestions)}/${num(total)} 题", self.source)
+
+    def test_every_missing_case_has_its_own_phrase(self):
+        # 每种没生成的情况各有一句话，有几种列几种，不允许只留一句笼统的。
+        self.assertIn("'未审核放行':'被审核退回'}，没有生成", self.source)
+        self.assertIn("页的题目全都没通过交付校验", self.source)
+        self.assertIn("页只有部分题目通过校验", self.source)
+        self.assertIn("题没通过交付校验", self.source)
+
+    def test_legacy_summary_without_question_counts_stays_honest(self):
+        # 老汇总没有题数：不硬凑数字，只说"部分生成"，页数从略。
+        self.assertIn("已发布（部分生成）", self.source)
+        self.assertIn("cov.hasQuestions", self.source)
+
+    def test_partial_rows_get_a_distinct_badge(self):
+        self.assertIn("'部分生成'", self.source)
+        self.assertIn("const badgeTone=", self.source)
+
+    def test_kpi_card_counts_partial_successes(self):
+        self.assertIn("其中 ${num(partialCount)} 项部分生成", self.source)
+
+    def test_old_rows_without_coverage_keep_a_honest_fallback(self):
+        # 升级前的老任务没有覆盖汇总，只能退回一句话，且要承认"看不到具体页数"。
+        self.assertIn("cov.known", self.source)
+        self.assertIn("最终 JSON 与裁剪图已发布", self.source)
+
+    def test_status_legend_explains_the_numbers(self):
+        self.assertIn("标“部分生成”说明还有页面或题目没生成", self.source)
+
+    def test_the_word_shou_lu_is_gone_from_user_visible_text(self):
+        for path in ("app.js", "styles.css", "index.html", "review-ui.js"):
+            text = (STATIC / path).read_text(encoding="utf-8")
+            self.assertNotIn("收录", text, f"{path} 里还有“收录”字样")
+        for name in ("central_library.py", "server.py"):
+            text = (STATIC.parent / name).read_text(encoding="utf-8")
+            self.assertNotIn("收录", text, f"{name} 里还有“收录”字样")
+
+
+class ContinuationBoxReviewTests(unittest.TestCase):
+    """审核页要能看到续框：跨页题目在网站上只剩半截，审核员没法下结论。
+
+    提交快照以前只带 region_role=question 的框，续框（跨页续题片段）整个消失；
+    现在快照带上 role=continuation，前端用橙色虚线框单独画出来并在计数里注明。
+    """
+
+    def setUp(self):
+        self.source = (STATIC / "app.js").read_text(encoding="utf-8")
+        self.styles = (STATIC / "styles.css").read_text(encoding="utf-8")
+
+    def test_queue_shows_continuation_count(self):
+        self.assertIn("个框${contCount ? ` · ${contCount} 续框` : ''}", self.source)
+
+    def test_overlay_draws_continuation_boxes_with_a_distinct_style(self):
+        self.assertIn('String(region.role || \'question\') === \'continuation\'', self.source)
+        self.assertIn('class="cont"', self.source)
+        self.assertIn("续框", self.source)
+        self.assertIn(".image-board rect.cont{stroke:#f79009", self.styles)
+        self.assertIn(".image-board text.cont{fill:#b45309}", self.styles)
 
 
 if __name__ == "__main__":
