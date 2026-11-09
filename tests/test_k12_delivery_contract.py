@@ -18,9 +18,11 @@ import numpy as np
 from review_tools import manual_annotation_data as data
 from review_tools.delivery_workspace import (
     _DeliveryIdentity,
+    _answer_body_text,
     _k12_text,
     _mask_pii,
     _strip_noise,
+    _strip_printed_minor_prefix,
     analyze_delivery,
     sync_delivery_workspace,
 )
@@ -94,6 +96,38 @@ class TextPipelineTests(unittest.TestCase):
 
     def test_k12_text_runs_math_then_noise_then_pii(self):
         self.assertEqual(_k12_text("$\\frac{1}{2}$ <b>请拨打 13800138000</b>"), "1⁄2 请拨打 x")
+
+
+class PrintedMinorPrefixTests(unittest.TestCase):
+    """答案框常把印刷小题号一起框进切片，OCR 忠实读出"8. πr²h"。
+
+    交付前要剥掉与该答案小题号一致的题号前缀；剥完只剩纯数字时不动，
+    那更可能是答案本身的小数（小题 8 的答案 "8.5"）。
+    """
+
+    def test_strips_prefix_matching_minor_number(self):
+        self.assertEqual(
+            _strip_printed_minor_prefix("8. $\\pi r^{2}h$", 8), "$\\pi r^{2}h$")
+        self.assertEqual(_strip_printed_minor_prefix("8、一个圆锥的体积", 8), "一个圆锥的体积")
+        self.assertEqual(_strip_printed_minor_prefix("8．50.24", 8), "50.24")
+
+    def test_two_dots_mean_number_then_value(self):
+        # "7." 是题号，"6.0288" 是答案；整串只有两个点，不存在小数歧义。
+        self.assertEqual(_strip_printed_minor_prefix("7.6.0288", 7), "6.0288")
+
+    def test_bare_decimal_answer_is_kept(self):
+        self.assertEqual(_strip_printed_minor_prefix("8.5", 8), "8.5")
+        self.assertEqual(_strip_printed_minor_prefix("8.5 平方分米", 8), "8.5 平方分米")
+
+    def test_prefix_of_other_questions_is_untouched(self):
+        self.assertEqual(_strip_printed_minor_prefix("9. πr²h", 8), "9. πr²h")
+        self.assertEqual(_strip_printed_minor_prefix("12.56", 8), "12.56")
+
+    def test_answer_body_text_uses_record_minor_number(self):
+        record = {"answer": "8. $\\pi r^{2}h$", "text": "", "minor_number": 8}
+        self.assertEqual(_answer_body_text(record), "$\\pi r^{2}h$")
+        record["minor_number"] = None
+        self.assertEqual(_answer_body_text(record), "8. $\\pi r^{2}h$")
 
 
 class DeliveryGateTests(unittest.TestCase):

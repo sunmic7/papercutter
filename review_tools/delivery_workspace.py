@@ -467,6 +467,27 @@ def _unicode_math_text(value: object) -> str:
     return _clean_text(convert(source)).replace("{", "(").replace("}", ")")
 
 
+def _strip_printed_minor_prefix(text: str, minor: object) -> str:
+    """剥掉答案文本开头的印刷小题号（答案框常把"8."一起框进切片）。
+
+    只在开头数字与该答案的小题号一致时才剥；剥完只剩纯数字时不动——
+    那更可能是答案本身的小数（小题 8 的答案 "8.5"），而不是题号。
+    "7.6.0288" 这类出现第二个分隔点的，说明 "7." 一定是题号，剥成 "6.0288"。
+    """
+    raw = str(text or "")
+    try:
+        minor_value = int(str(minor).strip())
+    except (TypeError, ValueError):
+        return raw
+    match = re.match(r"^\s*(\d{1,3})\s*[.、．]\s*(\S.*)$", raw, re.S)
+    if not match or int(match.group(1)) != minor_value:
+        return raw
+    rest = match.group(2)
+    if rest[:1].isdigit() and not re.search(r"[.、．]", rest):
+        return raw
+    return rest
+
+
 def _answer_body_text(record: dict) -> str:
     """答案记录的正文：人工填的标准答案优先，其次答案框的 OCR 原文。
 
@@ -479,7 +500,8 @@ def _answer_body_text(record: dict) -> str:
     for key in ("answer", "text", "analysis"):
         value = _clean_text(record.get(key))
         if value:
-            return value
+            return _strip_printed_minor_prefix(
+                value, record.get("minor_number", record.get("number")))
     return ""
 
 
