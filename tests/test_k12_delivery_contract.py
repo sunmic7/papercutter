@@ -21,6 +21,7 @@ from review_tools.delivery_workspace import (
     _answer_body_text,
     _k12_text,
     _mask_pii,
+    _merged_answer_text,
     _strip_noise,
     _strip_printed_minor_prefix,
     analyze_delivery,
@@ -128,6 +129,38 @@ class PrintedMinorPrefixTests(unittest.TestCase):
         self.assertEqual(_answer_body_text(record), "$\\pi r^{2}h$")
         record["minor_number"] = None
         self.assertEqual(_answer_body_text(record), "8. $\\pi r^{2}h$")
+
+    def test_punctuated_prefix_from_real_case(self):
+        # 真实案例 BADA11D3FD6：答案框 OCR 把答案行序号点读歪成 "、1. "。
+        self.assertEqual(
+            _strip_printed_minor_prefix("、1. 12.56    37.68    62.8", 1),
+            "12.56    37.68    62.8")
+        self.assertEqual(_strip_printed_minor_prefix("，、1. 12.56", 1), "12.56")
+
+
+class StaleAnalysisFragmentTests(unittest.TestCase):
+    """答案框重新 OCR 后 text 会刷新，但旧"答案/解析拆分"写进 analysis 的
+    纯数字碎片会残留（如 "12.\\n56\\n68\\n37\\n62.\\n1."）。工作台不重刷
+    旧字段，交付出口识别这种碎片并丢弃；真正的文字解析不受影响。
+    """
+
+    def test_numeric_fragment_of_the_answer_is_dropped(self):
+        merged = _merged_answer_text(
+            ["12.56 37.68 62.8"], ["12.\n56\n68\n37\n62.\n1."])
+        self.assertEqual(merged, "12.56 37.68 62.8")
+
+    def test_prose_analysis_is_kept_even_with_overlapping_digits(self):
+        merged = _merged_answer_text(
+            ["12.56"], ["先求底面周长 3.14×4=12.56，再求侧面积。"])
+        self.assertIn("先求底面周长", merged)
+
+    def test_numbers_absent_from_answer_are_kept(self):
+        # 数字不在答案里时不能丢——那可能是另一来源的真实内容。
+        merged = _merged_answer_text(["25"], ["3.14 100"])
+        self.assertEqual(merged, "25\n3.14 100")
+
+    def test_pure_punctuation_is_dropped(self):
+        self.assertEqual(_merged_answer_text(["12.56"], ["。、．"]), "12.56")
 
 
 class DeliveryGateTests(unittest.TestCase):

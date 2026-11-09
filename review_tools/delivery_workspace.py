@@ -473,19 +473,41 @@ def _strip_printed_minor_prefix(text: str, minor: object) -> str:
     只在开头数字与该答案的小题号一致时才剥；剥完只剩纯数字时不动——
     那更可能是答案本身的小数（小题 8 的答案 "8.5"），而不是题号。
     "7.6.0288" 这类出现第二个分隔点的，说明 "7." 一定是题号，剥成 "6.0288"。
+    前面带标点的变体（"，、1. 12.56 …"，OCR 把答案行的序号点读歪了）同样剥。
     """
     raw = str(text or "")
     try:
         minor_value = int(str(minor).strip())
     except (TypeError, ValueError):
         return raw
-    match = re.match(r"^\s*(\d{1,3})\s*[.、．]\s*(\S.*)$", raw, re.S)
+    match = re.match(r"^[、，,.\s]*(\d{1,3})\s*[.、．]\s*(\S.*)$", raw, re.S)
     if not match or int(match.group(1)) != minor_value:
         return raw
     rest = match.group(2)
     if rest[:1].isdigit() and not re.search(r"[.、．]", rest):
         return raw
     return rest
+
+
+def _analysis_is_numeric_fragment(value: str, body: str) -> bool:
+    """判断一段解析是否只是答案数字的碎片（旧 OCR 残留的典型形态）。
+
+    答案框重新 OCR 后 ``text`` 会刷新，但早前"答案/解析拆分"写进
+    ``analysis`` 的旧值会残留（如 "12.\\n56\\n68\\n37\\n62.\\n1."）。
+    特征：整段没有任何文字（去掉数字/标点/空白后为空），且每个数字串
+    都能被答案正文里的某个数字串覆盖 —— 这种"解析"没有信息量，丢弃；
+    真正的解析总有文字叙述，不会命中。
+    """
+    text = str(value or "")
+    if not text.strip():
+        return False
+    if re.search(r"[\u4e00-\u9fffA-Za-z]", text):
+        return False
+    digits = re.findall(r"\d+", text)
+    if not digits:
+        return True  # 纯标点/空白，没有信息量
+    body_digits = re.findall(r"\d+", body)
+    return all(any(token in candidate for candidate in body_digits) for token in digits)
 
 
 def _answer_body_text(record: dict) -> str:
@@ -519,6 +541,10 @@ def _merged_answer_text(answers: list[str], analyses: list[str]) -> str:
             continue
         # 同一条记录里 answer 和 analysis 常常是同一段话，重复贴两遍没有意义。
         if text in body or text in extras:
+            continue
+        # 答案框重新 OCR 后旧拆分残留在 analysis 里的纯数字碎片，同样没有
+        # 信息量（工作台侧不重刷旧字段，交付出口兜底）。
+        if _analysis_is_numeric_fragment(text, body):
             continue
         extras.append(text)
     if not extras:
