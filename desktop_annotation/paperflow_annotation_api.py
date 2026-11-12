@@ -101,7 +101,14 @@ PRELABEL_INFERENCE_LOCK = threading.Lock()
 PRELABEL_INFLIGHT_LOCK = threading.Lock()
 PRELABEL_INFLIGHT: dict[tuple, "_PrelabelFlight"] = {}
 ANSWER_PRELABEL_REVIEW_THRESHOLD = 120
-PAPERFLOW_BRIDGE_REVISION = "answer-chain-20261109"
+PAPERFLOW_BRIDGE_REVISION = json.loads(
+    (Path(__file__).resolve().parents[1] / "review_tools" / "bridge_identity.json").read_text(encoding="utf-8")
+)["revision"]
+_package_manifest = Path(__file__).resolve().parents[1] / "manifest.json"
+PAPERFLOW_PACKAGE_VERSION = (
+    json.loads(_package_manifest.read_text(encoding="utf-8-sig"))["version"]
+    if _package_manifest.is_file() else "development"
+)
 REVIEW_SESSION = ReviewSession()
 _configured_client_id = os.environ.get('PAPERFLOW_CLIENT_ID', '')
 LIBRARY_CLIENT_ID = _configured_client_id if re.fullmatch(r'[a-f0-9]{32}', _configured_client_id) else uuid.uuid4().hex
@@ -1079,6 +1086,20 @@ def _save_page(payload: dict) -> dict:
         for persistent_key in ("delivery_id",):
             if persistent_key in previous:
                 record[persistent_key] = previous[persistent_key]
+        # Printed answer-number geometry is part of the logical answer record.
+        # New clients send an explicit empty value after a frame is resized;
+        # older clients omit the field, in which case preserving prior data is
+        # safer than silently discarding it.
+        number_metadata_keys = (
+            "raw_ocr_text", "printed_number_bbox", "ocr_exclude_regions",
+            "number_prefix_removed", "number_prefix_removal_source",
+            "number_prefix_confidence",
+        )
+        for metadata_key in number_metadata_keys:
+            if metadata_key in item:
+                record[metadata_key] = _json_copy(item[metadata_key])
+            elif metadata_key in previous:
+                record[metadata_key] = _json_copy(previous[metadata_key])
         # 补全字段（快照/分级/AI 结果/词表码…）同样属于逻辑记录：页面保存是
         # 重建记录的白名单路径，不在这里接住就会把整条 AI 结果抹掉。
         for enrich_key in annotation_data.ENRICH_PERSISTENT_KEYS:
@@ -1928,8 +1949,62 @@ def _ensure_review_delivery_clear(project_path: Path) -> None:
         raise ValueError(f"Final crops and JSON are blocked: {len(unresolved)} reviewed page(s) still require action ({statuses}). Fix, resubmit and pull the approved conclusions first.")
 
 
+def _run_self_check(project: dict) -> dict:
+    """员工自检：乱码 + 交付字段缺项。只读、不落盘，可频繁调用。
+
+    自检模块会链式加载 delivery_workspace → cv2/numpy，属于原生重依赖。
+    必须在这里延迟导入：工作台冷启动只跑登录/健康检查，不能因为新增了
+    一道自检闸就把模型库提前拉起来（见 test_workbench_fast_startup）。
+    """
+    try:
+        from review_tools import self_check
+        return self_check.check_project(project)
+    except ImportError as error:
+        raise ValueError(f"自检模块加载失败，暂不能生成或上传：{error}") from error
+    except Exception as error:
+        raise ValueError(f"自检执行失败，暂不能生成或上传：{error}") from error
+
+
+def _ensure_self_check_clear(project: dict) -> dict:
+    """硬闸：自检不通过不许生成裁图/JSON，也不许提交审核上传。
+
+    这是「员工自检」流程的防线，和审核员放行闸（_ensure_review_delivery_clear）
+    相互独立：旧审核流程保留，但自检没过连第一步都走不出去。
+    """
+    report = _run_self_check(project)
+    if report["blocking"]:
+        raise ValueError(
+            f"自检未通过，已阻止生成和上传。{report['summary']}。"
+            "请点工作台「自检报告」逐项查看并修正后重试。")
+    return report
+
+
+def _self_check_route(payload: dict) -> dict:
+    """员工自检只读入口：本地教材按路径读文件，服务器教材用内联工程。
+
+    ``project_path`` 以 ``server://`` 开头的请求会在 ``do_POST`` 里被转发到远端
+    资料库（远端没有自检路由）。自检是纯文本只读、不写文件、不碰图片，所以
+    前端对服务器教材改传 ``project``（工作台内存里的完整工程），这里直接用
+    同一份规则跑，省掉一次远端往返，也不依赖服务器版本。
+
+    内联工程故意不做路径校验：它本来就不落盘，也不代表一次文件操作。
+    """
+    inline = payload.get("project")
+    if isinstance(inline, dict):
+        project = inline
+    else:
+        _project_path, project = _load_project(payload)
+    report = dict(_run_self_check(project))
+    # check_project 的 ok 是「自检是否通过」，桥服务响应的 ok 是「请求是否成功」。
+    # 同名会被前端 paperFlowRequestDirect 当成请求失败抛掉，面板就永远显示不出
+    # 问题清单。结论改名 self_check_ok，成功标志单独返回。
+    report["self_check_ok"] = report.pop("ok", None)
+    return {"ok": True, **report}
+
+
 def _export_project(payload: dict) -> dict:
     project_path, _project = _load_project(payload)
+    _ensure_self_check_clear(_project)
     _ensure_review_delivery_clear(project_path)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     target = ROOT / "runtime" / "manual_annotation_exports" / project_path.stem / stamp
@@ -1939,6 +2014,7 @@ def _export_project(payload: dict) -> dict:
 
 def _sync_delivery(payload: dict) -> dict:
     project_path, project = _load_project(payload)
+    _ensure_self_check_clear(project)
     # 与 export 路径同一道闸：审核未全放行的教材不允许把最终裁图/JSON 落到交付工作区。
     _ensure_review_delivery_clear(project_path)
     result = sync_delivery_workspace(project_path, ROOT / "runtime", materialize_all=True)
@@ -1955,6 +2031,7 @@ def _group_export_preflight(payload: dict) -> dict:
 
 def _export_match_scope(payload: dict) -> dict:
     project_path, _project = _load_project(payload)
+    _ensure_self_check_clear(_project)
     _ensure_review_delivery_clear(project_path)
     scope_id = str(payload.get("scope_id", "") or "").strip()
     if not scope_id:
@@ -2018,6 +2095,7 @@ def _review_submit(payload: dict) -> dict:
     frames without asking the annotator for a copy of the textbook folder.
     """
     project_path, _project = _load_project(payload)
+    _ensure_self_check_clear(_project)
     result = submit_review_snapshot(
         str(payload.get("server_url", "")),
         str(payload.get("username", "")),
@@ -2031,7 +2109,7 @@ def _review_submit(payload: dict) -> dict:
     annotation_data.save_project(_project, project_path)
     result["project_revision"] = _project["project_revision"]
     source: dict = {"total": 0, "uploaded": 0, "skipped": 0, "bytes": 0}
-    notice = "已按审核中心账号同步个人工程并提交审核快照；最终裁图和最终 JSON 由服务器在逐页审核通过后统一生成，无需在本机导出版。"
+    notice = "已按审核中心账号同步个人工程并提交；服务器收到后立即按交付字段生成裁剪图片和最终 JSON，不用等审核通过，也不需在本机导出版。"
     if payload.get("upload_source_images", True):
         try:
             source = upload_project_source_images(
@@ -2715,6 +2793,7 @@ ROUTES = {
     "/api/project/workspace-page": _workspace_page,
     "/api/project/export": _export_project,
     "/api/project/sync-delivery": _sync_delivery,
+    "/api/project/self-check": _self_check_route,
     "/api/project/group-export-preflight": _group_export_preflight,
     "/api/project/export-match-scope": _export_match_scope,
     "/api/review/submit": _review_submit,
@@ -2794,6 +2873,9 @@ class PaperFlowHandler(BaseHTTPRequestHandler):
                 "ok": True,
                 "service": "paperflow-local",
                 "bridge_revision": PAPERFLOW_BRIDGE_REVISION,
+                "source_root": str(Path(__file__).resolve().parents[1]),
+                "pid": os.getpid(),
+                "package_version": PAPERFLOW_PACKAGE_VERSION,
                 # 让排查和前端提示都能知道模型是否已经热好：
                 # pending / loading / ready / failed / disabled。
                 "prewarm": prewarm_state(),

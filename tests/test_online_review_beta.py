@@ -181,6 +181,28 @@ class OnlineReviewBetaTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_submission_queues_delivery_and_approval_does_not_duplicate_it(self):
+        """提交即生成：一页都没审，交付任务已经排在队里；审核通过不重算同一份内容。"""
+        task = self.store.create_submission(self.annotator, snapshot())
+        with closing(self.store._connect()) as db:
+            job = db.execute("SELECT * FROM delivery_jobs WHERE submission_id=?", (task["id"],)).fetchone()
+        self.assertIsNotNone(job)
+        self.assertEqual(job["status"], "queued")
+        # 默认口径：按交付字段判定，不等审核放行。
+        self.assertEqual(job["only_reviewed"], 0)
+        self.assertEqual(job["requested_by_id"], self.annotator["id"])
+
+        # 交付已经生成过之后，逐页放行不应再制造第二个版本。
+        with closing(self.store._connect()) as db:
+            db.execute("UPDATE delivery_jobs SET status='succeeded' WHERE id=?", (job["id"],))
+            db.commit()
+        self.store.decide_page(self.reviewer, task["id"], "question-0", "approved", "")
+        with closing(self.store._connect()) as db:
+            after = db.execute("SELECT status,attempts,version FROM delivery_jobs WHERE id=?",
+                               (job["id"],)).fetchone()
+        self.assertEqual(after["status"], "succeeded")
+        self.assertEqual(after["attempts"], job["attempts"])
+
     def test_submission_keeps_only_review_snapshot_and_returns_decisions(self):
         created = self.store.create_submission(self.annotator, snapshot())
         self.assertEqual(created["page_count"], 1)

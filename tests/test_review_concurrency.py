@@ -167,7 +167,12 @@ class ReviewConcurrencyTests(unittest.TestCase):
         with self.assertRaises(ConflictError) as caught:
             self.store.retry_delivery(self.admin, "BOOK-A")
         self.assertIn("冻结", str(caught.exception))
-        self.assertIsNone(self._job(first["id"]))
+        # 提交即生成：任务在提交那一刻就已入队，所以这里不再断言"没有任务"；
+        # 关键是不能变成一个能跑成功的任务，而是停在排队态并带着不可复现的原因。
+        job = self._job(first["id"])
+        self.assertIsNotNone(job)
+        self.assertNotEqual(job["status"], "succeeded")
+        self.assertIn("冻结", job["error"])
 
     def test_project_edit_retires_stale_review_task(self):
         first = self._submit(revision=1)
