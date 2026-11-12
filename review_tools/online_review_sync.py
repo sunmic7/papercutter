@@ -116,6 +116,33 @@ def _prune_preview_cache(cache_dir: Path) -> None:
         pass
 
 
+# 生成正式版本时要用冻结工程重算快照指纹，只为拿宽高却把每张整页扫描图
+# 解码一遍（实测 4896×3380 约 110ms，150 页的书就是半分钟）。原图字节的
+# sha256 已经在算，同字节必然同尺寸，所以把结果按摘要缓存；原图一换键就变。
+_PAGE_SIZE_CACHE: dict[str, tuple[int, int]] = {}
+_PAGE_SIZE_CACHE_LOCK = threading.Lock()
+_PAGE_SIZE_CACHE_LIMIT = 2000
+
+
+def _page_size(digest: str, raw: bytes) -> tuple[int, int]:
+    with _PAGE_SIZE_CACHE_LOCK:
+        cached = _PAGE_SIZE_CACHE.get(digest)
+    if cached is not None:
+        return cached
+    import cv2
+    import numpy as np
+
+    image = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError("无法读取本地页面，不能提交审核")
+    size = (int(image.shape[0]), int(image.shape[1]))
+    with _PAGE_SIZE_CACHE_LOCK:
+        if len(_PAGE_SIZE_CACHE) >= _PAGE_SIZE_CACHE_LIMIT:
+            _PAGE_SIZE_CACHE.clear()
+        _PAGE_SIZE_CACHE[digest] = size
+    return size
+
+
 def _page_entries(project: dict, max_preview_side: int, include_previews: bool,
                   previews_out: dict | None = None) -> list[dict]:
     """Build review page entries, generating previews in parallel.
@@ -211,10 +238,7 @@ def _page_entries(project: dict, max_preview_side: int, include_previews: bool,
                 payload = encoded.tobytes()
                 _store_preview(cache_dir, digest, side, payload, width, height)
         else:
-            image = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
-            if image is None:
-                raise ValueError(f"无法读取本地页面，不能提交审核：{source}")
-            height, width = image.shape[:2]
+            height, width = _page_size(digest, raw)
         item = {
             "page_key": candidate["page_key"],
             "kind": candidate["kind"],

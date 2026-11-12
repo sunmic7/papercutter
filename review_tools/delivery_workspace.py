@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -88,11 +89,8 @@ def _k12_text(value: object) -> str:
     return _mask_pii(_strip_noise(_unicode_math_text(value)))
 
 
-def _vocabulary_errors(meta: dict) -> list[str]:
-    """N3 词表闸：值非空但不在规范枚举内即拒收。
-
-    空值由 ``_k12_validation`` 的必填项检查单独报，这里只看"填了但填错"。
-    """
+def vocabulary_issues(meta: dict) -> list[dict]:
+    """N3 词表闸（结构化）：值非空但不在规范枚举内即拒收。"""
     checks = (
         ("language", K12_LANGUAGES, "语言"),
         ("stage", K12_STAGES, "学段"),
@@ -101,12 +99,233 @@ def _vocabulary_errors(meta: dict) -> list[str]:
         ("question_type", K12_QUESTION_TYPE_VALUES, "题型"),
         ("difficulty", K12_DIFFICULTIES, "难度"),
     )
-    errors = []
+    issues = []
     for key, allowed, label in checks:
         value = str(meta.get(key, "")).strip()
         if value and value not in allowed:
-            errors.append(f"{label}不在规范词表内：{value}")
-    return errors
+            issues.append({"code": "invalid_vocabulary", "field": key,
+                           "message": f"{label}不在规范词表内：{value}"})
+    return issues
+
+
+def _vocabulary_errors(meta: dict) -> list[str]:
+    """生成闸用的字符串版本；空值由必填项检查单独报，这里只看填错。"""
+    return [item["message"] for item in vocabulary_issues(meta)]
+
+
+# --- 员工自检：OCR / LaTeX 乱码判据 ---------------------------------------
+# 只认确定的语法破损，不搞命令白名单——OCR 常输出合法但少见的 TeX 命令，
+# 拿白名单判会把正常公式误报成乱码，员工很快就会忽略提示。
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_CJK_AFTER_BACKSLASH_RE = re.compile(r"\\[\u3400-\u9fff]")
+_COMMAND_WITHOUT_ARG_RE = re.compile(r"\\(?:frac|sqrt|overline|text|mathrm)\b\s*(?=$|[}\]$])", re.I)
+_LATEX_COMMAND_RE = re.compile(r"\\([A-Za-z]{2,})")
+# OCR 最容易打歪、也最常出现在 K12 教材里的命令。只拿它做「编辑距离 1」的
+# 邻近判断，不把它当白名单——合法但少见的 TeX 命令不会被误报成乱码。
+# 具体集合在 _LATEX_SYMBOLS 定义之后构造，避免模块加载期的前向引用。
+
+
+def _edit_distance_one(left: str, right: str) -> bool:
+    """OCR 近似：替换/增/删一个字符，或相邻两字符换位。
+
+    ``times → timse`` 这类换位在 OCR 里很常见，纯编辑距离是 2，漏掉就等于
+    放过了最典型的一批拼错命令。
+    """
+    if len(left) == len(right):
+        if sum(a != b for a, b in zip(left, right)) == 1:
+            return True
+        return any(left[:i] + left[i + 1] + left[i] + left[i + 2:] == right
+                   for i in range(len(left) - 1))
+    if abs(len(left) - len(right)) > 1:
+        return False
+    shorter, longer = (left, right) if len(left) < len(right) else (right, left)
+    return any(longer[:i] + longer[i + 1:] == shorter
+               for i in range(len(longer)))
+
+
+def _first_marker_offset(text: str, markers: tuple[str, ...]) -> int:
+    """第一个乱码标记在原文里的下标；没有则 -1。"""
+    positions = [text.find(marker) for marker in markers if marker in text]
+    return min(positions) if positions else -1
+
+
+def latex_syntax_details(value: object) -> list[dict]:
+    """OCR 转写的 LaTeX 乱码/破损硬信号，并给出问题在原文里的位置。
+
+    交给交付 JSON 的文本会经 ``_unicode_math_text`` 把 ``\\frac{1}{2}`` 转成
+    ``1⁄2``、丢掉 ``$``。未知命令则**原样留下命令名**，所以破损公式必须在这里
+    提前拦住，否则乱码会安静地进包。检查对象是原始 OCR 文本，不是清洗后的。
+
+    返回 ``[{"message": ..., "offset": ...}]``；``offset`` 是原文中的字符下标，
+    -1 表示整段性问题（如 ``$`` 未闭合）。``latex_syntax_errors`` 只是它的
+    字符串版本——**判据只有这一份**，前端「乱码明细」的高亮位置也来自这里。
+    """
+    text = str(value or "")
+    if not text or ("$" not in text and "\\" not in text):
+        return []
+    details: list[dict] = []
+
+    def add(message: str, offset: int) -> None:
+        details.append({"message": message, "offset": offset})
+
+    marker_offset = _first_marker_offset(text, GARBLED_MARKERS)
+    if marker_offset >= 0:
+        add("含乱码字符", marker_offset)
+    control = _CONTROL_CHAR_RE.search(text)
+    if control:
+        add("含控制字符", control.start())
+    dollars = [match.start() for match in re.finditer(r"(?<!\\)\$", text)]
+    if len(dollars) % 2:
+        add("公式定界符 $ 未闭合", dollars[-1] if dollars else -1)
+    depth = 0
+    bad_brace = -1
+    for index, char in enumerate(text):
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth < 0:
+                bad_brace = index
+                break
+    if bad_brace >= 0 or depth:
+        add("公式花括号不配对", bad_brace if bad_brace >= 0 else len(text) - 1)
+    cjk = _CJK_AFTER_BACKSLASH_RE.search(text)
+    if cjk:
+        add("公式命令后混入中文字符", cjk.start())
+    no_arg = _COMMAND_WITHOUT_ARG_RE.search(text)
+    if no_arg:
+        add("公式命令缺少参数", no_arg.start())
+    for match in _LATEX_COMMAND_RE.finditer(text):
+        command = match.group(1)
+        if command in _KNOWN_LATEX_COMMANDS:
+            continue
+        if any(_edit_distance_one(command, known)
+               for known in _KNOWN_LATEX_COMMANDS):
+            add(f"疑似 OCR 拼错的公式命令 \\{command}", match.start())
+            break
+    return details
+
+
+def latex_syntax_errors(value: object) -> list[str]:
+    """生成闸用的字符串版本；判据与 ``latex_syntax_details`` 完全同源。"""
+    return [item["message"] for item in latex_syntax_details(value)]
+
+
+def _garbled_issue(field: str, message: str, raw_text: str,
+                   offset: int, *, option_index: int | None = None) -> dict:
+    """给自检面板附上一小段原文，方便员工直接看到「哪里乱码」。
+
+    ``raw_excerpt`` 是原文切片，``excerpt_offset`` 是问题字符在切片内的下标；
+    ``raw_offset`` / ``raw_length`` 是它在整段原文里的绝对位置。生成闸只读
+    ``message``，这些附加字段不影响拒收结论。
+    """
+    item = {"code": "garbled", "field": field, "message": message}
+    if option_index is not None:
+        item["option_index"] = option_index
+    if raw_text:
+        start = max(0, (offset if offset >= 0 else 0) - 24)
+        end = min(len(raw_text), start + 96)
+        item["raw_excerpt"] = raw_text[start:end]
+        item["raw_start"] = start
+        item["raw_offset"] = offset
+        item["excerpt_offset"] = offset - start if 0 <= offset < end else -1
+        item["raw_length"] = len(raw_text)
+    return item
+
+
+def k12_field_issues(meta: dict, body: dict, *,
+                     raw_texts: dict | None = None,
+                     skip_fields: set[str] | None = None) -> list[dict]:
+    """纯文本字段闸：自检与生成共用，唯一规则来源。
+
+    不读图片、不碰身份库、不看审核状态，只判断「缺项 / 词表 / 乱码」。
+    返回结构化 ``[{code, field, message}]``；``code`` 为
+    ``missing_field`` / ``invalid_vocabulary`` / ``garbled``。
+
+    ``raw_texts`` 是清洗前的原始 OCR 文本（question/answer/options），
+    LaTeX 语法必须在原文上判——清洗会抹掉 ``$`` 和反斜杠。
+    ``skip_fields`` 让自检按定位去重（书级字段只报一次、未匹配答案不判缺项）。
+    """
+    skip = set(skip_fields or ())
+    issues: list[dict] = []
+    required_meta = {
+        "language": "语言", "stage": "学段", "grade": "年级", "subject": "学科",
+        "question_type": "题型", "difficulty": "难度",
+    }
+    for key, label in required_meta.items():
+        if key in skip:
+            continue
+        if not str(meta.get(key, "")).strip():
+            issues.append({"code": "missing_field", "field": key,
+                           "message": f"缺少{label}"})
+    for issue in vocabulary_issues(meta):
+        if issue["field"] not in skip:
+            issues.append(issue)
+    if "knowledge_points" not in skip and not meta.get("knowledge_points"):
+        issues.append({"code": "missing_field", "field": "knowledge_points",
+                       "message": "缺少知识点"})
+
+    def add(field: str, label: str, value: object, raw: object) -> None:
+        if field in skip:
+            return
+        text = str(value or "")
+        raw_text = str(raw if raw is not None else text or "")
+        if not text.strip():
+            issues.append({"code": "missing_field", "field": field,
+                           "message": f"缺少{label}"})
+            return
+        marker_offset = _first_marker_offset(text, GARBLED_MARKERS)
+        reported_marker = marker_offset >= 0
+        if reported_marker:
+            issues.append(_garbled_issue(
+                field, f"{label}含乱码字符", raw_text,
+                _first_marker_offset(raw_text, GARBLED_MARKERS)))
+        for detail in latex_syntax_details(raw_text):
+            if detail["message"] == "含乱码字符":
+                # 清洗后的文本可能把替换符抹掉，这时仍要按原文报一次；
+                # 两边都报过时只保留一条，避免同一个字符重复计数。
+                if reported_marker:
+                    continue
+                issues.append(_garbled_issue(field, f"{label}含乱码字符",
+                                             raw_text, detail["offset"]))
+                reported_marker = True
+                continue
+            issues.append(_garbled_issue(field, f"{label}{detail['message']}",
+                                         raw_text, detail["offset"]))
+
+    raw_texts = raw_texts or {}
+    add("question", "题目文本", body.get("question"), raw_texts.get("question"))
+    add("answer", "标准答案", body.get("answer"), raw_texts.get("answer"))
+    raw_options = raw_texts.get("options") or []
+    for index, option in enumerate(body.get("options", []) or []):
+        raw_option = str(raw_options[index] if index < len(raw_options) else option or "")
+        text = str(option or "")
+        reported_marker = _first_marker_offset(text, GARBLED_MARKERS) >= 0
+        if reported_marker:
+            issues.append(_garbled_issue(
+                "options", f"选项{index + 1}含乱码字符", raw_option,
+                _first_marker_offset(raw_option, GARBLED_MARKERS),
+                option_index=index + 1))
+        for detail in latex_syntax_details(raw_option):
+            if detail["message"] == "含乱码字符":
+                if reported_marker:
+                    continue
+                issues.append(_garbled_issue(
+                    "options", f"选项{index + 1}含乱码字符", raw_option,
+                    detail["offset"], option_index=index + 1))
+                reported_marker = True
+                continue
+            issues.append(_garbled_issue(
+                "options", f"选项{index + 1}{detail['message']}", raw_option,
+                detail["offset"], option_index=index + 1))
+    return issues
+
+
+def k12_field_errors(meta: dict, body: dict, *,
+                     raw_texts: dict | None = None) -> list[str]:
+    """给生成闸用的字符串列表版本，规则与 ``k12_field_issues`` 完全同源。"""
+    return [item["message"] for item in k12_field_issues(
+        meta, body, raw_texts=raw_texts)]
 
 
 def _content_signature(sample: dict) -> str:
@@ -328,6 +547,70 @@ def _delivery_artifact_path(root: Path, value: object) -> Path | None:
     return candidate
 
 
+def _reuse_artifact(reuse_root: Path | None, value: object) -> Path | None:
+    """Resolve ``manifest.json``'s relative artifact path inside an older version."""
+    text = str(value or "").strip()
+    if reuse_root is None or not text:
+        return None
+    relative = Path(text)
+    if relative.is_absolute():
+        return None
+    resolved_root = Path(reuse_root).resolve()
+    candidate = (resolved_root / relative).resolve()
+    try:
+        candidate.relative_to(resolved_root)
+    except ValueError:
+        return None
+    return candidate
+
+
+def _link_reused_file(source: Path | None, target: Path) -> bool:
+    """Reuse a crop from the previous version without decoding or re-encoding it.
+
+    Hard links keep disk usage flat (each version is immutable and is deleted
+    independently); ``os.replace`` writes never mutate a shared inode, so a
+    later version can safely replace its own copy.  Fall back to a plain copy
+    when the two versions live on different volumes or the filesystem refuses
+    links — a copy is still far cheaper than a full-page decode + JPEG encode.
+    """
+    if source is None or not source.is_file() or target.exists():
+        return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(source, target)
+        return True
+    except OSError:
+        pass
+    try:
+        shutil.copyfile(source, target)
+        return True
+    except OSError:
+        return False
+
+
+def _load_reuse_items(reuse_root: Path | None) -> dict[str, dict]:
+    if reuse_root is None:
+        return {}
+    try:
+        manifest = json.loads((Path(reuse_root) / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    return {item.get("id"): item for item in manifest.get("items", [])
+            if isinstance(item, dict) and item.get("id")}
+
+
+def _illustration_signature(source: str | Path, box: object) -> str:
+    """K12 crop identity: page bytes + box. Illustration edits must never reuse a stale crop."""
+    path = Path(source).resolve()
+    stat = path.stat()
+    payload = {"source": os.path.normcase(str(path)), "size": stat.st_size,
+               "mtime_ns": stat.st_mtime_ns, "bbox": list(box or []),
+               "crop_version": "illustration_v1"}
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
 def _number_sort_key(record: dict) -> tuple:
     parts = []
     for value in data.number_path(record):
@@ -391,6 +674,13 @@ _LATEX_SYMBOLS = {
     "lambda": "λ", "mu": "μ", "pi": "π", "sigma": "σ", "omega": "ω",
     "Delta": "Δ", "Theta": "Θ", "Lambda": "Λ", "Sigma": "Σ", "Omega": "Ω",
 }
+_KNOWN_LATEX_COMMANDS = frozenset({
+    "frac", "sqrt", "text", "mathrm", "overline", "underline", "binom",
+    "left", "right", "begin", "end", "displaystyle", "quad", "qquad",
+    "sum", "int", "lim", "log", "sin", "cos", "tan", "vec", "hat", "bar",
+    "dot", "perp", "parallel", "circ", "degree", "because", "therefore",
+    "triangle", "equiv", "cong", "geq", "leq",
+} | set(_LATEX_SYMBOLS))
 _SUPERSCRIPTS = str.maketrans("0123456789+-=()n", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿ")
 _SUBSCRIPTS = str.maketrans("0123456789+-=()aehijklmnoprstuvx", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₕᵢⱼₖₗₘₙₒₚᵣₛₜᵤᵥₓ")
 
@@ -528,9 +818,21 @@ def _answer_body_text(record: dict, prefer_text: bool = False) -> str:
     if not isinstance(record, dict):
         return ""
     keys = ("text", "answer", "analysis") if prefer_text else ("answer", "text", "analysis")
+    removal_source = str(record.get("number_prefix_removal_source", "") or "")
+    ocr_meta = record.get("ocr", {}) if isinstance(record.get("ocr"), dict) else {}
+    number_already_excluded = bool(
+        record.get("number_prefix_removed")
+        or removal_source in {"answer_anchor_geometry", "geometry_mask"}
+        or ocr_meta.get("number_mask_applied")
+    )
     for key in keys:
         value = _clean_text(record.get(key))
         if value:
+            # Geometry-based masking has already removed only the printed
+            # number. Running the text heuristic again could destroy a valid
+            # answer whose own first token is e.g. "3. 15".
+            if number_already_excluded:
+                return value
             return _strip_printed_minor_prefix(
                 value, record.get("minor_number", record.get("number")))
     return ""
@@ -561,7 +863,8 @@ def _merged_answer_text(answers: list[str], analyses: list[str]) -> str:
     return "\n".join([body, *extras]) if body else "\n".join(extras)
 
 
-def _k12_validation(sample: dict, image_sizes: list[tuple[int, int]]) -> tuple[list[str], list[str]]:
+def _k12_validation(sample: dict, image_sizes: list[tuple[int, int]], *,
+                     raw_texts: dict | None = None) -> tuple[list[str], list[str]]:
     """Return ``(errors, hints)``: errors block delivery, hints only inform.
 
     题图不是必填项 —— 交付规范要求 ``question_images`` 字段存在，空数组是
@@ -570,29 +873,13 @@ def _k12_validation(sample: dict, image_sizes: list[tuple[int, int]]) -> tuple[l
 
     解析同样不再必填：答案框里有什么就交付什么，原教材给了讲解就并进
     ``answer``，没给也不拦 —— 否则一整本没有解析的教辅一道题都出不了。
+
+    字段/乱码部分交给 ``k12_field_errors``，员工自检调用的是同一个函数，
+    界面提示与生成拒收永远同口径。
     """
     meta, body = sample["metainfo"], sample["data"]
-    errors = []
+    errors = k12_field_errors(meta, body, raw_texts=raw_texts)
     hints: list[str] = []
-    required_meta = {
-        "language": "语言", "stage": "学段", "grade": "年级", "subject": "学科",
-        "question_type": "题型", "difficulty": "难度",
-    }
-    for key, label in required_meta.items():
-        if not str(meta.get(key, "")).strip():
-            errors.append(f"缺少{label}")
-    errors.extend(_vocabulary_errors(meta))
-    if not meta.get("knowledge_points"):
-        errors.append("缺少知识点")
-    for key, label in (("question", "题目文本"), ("answer", "标准答案")):
-        value = str(body.get(key, ""))
-        if not value.strip():
-            errors.append(f"缺少{label}")
-        elif any(marker in value for marker in GARBLED_MARKERS):
-            errors.append(f"{label}含乱码字符")
-    for index, option in enumerate(body.get("options", []) or []):
-        if any(marker in str(option) for marker in GARBLED_MARKERS):
-            errors.append(f"选项{index + 1}含乱码字符")
     if not body.get("question_images") and not any(body.get("option_images", [])):
         hints.append("本题没有题图")
     if any(min(width, height) < 128 for width, height in image_sizes):
@@ -607,7 +894,8 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
                         materialize_all: bool, identity_path: Path | None = None,
                         allowed_pages: set[tuple[str, int]] | None = None,
                         rejected_pages: set[tuple[str, int]] | None = None,
-                        only_reviewed: bool = False) -> dict:
+                        only_reviewed: bool = False,
+                        reuse_root: Path | None = None) -> dict:
     """Build the customer-facing UTF-8 JSONL and meaningful illustration crops.
 
     Internal Q/A crops remain available for audit, but answer screenshots and whole-question
@@ -649,6 +937,18 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
     lines, report_items, active_images, page_lines = [], [], set(), {}
     page_orders = {}
     page_sizes: dict[int, tuple[int, int]] = {}
+    # 上一版为每张插图记录「源图 + bbox」签名，签名不变就直接复用文件，
+    # 不再为了同一个框重新解码整张试卷页。
+    reuse_signatures: dict[str, str] = {}
+    emitted_signatures: dict[str, str] = {}
+    if reuse_root is not None:
+        try:
+            cached = json.loads((Path(reuse_root) / "k12_dataset" / "image_signatures.json")
+                                .read_text(encoding="utf-8"))
+            if isinstance(cached, dict):
+                reuse_signatures = {str(key): str(value) for key, value in cached.items()}
+        except (OSError, ValueError, TypeError):
+            reuse_signatures = {}
     identity = _DeliveryIdentity(identity_path)
     book_id = str(project["delivery_book_id"])
     claimed_signatures: dict[str, str] = {}
@@ -765,7 +1065,11 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
             }, targets)
 
         sample, image_targets = build_sample("0000000")   # probe: id is irrelevant to validation
-        errors, hints = _k12_validation(sample, image_sizes)
+        errors, hints = _k12_validation(sample, image_sizes, raw_texts={
+            "question": ocr_question,
+            "answer": _merged_answer_text(answers, analyses),
+            "options": options,
+        })
         if full_page_skipped:
             errors.append(f"已剔除{full_page_skipped}张整页截图（H3③）")
         signature = _content_signature(sample)
@@ -810,10 +1114,21 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
                              "identity": identity_status})
         if eligible:
             sample, image_targets = build_sample(sample_id)
+            source_path = data.source_path(project, page)
             for target, box in image_targets:
-                if materialize_page or not target.is_file():
-                    crop = _crop(data.source_path(project, page), box)
-                    _atomic_image(target, crop)
+                relative = f"images/{target.name}"
+                signature = _illustration_signature(source_path, box)
+                emitted_signatures[relative] = signature
+                if not (materialize_page or not target.is_file()):
+                    continue
+                reusable = reuse_signatures.get(relative) == signature
+                if reusable and target.is_file():
+                    continue  # 内容已是正确版本
+                if reusable and _link_reused_file(
+                        _reuse_artifact(reuse_root, f"k12_dataset/{relative}"), target):
+                    continue
+                crop = _crop(source_path, box)
+                _atomic_image(target, crop)
             encoded = json.dumps(sample, ensure_ascii=False, separators=(",", ":"))
             lines.append(encoded)
             page_lines.setdefault(page_index, []).append(encoded)
@@ -871,6 +1186,7 @@ def _write_k12_delivery(root: Path, project: dict, question_rows: list, answer_r
               "items": report_items}
     _atomic_json(k12_root / "quality_report.json", report)
     _atomic_json(k12_root / "coverage_report.json", _coverage_summary(lines))
+    _atomic_json(k12_root / "image_signatures.json", emitted_signatures)
     return {"dataset_file": str(dataset_path), "eligible_count": len(lines),
             "rejected_count": report["rejected_count"],
             "identity_summary": identity_counts}
@@ -1110,7 +1426,11 @@ def analyze_delivery(project_path: str | Path, runtime_root: str | Path,
                 }
 
             sample = build_sample("0000000")
-            errors, hints = _k12_validation(sample, image_sizes)
+            errors, hints = _k12_validation(sample, image_sizes, raw_texts={
+                "question": ocr_question,
+                "answer": _merged_answer_text(answers, analyses),
+                "options": options,
+            })
             if full_page_skipped:
                 errors.append(f"已剔除{full_page_skipped}张整页截图（H3③）")
             signature = _content_signature(sample)
@@ -1241,6 +1561,10 @@ def _source_signature(project: dict, page: dict, record: dict, answer: bool) -> 
                 "bbox": continuation.get("bbox", []),
             })
         payload["continuation_sources"] = continuation_sources
+    else:
+        # 跨版本复用靠签名比对；答案裁图算法日后若变，必须升这个版本号，
+        # 否则会一直复用旧版图片。首次启用会让历史版本重裁一次，之后稳定。
+        payload["composition_version"] = "answer_crop_v1"
     return hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
@@ -1316,7 +1640,8 @@ def sync_delivery_workspace(project_path: str | Path, runtime_root: str | Path,
                             output_root: str | Path | None = None,
                             allowed_pages: set[tuple[str, int]] | None = None,
                             rejected_pages: set[tuple[str, int]] | None = None,
-                            only_reviewed: bool = False) -> dict:
+                            only_reviewed: bool = False,
+                            reuse_root: str | Path | None = None) -> dict:
     """Sync edited delivery artifacts and rebuild the small authoritative indexes.
 
     Crops are rewritten only when their source signature changes. JSON is cheap and is
@@ -1332,6 +1657,11 @@ def sync_delivery_workspace(project_path: str | Path, runtime_root: str | Path,
 
     ``allowed_pages`` limits the package to pages already approved in review, so a
     book can be generated before the whole book has been signed off.
+
+    ``reuse_root`` points at the previously published immutable version.  A brand
+    new version directory has no ``manifest.json`` of its own, so without it every
+    crop would be re-decoded and re-encoded on each submission.  Matching source
+    signatures are reused via hard links; only genuinely changed boxes are cropped.
     """
     project_file = Path(project_path).resolve()
     project = data.load_project(project_file)
@@ -1345,6 +1675,10 @@ def sync_delivery_workspace(project_path: str | Path, runtime_root: str | Path,
     except (OSError, ValueError, TypeError):
         old_manifest = {}
     old_items = {item.get("id"): item for item in old_manifest.get("items", []) if isinstance(item, dict)}
+    reuse_path = Path(reuse_root).resolve() if reuse_root is not None else None
+    # 只读上一版的清单做签名基线，不把它并进 old_items —— 那些路径指向旧目录，
+    # 混进删除逻辑会误删新版本刚复用过来的文件。
+    reuse_items = _load_reuse_items(reuse_path)
     targeted_internal_ids = {str(value) for value in (changed_record_ids or []) if str(value)}
 
     question_rows = sorted(
@@ -1391,6 +1725,7 @@ def sync_delivery_workspace(project_path: str | Path, runtime_root: str | Path,
     documents: dict[str, dict] = {}
     manifest_items = []
     crop_updates = 0
+    crop_reused = 0
     for kind, rows, relations in (
         ("question", question_rows, question_relations),
         ("answer", answer_rows, answer_relations),
@@ -1425,7 +1760,16 @@ def sync_delivery_workspace(project_path: str | Path, runtime_root: str | Path,
                 or explicitly_changed
                 or image_path.is_file()
             )
-            if should_materialize and (old.get("source_signature") != signature or not image_path.is_file()):
+            reused = reuse_items.get(public_id, {})
+            baseline = old if old else reused
+            # 签名一致说明像素完全一致：把上一版的文件硬链接进新版本目录，
+            # 后续的 is_file() 判断就会跳过整页解码 + JPEG 编码。
+            if (should_materialize and not image_path.is_file()
+                    and reused.get("source_signature") == signature):
+                if _link_reused_file(
+                        _reuse_artifact(reuse_path, reused.get("image_file")), image_path):
+                    crop_reused += 1
+            if should_materialize and (baseline.get("source_signature") != signature or not image_path.is_file()):
                 crop = (_crop(data.source_path(project, page, True), record["bbox"])
                         if kind == "answer" else _question_crop(project, page, record))
                 _atomic_image(image_path, crop)
@@ -1514,6 +1858,7 @@ def sync_delivery_workspace(project_path: str | Path, runtime_root: str | Path,
         allowed_pages=(set(allowed_pages) if allowed_pages is not None else None),
         rejected_pages=(set(rejected_pages) if rejected_pages is not None else None),
         only_reviewed=bool(only_reviewed),
+        reuse_root=reuse_path,
     )
     # Delivery generation may assign missing public IDs, but it is part of the
     # caller's logical mutation and must not advance the renderer CAS revision
@@ -1523,5 +1868,5 @@ def sync_delivery_workspace(project_path: str | Path, runtime_root: str | Path,
         "output_path": str(root), "book_id": project["delivery_book_id"],
         "question_count": len(question_rows), "answer_count": len(answer_rows),
         "ready_question_count": len(ready_questions), "crop_updates": crop_updates,
-        "removed_count": removed, "k12": k12,
+        "crop_reused": crop_reused, "removed_count": removed, "k12": k12,
     }

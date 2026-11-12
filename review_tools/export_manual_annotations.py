@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 import cv2
@@ -19,10 +21,33 @@ if str(APP_DIR) not in sys.path:
 from review_tools import manual_annotation_data as data
 
 
-def _crop(path: str, box: list[int]):
+# 一页上通常有 3~8 个框，每个框都要裁一遍。旧实现每次都把整张 4896×3380
+# 的扫描页重新解码（实测约 110ms），一页 4 题就是 4 次。生成服务是长驻进程，
+# 按「路径 + 大小 + mtime_ns」缓存解码结果，源图一改缓存键立刻失效。
+# 只保留最近 4 张（约 200MB 上限），并且只读切片、不原地修改缓存数组。
+_CROP_PAGE_CACHE_SIZE = 4
+
+
+@lru_cache(maxsize=_CROP_PAGE_CACHE_SIZE)
+def _decoded_page(cache_key: tuple):
+    path, _size, _mtime_ns = cache_key
     image = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
     if image is None:
         raise ValueError(f"无法读取图片：{path}")
+    return image
+
+
+def _page_image(path: str):
+    try:
+        stat = os.stat(path)
+    except OSError as error:
+        raise ValueError(f"无法读取图片：{path}") from error
+    key = (os.path.normcase(os.path.abspath(str(path))), stat.st_size, stat.st_mtime_ns)
+    return _decoded_page(key)
+
+
+def _crop(path: str, box: list[int]):
+    image = _page_image(path)
     x0, y0, x1, y1 = (int(value) for value in box)
     height, width = image.shape[:2]
     x0, y0, x1, y1 = max(0, x0), max(0, y0), min(width, x1), min(height, y1)
